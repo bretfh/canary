@@ -1,0 +1,17 @@
+# Guile compiled files
+*.go
+.cache/
+
+# Emacs
+*~
+\#*\#
+.#*
+
+# Build artifacts
+*.o
+*.so
+*.a
+
+# OS
+.DS_Store
+Thumbs.db
