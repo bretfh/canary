@@ -36,9 +36,9 @@
            (when bg (set! p (cons* 'bg bg p))))
          p)))
 
-(define (term-render-line t y . maybe-buf)
-  (let* ((w (term-width t))
-         (row (term-grid-row t y))
+(define (term-render-line term y . maybe-buf)
+  (let* ((w (term-width term))
+         (row (term-grid-row term y))
          (chars (if (and (pair? maybe-buf)
                          (string? (car maybe-buf))
                          (= (string-length (car maybe-buf)) w))
@@ -59,15 +59,15 @@
           (set! first #f))))
     (values chars (reverse changes))))
 
-(define (term-render-region t origin)
+(define (term-render-region term origin)
   (let ((col0 (car origin))
         (row0 (cadr origin))
-        (h (term-height t))
+        (h (term-height term))
         (cmds '()))
     (do ((y 0 (+ y 1)))
         ((= y h))
       (call-with-values
-       (lambda () (term-render-line t y))
+       (lambda () (term-render-line term y))
        (lambda (chars changes)
          (let loop ((cs changes))
            (cond
@@ -78,7 +78,7 @@
                     (face-pl (cadr entry))
                     (next-start
                      (cond
-                      ((null? (cdr cs)) (term-width t))
+                      ((null? (cdr cs)) (term-width term))
                       (else (car (cadr cs)))))
                     (segment (substring chars start next-start)))
                (set! cmds
@@ -86,12 +86,12 @@
                                  segment face-pl)
                            cmds))
                (loop (cdr cs)))))))))
-    (when (term-cursor-visible? t)
+    (when (term-cursor-visible? term)
       (set! cmds
             (cons (list 'cursor
-                        (+ col0 (term-cursor-x t))
-                        (+ row0 (term-cursor-y t))
-                        (cursor-style->draw (term-cursor-style t)))
+                        (+ col0 (term-cursor-x term))
+                        (+ row0 (term-cursor-y term))
+                        (cursor-style->draw (term-cursor-style term)))
                   cmds)))
     (reverse cmds)))
 
@@ -102,20 +102,20 @@
     ((bar blinking-bar) 'bar)
     (else 'block)))
 
-(define (term-dump-row t y)
-  (let* ((row (term-grid-row t y))
+(define (term-dump-row term y)
+  (let* ((row (term-grid-row term y))
          (w (vector-length row))
          (s (make-string w #\space)))
     (do ((x 0 (+ x 1)))
         ((= x w) s)
       (string-set! s x (cell-char (vector-ref row x))))))
 
-(define (term-dump t)
-  (let ((h (term-height t))
+(define (term-dump term)
+  (let ((h (term-height term))
         (out (open-output-string)))
     (do ((y 0 (+ y 1)))
         ((= y h))
-      (display (term-dump-row t y) out)
+      (display (term-dump-row term y) out)
       (when (< y (- h 1))
         (newline out)))
     (get-output-string out)))
@@ -164,9 +164,9 @@
                                          (join (cdr codes))))))
                  "m"))
 
-(define (term-render-ansi-line t y)
-  (let* ((w (term-width t))
-         (row (term-grid-row t y))
+(define (term-render-ansi-line term y)
+  (let* ((w (term-width term))
+         (row (term-grid-row term y))
          (out (open-output-string))
          (prev-face #f)
          (first #t))

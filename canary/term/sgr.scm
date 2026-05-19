@@ -2,8 +2,8 @@
   #:use-module (canary term types)
   #:export (process-sgr!))
 
-(define (process-sgr! t params)
-  (let* ((attrs (term-attrs t))
+(define (process-sgr! term params)
+  (let* ((attrs (term-attrs term))
          (vec (list->vector params))
          (len (vector-length vec))
          (i 0))
