@@ -1,6 +1,7 @@
 (define-module (canary term types)
   #:use-module (srfi srfi-9)
   #:use-module (srfi srfi-9 gnu)
+  #:use-module (rnrs bytevectors)
   #:export (<face-attrs>
             make-face-attrs
             face-attrs?
@@ -20,20 +21,15 @@
             face-attrs-equal?
             reset-face-attrs!
 
-            <cell>
-            make-cell
-            cell?
-            cell-char set-cell-char!
-            cell-face set-cell-face!
-
             <term>
             make-term
             term?
             term-width set-term-width!
             term-height set-term-height!
-            term-grid set-term-grid!
-            term-alt-grid set-term-alt-grid!
-            term-main-grid set-term-main-grid!
+            term-chars set-term-chars!
+            term-faces set-term-faces!
+            term-main-chars set-term-main-chars!
+            term-main-faces set-term-main-faces!
             term-cursor-x set-term-cursor-x!
             term-cursor-y set-term-cursor-y!
             term-saved-cursor-x set-term-saved-cursor-x!
@@ -70,14 +66,13 @@
             term-in-alt? set-term-in-alt!
             term-last-write-face set-term-last-write-face!
 
-            term-grid-row
-            term-grid-cell
-            set-term-grid-cell!
-            make-grid
-            make-row
-            clear-row!
-            clear-grid!
-            copy-row
+            term-char-at term-face-at
+            set-term-char-at! set-term-face-at!
+            set-term-cell-at!
+            term-clear!
+            term-clear-row!
+            term-copy-row!
+            term-copy!
             term-reset!
             term-resize!))
 
@@ -115,7 +110,7 @@
 
 (define (face-attrs-equal? a b)
   (cond
-   ((and (not a) (not b)) #t)
+   ((eq? a b) #t)
    ((or (not a) (not b)) #f)
    (else
     (and (equal? (face-fg a) (face-fg b))
@@ -143,53 +138,8 @@
   (set-face-conceal! f #f)
   (set-face-crossed! f #f))
 
-(define-record-type <cell>
-  (%make-cell ch face)
-  cell?
-  (ch    cell-char  set-cell-char!)
-  (face  cell-face  set-cell-face!))
-
-(define* (make-cell #:optional (ch #\space) (face #f))
-  (%make-cell ch face))
-
-(define (make-row width)
-  (let ((row (make-vector width #f)))
-    (do ((x 0 (+ x 1)))
-        ((= x width) row)
-      (vector-set! row x (make-cell)))))
-
-(define (make-grid width height)
-  (let ((grid (make-vector height #f)))
-    (do ((y 0 (+ y 1)))
-        ((= y height) grid)
-      (vector-set! grid y (make-row width)))))
-
-(define (clear-row! row . maybe-face)
-  (let ((face (if (pair? maybe-face) (car maybe-face) #f))
-        (len (vector-length row)))
-    (do ((x 0 (+ x 1)))
-        ((= x len))
-      (let ((c (vector-ref row x)))
-        (set-cell-char! c #\space)
-        (set-cell-face! c face)))))
-
-(define (clear-grid! grid . maybe-face)
-  (let ((face (if (pair? maybe-face) (car maybe-face) #f))
-        (h (vector-length grid)))
-    (do ((y 0 (+ y 1)))
-        ((= y h))
-      (clear-row! (vector-ref grid y) face))))
-
-(define (copy-row src)
-  (let* ((len (vector-length src))
-         (dst (make-vector len #f)))
-    (do ((x 0 (+ x 1)))
-        ((= x len) dst)
-      (let ((sc (vector-ref src x)))
-        (vector-set! dst x (make-cell (cell-char sc) (cell-face sc)))))))
-
 (define-record-type <term>
-  (%make-term width height grid alt-grid main-grid
+  (%make-term width height chars faces main-chars main-faces
               cx cy saved-cx saved-cy saved-attrs attrs
               scroll-top scroll-bottom
               parser-state csi-params csi-format osc-buf
@@ -203,9 +153,10 @@
   term?
   (width            term-width            set-term-width!)
   (height           term-height           set-term-height!)
-  (grid             term-grid             set-term-grid!)
-  (alt-grid         term-alt-grid         set-term-alt-grid!)
-  (main-grid        term-main-grid        set-term-main-grid!)
+  (chars            term-chars            set-term-chars!)
+  (faces            term-faces            set-term-faces!)
+  (main-chars       term-main-chars       set-term-main-chars!)
+  (main-faces       term-main-faces       set-term-main-faces!)
   (cx               term-cursor-x         set-term-cursor-x!)
   (cy               term-cursor-y         set-term-cursor-y!)
   (saved-cx         term-saved-cursor-x   set-term-saved-cursor-x!)
@@ -242,34 +193,97 @@
   (in-alt?          term-in-alt?          set-term-in-alt!)
   (last-write-face  term-last-write-face  set-term-last-write-face!))
 
+(define %space (char->integer #\space))
+
+(define (alloc-chars n) (make-u32vector n %space))
+(define (alloc-faces n) (make-vector n #f))
+
 (define* (make-term #:key (width 80) (height 24)
                     (input-fn #f) (bell-fn #f)
                     (title-fn #f) (cwd-fn #f)
                     (max-scrollback 10000))
-  (%make-term width height
-              (make-grid width height) #f #f
-              0 0 0 0 (default-face-attrs) (default-face-attrs)
-              0 (- height 1)
-              #f '() #f ""
-              #t #f #f #f
-              #t 'block
-              'us-ascii 'us-ascii 'us-ascii 'us-ascii 'g0
-              (if (positive? max-scrollback)
-                  (make-vector 64 #f)
-                  #f)
-              0 max-scrollback
-              input-fn bell-fn title-fn cwd-fn
-              "" "" #\space #f
-              #f))
+  (let ((n (* width height)))
+    (%make-term width height
+                (alloc-chars n) (alloc-faces n)
+                #f #f
+                0 0 0 0 (default-face-attrs) (default-face-attrs)
+                0 (- height 1)
+                #f '() #f ""
+                #t #f #f #f
+                #t 'block
+                'us-ascii 'us-ascii 'us-ascii 'us-ascii 'g0
+                (if (positive? max-scrollback)
+                    (make-vector 64 #f)
+                    #f)
+                0 max-scrollback
+                input-fn bell-fn title-fn cwd-fn
+                "" "" #\space #f
+                #f)))
 
-(define (term-grid-row t y)
-  (vector-ref (term-grid t) y))
+(define (term-index t x y)
+  (+ (* y (term-width t)) x))
 
-(define (term-grid-cell t x y)
-  (vector-ref (term-grid-row t y) x))
+(define (term-char-at t x y)
+  (integer->char (u32vector-ref (term-chars t) (term-index t x y))))
 
-(define (set-term-grid-cell! t x y cell)
-  (vector-set! (term-grid-row t y) x cell))
+(define (term-face-at t x y)
+  (vector-ref (term-faces t) (term-index t x y)))
+
+(define (set-term-char-at! t x y ch)
+  (u32vector-set! (term-chars t) (term-index t x y) (char->integer ch)))
+
+(define (set-term-face-at! t x y face)
+  (vector-set! (term-faces t) (term-index t x y) face))
+
+(define (set-term-cell-at! t x y ch face)
+  (let ((i (term-index t x y)))
+    (u32vector-set! (term-chars t) i (char->integer ch))
+    (vector-set! (term-faces t) i face)))
+
+(define* (term-clear! t #:optional (face #f))
+  (let ((chars (term-chars t))
+        (faces (term-faces t))
+        (n (* (term-width t) (term-height t))))
+    (do ((i 0 (+ i 1)))
+        ((= i n))
+      (u32vector-set! chars i %space)
+      (vector-set!    faces i face))))
+
+(define* (term-clear-row! t y #:optional (face #f))
+  (let* ((w (term-width t))
+         (chars (term-chars t))
+         (faces (term-faces t))
+         (start (* y w))
+         (end   (+ start w)))
+    (do ((i start (+ i 1)))
+        ((= i end))
+      (u32vector-set! chars i %space)
+      (vector-set!    faces i face))))
+
+(define (term-copy-row! t src-y dst-y)
+  (let* ((w (term-width t))
+         (chars (term-chars t))
+         (faces (term-faces t))
+         (src (* src-y w))
+         (dst (* dst-y w)))
+    (do ((i 0 (+ i 1)))
+        ((= i w))
+      (u32vector-set! chars (+ dst i) (u32vector-ref chars (+ src i)))
+      (vector-set!    faces (+ dst i) (vector-ref    faces (+ src i))))))
+
+(define (term-copy! dst src)
+  "Copy the visible grid of SRC into DST. Both must have the same dimensions."
+  (let* ((w (term-width src))
+         (h (term-height src))
+         (n (* w h))
+         (sc (term-chars src))
+         (sf (term-faces src))
+         (dc (term-chars dst))
+         (df (term-faces dst)))
+    (do ((i 0 (+ i 1)))
+        ((= i n))
+      (u32vector-set! dc i (u32vector-ref sc i))
+      (vector-set!    df i (vector-ref    sf i)))))
 
 (define (term-reset! t)
   (set-term-parser-state! t #f)
@@ -292,33 +306,42 @@
   (set-term-g2! t 'us-ascii)
   (set-term-g3! t 'us-ascii)
   (reset-face-attrs! (term-attrs t))
-  (clear-grid! (term-grid t))
+  (term-clear! t)
   (when (term-in-alt? t)
-    (set-term-grid! t (term-main-grid t))
-    (set-term-main-grid! t #f)
+    (set-term-chars! t (term-main-chars t))
+    (set-term-faces! t (term-main-faces t))
+    (set-term-main-chars! t #f)
+    (set-term-main-faces! t #f)
     (set-term-in-alt! t #f)))
+
+(define (copy-region! src-chars src-faces src-w
+                      dst-chars dst-faces dst-w
+                      copy-w copy-h)
+  (do ((y 0 (+ y 1)))
+      ((= y copy-h))
+    (do ((x 0 (+ x 1)))
+        ((= x copy-w))
+      (let ((si (+ (* y src-w) x))
+            (di (+ (* y dst-w) x)))
+        (u32vector-set! dst-chars di (u32vector-ref src-chars si))
+        (vector-set!    dst-faces di (vector-ref    src-faces si))))))
 
 (define (term-resize! t cols rows)
   (when (and (positive? cols) (positive? rows)
              (or (not (= cols (term-width t)))
                  (not (= rows (term-height t)))))
-    (let ((old-grid (term-grid t))
-          (old-w (term-width t))
-          (old-h (term-height t))
-          (new-grid (make-grid cols rows)))
-      (let ((copy-h (min old-h rows))
-            (copy-w (min old-w cols)))
-        (do ((y 0 (+ y 1)))
-            ((= y copy-h))
-          (let ((src-row (vector-ref old-grid y))
-                (dst-row (vector-ref new-grid y)))
-            (do ((x 0 (+ x 1)))
-                ((= x copy-w))
-              (let ((sc (vector-ref src-row x))
-                    (dc (vector-ref dst-row x)))
-                (set-cell-char! dc (cell-char sc))
-                (set-cell-face! dc (cell-face sc)))))))
-      (set-term-grid! t new-grid)
+    (let* ((old-w (term-width t))
+           (old-h (term-height t))
+           (n     (* cols rows))
+           (new-chars (alloc-chars n))
+           (new-faces (alloc-faces n))
+           (copy-w (min old-w cols))
+           (copy-h (min old-h rows)))
+      (copy-region! (term-chars t) (term-faces t) old-w
+                    new-chars new-faces cols
+                    copy-w copy-h)
+      (set-term-chars! t new-chars)
+      (set-term-faces! t new-faces)
       (set-term-width! t cols)
       (set-term-height! t rows)
       (set-term-scroll-top! t 0)
@@ -326,19 +349,13 @@
       (set-term-cursor-x! t (min (term-cursor-x t) (- cols 1)))
       (set-term-cursor-y! t (min (term-cursor-y t) (- rows 1)))
       (when (term-in-alt? t)
-        (let ((old-main (term-main-grid t))
-              (new-main (make-grid cols rows)))
-          (when old-main
-            (let ((copy-h (min (vector-length old-main) rows)))
-              (do ((y 0 (+ y 1)))
-                  ((= y copy-h))
-                (let* ((src-row (vector-ref old-main y))
-                       (dst-row (vector-ref new-main y))
-                       (copy-w (min (vector-length src-row) cols)))
-                  (do ((x 0 (+ x 1)))
-                      ((= x copy-w))
-                    (let ((sc (vector-ref src-row x))
-                          (dc (vector-ref dst-row x)))
-                      (set-cell-char! dc (cell-char sc))
-                      (set-cell-face! dc (cell-face sc))))))))
-          (set-term-main-grid! t new-main))))))
+        (let ((old-main-chars (term-main-chars t))
+              (old-main-faces (term-main-faces t)))
+          (when (and old-main-chars old-main-faces)
+            (let ((new-main-chars (alloc-chars n))
+                  (new-main-faces (alloc-faces n)))
+              (copy-region! old-main-chars old-main-faces old-w
+                            new-main-chars new-main-faces cols
+                            copy-w copy-h)
+              (set-term-main-chars! t new-main-chars)
+              (set-term-main-faces! t new-main-faces))))))))
