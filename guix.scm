@@ -1,5 +1,6 @@
 (use-modules (guix packages)
              (guix gexp)
+             (guix git-download)
              (guix build-system gnu)
              ((guix licenses) #:prefix l:)
              (gnu packages commencement)
@@ -9,18 +10,11 @@
 (define %canary-checkout
   (dirname (current-filename)))
 
-(define (%canary-select? file stat)
-  (and (not (memq (stat:type stat) '(socket fifo symlink)))
-       (let* ((rel (substring file (+ 1 (string-length %canary-checkout))))
-              (top (let ((slash (string-index rel #\/)))
-                     (if slash (substring rel 0 slash) rel))))
-         (not (member top '(".git" "build" "node_modules"))))))
-
 (define %canary-source
   (local-file %canary-checkout
               "guile-canary-source"
               #:recursive? #t
-              #:select? %canary-select?))
+              #:select? (git-predicate %canary-checkout)))
 
 (define-public guile-canary
   (package

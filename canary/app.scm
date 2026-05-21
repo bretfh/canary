@@ -18,6 +18,7 @@
   #:use-module (fibers operations)
   #:use-module ((fibers io-wakeup) #:select (wait-until-port-readable-operation))
   #:use-module ((fibers timers) #:select ((sleep . fiber-sleep)))
+  #:use-module (ice-9 threads)
   #:use-module (oop goops)
   #:use-module (srfi srfi-1)
   #:use-module (srfi srfi-9)
@@ -160,13 +161,30 @@
                    #:accessor app-log-cap)
   (log-height-frac #:init-keyword #:log-height-frac #:init-value 1/5
                    #:accessor app-log-height-frac)
-  ;; engine-managed
   (msg-queue   #:init-value '()              #:accessor app-msg-queue)
-  (msg-bell    #:init-form (make-channel)    #:accessor app-msg-bell)
-  (bell-rung?  #:init-value #f               #:accessor app-bell-rung?)
-  (stop-ch     #:init-form (make-channel)    #:accessor app-stop-ch)
+  (queue-mutex #:init-form (make-mutex)      #:accessor app-queue-mutex)
+  (msg-bell    #:init-form (make-bell-pipe)  #:accessor app-msg-bell)
+  (stop-ch     #:init-form (make-bell-pipe)  #:accessor app-stop-ch)
   (running?    #:init-value #t               #:accessor app-running?)
   (log-entries #:init-value '()              #:accessor app-log-entries))
+
+(define (make-bell-pipe)
+  (let ((p (pipe)))
+    (set-port-encoding! (car p) "ISO-8859-1")
+    (set-port-encoding! (cdr p) "ISO-8859-1")
+    (setvbuf (cdr p) 'none)
+    p))
+
+(define (ring! bell)
+  (write-char #\space (cdr bell))
+  (force-output (cdr bell)))
+
+(define (drain-bell! bell)
+  (let ((rd (car bell)))
+    (let loop ()
+      (when (char-ready? rd)
+        (read-char rd)
+        (loop)))))
 
 (define-generic init)
 (define-generic update)
@@ -187,30 +205,26 @@
     (set-ansi-backend-theme! (app-backend a) (app-theme a))))
 
 (define (send app msg)
-  "Enqueue MSG on the app's msg queue and ring the bell so the event
-loop wakes. Non-blocking: fibers in single-threaded mode means plain
-set! on the queue is safe."
+  "Enqueue MSG and wake the event loop. Thread-safe: queue ops behind a
+mutex, wakeup is a single byte to a pipe that the event-loop fiber
+selects on. Callable from any Guile thread, no fibers scheduler
+needed."
   (when (app-running? app)
-    (set! (app-msg-queue app) (cons msg (app-msg-queue app)))
-    (unless (app-bell-rung? app)
-      (set! (app-bell-rung? app) #t)
-      (spawn-fiber
-       (lambda () (put-message (app-msg-bell app) #t))))))
+    (with-mutex (app-queue-mutex app)
+      (set! (app-msg-queue app) (cons msg (app-msg-queue app))))
+    (ring! (app-msg-bell app))))
 
 (define (drain-msgs! app)
-  (let ((q (app-msg-queue app)))
-    (set! (app-msg-queue app) '())
-    (reverse q)))
+  (with-mutex (app-queue-mutex app)
+    (let ((q (app-msg-queue app)))
+      (set! (app-msg-queue app) '())
+      (reverse q))))
 
 (define (stop-app! app)
   (when (app-running? app)
     (set! (app-running? app) #f)
-    ;; wake any fiber blocked on the msg bell so it can observe running?=#f
-    (unless (app-bell-rung? app)
-      (set! (app-bell-rung? app) #t)
-      (spawn-fiber (lambda () (put-message (app-msg-bell app) #t))))
-    ;; signal shutdown to run-fibers body; spawn so we don't block if no one's listening
-    (spawn-fiber (lambda () (put-message (app-stop-ch app) 'stop)))))
+    (ring! (app-msg-bell app))
+    (ring! (app-stop-ch app))))
 
 (define (set-app-keymap! app km)
   (set! (app-keymap app) km))
@@ -510,12 +524,13 @@ was a no-op (keymap pending/no-match with no fallback, or filter drop)."
     (dispatch-to-user app msg))))
 
 (define (event-loop app)
-  (let loop ()
-    (when (app-running? app)
-      (get-message (app-msg-bell app))
-      (set! (app-bell-rung? app) #f)
-      (let* ((msgs (drain-msgs! app))
-             (dispatched?
+  (let ((rd (car (app-msg-bell app))))
+    (let loop ()
+      (when (app-running? app)
+        (perform-operation (wait-until-port-readable-operation rd))
+        (drain-bell! (app-msg-bell app))
+        (let* ((msgs (drain-msgs! app))
+               (dispatched?
               (let lp ((ms msgs) (any? #f))
                 (cond
                  ((null? ms) any?)
@@ -528,7 +543,7 @@ was a no-op (keymap pending/no-match with no fallback, or filter drop)."
             (lambda () (render-frame app))
             (lambda (key . args)
               (log! app 'render 'error (format #f "~a ~a" key args))))))
-      (when (app-running? app) (loop)))))
+      (when (app-running? app) (loop))))))
 
 (define %dup2
   (pointer->procedure int
@@ -561,7 +576,8 @@ Returns when the app stops."
     (when init-cmd (run-command app init-cmd)))
   (let ((sz (backend-size (app-backend app))))
     (send app (resize (size-width sz) (size-height sz))))
-  (get-message (app-stop-ch app))
+  (perform-operation
+   (wait-until-port-readable-operation (car (app-stop-ch app))))
   (backend-shutdown (app-backend app)))
 
 (define (run-app app)
@@ -613,7 +629,9 @@ Returns when the app stops."
                  (send app (resize (size-width sz) (size-height sz))))
                (spawn-fiber
                 (lambda () (drain-stderr-pipe app (car stderr-pipe))))
-               (get-message (app-stop-ch app)))
+               (perform-operation
+                (wait-until-port-readable-operation
+                 (car (app-stop-ch app)))))
              #:hz 100))
 
           (lambda ()
