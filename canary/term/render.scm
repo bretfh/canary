@@ -1,5 +1,6 @@
 (define-module (canary term render)
   #:use-module (canary term types)
+  #:use-module (canary width)
   #:use-module (rnrs bytevectors)
   #:export (term-render-line
             term-render-region
@@ -102,11 +103,16 @@
     (else 'block)))
 
 (define (term-dump-row term y)
-  (let* ((w (term-width term))
-         (s (make-string w #\space)))
+  ;; Build the row as a string omitting sentinel cells — what the
+  ;; terminal would visibly render (a wide char appears once, occupying
+  ;; two columns of the resulting string when displayed).
+  (let ((w (term-width term))
+        (out (open-output-string)))
     (do ((x 0 (+ x 1)))
-        ((= x w) s)
-      (string-set! s x (term-char-at term x y)))))
+        ((= x w) (get-output-string out))
+      (let ((ch (term-char-at term x y)))
+        (unless (wide-cont? (char->integer ch))
+          (display ch out))))))
 
 (define (term-dump term)
   (let ((h (term-height term))
@@ -171,11 +177,12 @@
         ((= x w))
       (let ((ch   (term-char-at term x y))
             (face (term-face-at term x y)))
-        (when (or first (not (face-attrs-equal? face prev-face)))
-          (display (emit-sgr-string face) out)
-          (set! prev-face face)
-          (set! first #f))
-        (display (printable ch) out)))
+        (unless (wide-cont? (char->integer ch))
+          (when (or first (not (face-attrs-equal? face prev-face)))
+            (display (emit-sgr-string face) out)
+            (set! prev-face face)
+            (set! first #f))
+          (display (printable ch) out))))
     (display (string-append (string #\esc) "[0m") out)
     (get-output-string out)))
 
@@ -188,24 +195,30 @@
   ;; state is a vector: #(cursor-x cursor-y last-face any-emitted?)
   (let ((cur-ch (u32vector-ref cur-chars i))
         (cur-fa (vector-ref cur-faces i)))
-    (let ((same?
-           (and prev-chars
-                (= cur-ch (u32vector-ref prev-chars i))
-                (face-attrs-equal? cur-fa (vector-ref prev-faces i)))))
-      (unless same?
-        (let ((cursor-x (vector-ref state 0))
-              (cursor-y (vector-ref state 1))
-              (last-face (vector-ref state 2)))
-          (unless (and (eqv? cursor-x x) (eqv? cursor-y y))
-            (display (move-to-ansi x y) out)
-            (vector-set! state 0 x)
-            (vector-set! state 1 y))
-          (unless (face-attrs-equal? cur-fa last-face)
-            (display (emit-sgr-string cur-fa) out)
-            (vector-set! state 2 cur-fa))
-          (display (printable (integer->char cur-ch)) out)
-          (vector-set! state 0 (+ x 1))
-          (vector-set! state 3 #t))))))
+    (cond
+     ;; sentinel: the wide char one cell to the left already painted
+     ;; this visual column. Don't emit, don't move the cursor.
+     ((wide-cont? cur-ch) #f)
+     (else
+      (let ((same?
+             (and prev-chars
+                  (= cur-ch (u32vector-ref prev-chars i))
+                  (face-attrs-equal? cur-fa (vector-ref prev-faces i)))))
+        (unless same?
+          (let ((cursor-x (vector-ref state 0))
+                (cursor-y (vector-ref state 1))
+                (last-face (vector-ref state 2))
+                (cw (char-display-width (integer->char cur-ch))))
+            (unless (and (eqv? cursor-x x) (eqv? cursor-y y))
+              (display (move-to-ansi x y) out)
+              (vector-set! state 0 x)
+              (vector-set! state 1 y))
+            (unless (face-attrs-equal? cur-fa last-face)
+              (display (emit-sgr-string cur-fa) out)
+              (vector-set! state 2 cur-fa))
+            (display (printable (integer->char cur-ch)) out)
+            (vector-set! state 0 (+ x (max 1 cw)))
+            (vector-set! state 3 #t))))))))
 
 (define (term-diff->ansi prev cur)
   (let* ((w (term-width cur))

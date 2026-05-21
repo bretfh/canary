@@ -2,16 +2,13 @@
   #:use-module (canary view)
   #:use-module (canary draw)
   #:use-module (canary borders)
+  #:use-module (canary width)
   #:use-module (srfi srfi-1)
   #:export (render
-            view->cmds))
+            view->cmds
+            image-cmd->fallback-cmds))
 
-(define (clamp s max-w)
-  (let ((n (string-length s)))
-    (cond
-     ((<= max-w 0) "")
-     ((<= n max-w) s)
-     (else (substring s 0 max-w)))))
+(define (clamp s max-w) (string-display-clamp s max-w))
 
 (define (render node cols rows)
   (view->cmds node (make-rect 0 0 cols rows)))
@@ -79,7 +76,21 @@
             (set-static-node-cached-rect! node rect)
             (set-static-node-cached-cmds! node cmds)
             cmds))))
+   ((image-node? node)
+    (let* ((w (min (image-node-w node) (rect-w rect)))
+           (h (min (image-node-h node) (rect-h rect))))
+      (list (make-image (rect-col rect) (rect-row rect) w h
+                        (image-node-px node) (image-node-py node)
+                        (image-node-src-x node) (image-node-src-y node)
+                        (image-node-src-w node) (image-node-src-h node)
+                        (image-node-src node)
+                        (image-node-fallback node)))))
    (else '())))
+
+(define (image-cmd->fallback-cmds cmd)
+  (view->cmds (image-fallback cmd)
+              (make-rect (image-col cmd) (image-row cmd)
+                         (image-w cmd) (image-h cmd))))
 
 (define (bg-fill-cmds face rect)
   (if face

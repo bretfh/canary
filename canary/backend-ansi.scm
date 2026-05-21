@@ -5,12 +5,16 @@
   #:use-module (canary theme)
   #:use-module (canary protocol)
   #:use-module (canary terminal)
+  #:use-module ((canary render) #:select (image-cmd->fallback-cmds))
+  #:use-module ((canary image)  #:select (image-bytes image-registered?))
   #:use-module ((canary term types) #:prefix t:)
   #:use-module ((canary term ops) #:prefix t:)
   #:use-module ((canary term write) #:prefix t:)
   #:use-module ((canary term render) #:prefix t:)
   #:use-module (oop goops)
+  #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
+  #:use-module ((srfi srfi-13) #:select (string-contains))
   #:export (<ansi-backend>
             make-ansi-backend
             ansi-backend-theme
@@ -19,16 +23,37 @@
             ansi-backend-cur-term
             ansi-backend-prev-term
             ansi-backend-size
+            graphics?
+            cell-w
+            cell-h
             face->sgr
             cmds->ansi
-            render-cmds-to-term!))
+            render-cmds-to-term!
+            stats
+            reset-stats!))
 
 (define-class <ansi-backend> (<backend>)
   (port      #:init-keyword #:port  #:accessor ansi-backend-port)
   (theme     #:init-keyword #:theme #:accessor ansi-backend-theme)
   (size      #:init-keyword #:size  #:init-value (size 80 24) #:accessor ansi-backend-size)
   (cur-term  #:init-value #f #:accessor ansi-backend-cur-term)
-  (prev-term #:init-value #f #:accessor ansi-backend-prev-term))
+  (prev-term #:init-value #f #:accessor ansi-backend-prev-term)
+  (graphics?         #:init-value #f             #:accessor graphics?)
+  (cell-w            #:init-value 10             #:accessor cell-w)
+  (cell-h            #:init-value 20             #:accessor cell-h)
+  (image-ids         #:init-form (make-hash-table) #:accessor ansi-backend-image-ids)
+  (next-image-id     #:init-value 1              #:accessor ansi-backend-next-image-id)
+  (placements        #:init-form (make-hash-table) #:accessor ansi-backend-placements)
+  (next-placement-id #:init-value 1              #:accessor ansi-backend-next-placement-id)
+  ;; metrics (since last reset)
+  (frames                  #:init-value 0 #:accessor ansi-backend-frames)
+  (bytes-out               #:init-value 0 #:accessor ansi-backend-bytes-out)
+  (sgr-transitions         #:init-value 0 #:accessor ansi-backend-sgr-transitions)
+  (cursor-moves            #:init-value 0 #:accessor ansi-backend-cursor-moves)
+  (image-transmits         #:init-value 0 #:accessor ansi-backend-image-transmits)
+  (image-transmit-bytes    #:init-value 0 #:accessor ansi-backend-image-transmit-bytes)
+  (placements-placed       #:init-value 0 #:accessor ansi-backend-placements-placed)
+  (placements-deleted      #:init-value 0 #:accessor ansi-backend-placements-deleted))
 
 (define (set-ansi-backend-theme! b th)
   (set! (ansi-backend-theme b) th))
@@ -139,8 +164,108 @@ either a <face> record or #f for 'default."
            (t:term-write! term line))))
       ((cursor-cmd? cmd)
        (t:term-goto! term (+ (cursor-row cmd) 1) (+ (cursor-col cmd) 1)))
+      ((image-cmd? cmd)
+       (render-cmds-to-term! term (image-cmd->fallback-cmds cmd) th))
       (else #f)))
    cmds))
+
+;; Placement vector layout:
+;;   #(placement-id img-id src src-x src-y src-w src-h w h px py)
+;;        0          1     2   3     4     5     6    7 8 9  10
+
+(define (pos-key col row) (+ (* row 100000) col))
+(define (key->col k) (modulo k 100000))
+(define (key->row k) (quotient k 100000))
+
+(define (placement-content-eq? a b)
+  (and (= (vector-ref a 1)  (vector-ref b 1))
+       (= (vector-ref a 3)  (vector-ref b 3))
+       (= (vector-ref a 4)  (vector-ref b 4))
+       (= (vector-ref a 5)  (vector-ref b 5))
+       (= (vector-ref a 6)  (vector-ref b 6))
+       (= (vector-ref a 7)  (vector-ref b 7))
+       (= (vector-ref a 8)  (vector-ref b 8))
+       (= (vector-ref a 9)  (vector-ref b 9))
+       (= (vector-ref a 10) (vector-ref b 10))))
+
+(define (emit-images! b cmds)
+  "Position-keyed diff. Each (col,row) origin is one placement slot.
+Deletes for slots that vanished; places for new or content-changed
+slots. Unchanged slots: zero bytes."
+  (let* ((port (ansi-backend-port b))
+         (old  (ansi-backend-placements b))
+         (new  (make-hash-table)))
+    ;; build the new map; img-id resolved here so unregistered srcs drop out
+    (for-each
+     (lambda (c)
+       (let* ((src    (image-src c))
+              (img-id (image-id-for! b src)))
+         (when img-id
+           (hash-set! new (pos-key (image-col c) (image-row c))
+                      (vector #f img-id src
+                              (image-src-x c) (image-src-y c)
+                              (image-src-w c) (image-src-h c)
+                              (image-w   c)   (image-h   c)
+                              (image-px  c)   (image-py  c))))))
+     cmds)
+    ;; deletes
+    (hash-for-each
+     (lambda (key old-vec)
+       (unless (hash-ref new key)
+         (emit-image-delete-placement! port
+                                       (vector-ref old-vec 1)
+                                       (vector-ref old-vec 0))
+         (set! (ansi-backend-placements-deleted b)
+               (+ (ansi-backend-placements-deleted b) 1))))
+     old)
+    ;; places / no-ops
+    (hash-for-each
+     (lambda (key new-vec)
+       (let ((old-vec (hash-ref old key)))
+         (cond
+          ((and old-vec (placement-content-eq? old-vec new-vec))
+           ;; carry forward placement-id, no emit
+           (vector-set! new-vec 0 (vector-ref old-vec 0)))
+          (else
+           ;; new or changed
+           (when (and old-vec
+                      (not (= (vector-ref old-vec 1) (vector-ref new-vec 1))))
+             (emit-image-delete-placement! port
+                                           (vector-ref old-vec 1)
+                                           (vector-ref old-vec 0))
+             (set! (ansi-backend-placements-deleted b)
+                   (+ (ansi-backend-placements-deleted b) 1)))
+           (let ((pid (if old-vec
+                          (vector-ref old-vec 0)
+                          (next-placement-id! b))))
+             (vector-set! new-vec 0 pid)
+             (emit-image-place! port
+                                (vector-ref new-vec 1) pid
+                                (key->col key) (key->row key)
+                                (vector-ref new-vec 7) (vector-ref new-vec 8)
+                                (vector-ref new-vec 3) (vector-ref new-vec 4)
+                                (vector-ref new-vec 5) (vector-ref new-vec 6)
+                                (vector-ref new-vec 9) (vector-ref new-vec 10))
+             (set! (ansi-backend-placements-placed b)
+                   (+ (ansi-backend-placements-placed b) 1)))))))
+     new)
+    (set! (ansi-backend-placements b) new)))
+
+(define (split-cmds-for-graphics b cmds)
+  "When graphics? is on, partition image-cmds with a registered src into
+the graphics list, leaving everything else (text/fill/cursor/clear, and
+image-cmds with unregistered srcs) in the term-grid list. With graphics?
+off, all image-cmds stay in the term-grid list and render as fallback."
+  (cond
+   ((not (graphics? b)) (values '() cmds))
+   (else
+    (let lp ((cs cmds) (gfx '()) (rest '()))
+      (cond
+       ((null? cs) (values (reverse gfx) (reverse rest)))
+       ((and (image-cmd? (car cs))
+             (image-registered? (image-src (car cs))))
+        (lp (cdr cs) (cons (car cs) gfx) rest))
+       (else (lp (cdr cs) gfx (cons (car cs) rest))))))))
 
 (define (cmds-extent cmds)
   (let lp ((cs cmds) (mw 1) (mh 1))
@@ -174,6 +299,227 @@ either a <face> record or #f for 'default."
 (define +sync-begin+ "\x1b[?2026h")
 (define +sync-end+ "\x1b[?2026l")
 
+(define %b64-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(define (base64-encode bv)
+  (let* ((n   (bytevector-length bv))
+         (out (make-string (* 4 (quotient (+ n 2) 3)) #\=)))
+    (let loop ((i 0) (j 0))
+      (cond
+       ((>= i n) out)
+       (else
+        (let* ((b0 (bytevector-u8-ref bv i))
+               (b1 (if (< (+ i 1) n) (bytevector-u8-ref bv (+ i 1)) 0))
+               (b2 (if (< (+ i 2) n) (bytevector-u8-ref bv (+ i 2)) 0))
+               (k0 (ash b0 -2))
+               (k1 (logior (logand (ash b0 4) #x30) (ash b1 -4)))
+               (k2 (logior (logand (ash b1 2) #x3c) (ash b2 -6)))
+               (k3 (logand b2 #x3f)))
+          (string-set! out j       (string-ref %b64-alphabet k0))
+          (string-set! out (+ j 1) (string-ref %b64-alphabet k1))
+          (when (< (+ i 1) n)
+            (string-set! out (+ j 2) (string-ref %b64-alphabet k2)))
+          (when (< (+ i 2) n)
+            (string-set! out (+ j 3) (string-ref %b64-alphabet k3)))
+          (loop (+ i 3) (+ j 4))))))))
+
+(define +chunk-size+ 3072)   ; pre-base64; b64 expansion ≤ 4096 limit
+
+(define (emit-image-transmit! port id bv)
+  (let* ((b64 (base64-encode bv))
+         (n   (string-length b64)))
+    (let loop ((off 0))
+      (let* ((remain (- n off))
+             (size   (min +chunk-size+ remain))
+             (more?  (> remain size))
+             (head   (if (zero? off)
+                         (string-append "a=t,f=100,i=" (number->string id)
+                                        ",m=" (if more? "1" "0"))
+                         (string-append "m=" (if more? "1" "0")))))
+        (display "\x1b_G" port)
+        (display head port)
+        (display ";" port)
+        (display (substring b64 off (+ off size)) port)
+        (display "\x1b\\" port)
+        (when more? (loop (+ off size)))))))
+
+(define (emit-image-place! port img-id pid col row w h sx sy sw sh px py)
+  (display "\x1b[" port)
+  (display (number->string (+ row 1)) port)
+  (display ";" port)
+  (display (number->string (+ col 1)) port)
+  (display "H" port)
+  (display "\x1b_Ga=p,i=" port)
+  (display (number->string img-id) port)
+  (display ",p=" port)
+  (display (number->string pid) port)
+  (display ",c=" port)
+  (display (number->string w) port)
+  (display ",r=" port)
+  (display (number->string h) port)
+  (when (and (positive? sw) (positive? sh))
+    (display ",x=" port) (display (number->string sx) port)
+    (display ",y=" port) (display (number->string sy) port)
+    (display ",w=" port) (display (number->string sw) port)
+    (display ",h=" port) (display (number->string sh) port))
+  (when (positive? px)
+    (display ",X=" port) (display (number->string px) port))
+  (when (positive? py)
+    (display ",Y=" port) (display (number->string py) port))
+  (display ",z=1\x1b\\" port))
+
+(define (emit-image-delete-placement! port img-id pid)
+  (display "\x1b_Ga=d,d=i,i=" port)
+  (display (number->string img-id) port)
+  (display ",p=" port)
+  (display (number->string pid) port)
+  (display "\x1b\\" port))
+
+(define (next-placement-id! b)
+  (let ((id (ansi-backend-next-placement-id b)))
+    (set! (ansi-backend-next-placement-id b) (+ id 1))
+    id))
+
+(define (image-id-for! b src)
+  "Return the kitty image id for SRC, transmitting the bytes on first
+use. Returns #f if SRC isn't registered."
+  (cond
+   ((hashq-ref (ansi-backend-image-ids b) src) => (lambda (id) id))
+   ((not (image-registered? src)) #f)
+   (else
+    (let* ((id (ansi-backend-next-image-id b))
+           (bv (image-bytes src)))
+      (emit-image-transmit! (ansi-backend-port b) id bv)
+      (hashq-set! (ansi-backend-image-ids b) src id)
+      (set! (ansi-backend-next-image-id b) (+ id 1))
+      (set! (ansi-backend-image-transmits b)
+            (+ (ansi-backend-image-transmits b) 1))
+      (set! (ansi-backend-image-transmit-bytes b)
+            (+ (ansi-backend-image-transmit-bytes b)
+               ;; PNG payload base64-expanded (~4/3) + framing overhead per chunk
+               (quotient (* (bytevector-length bv) 4) 3)
+               (* 40 (max 1 (quotient (bytevector-length bv) 3072)))))
+      id))))
+
+(define (partition-image-cmds cmds)
+  (let lp ((cs cmds) (gfx '()) (rest '()))
+    (cond
+     ((null? cs) (values (reverse gfx) (reverse rest)))
+     ((image-cmd? (car cs)) (lp (cdr cs) (cons (car cs) gfx) rest))
+     (else (lp (cdr cs) gfx (cons (car cs) rest))))))
+
+(define (parse-cell-size response)
+  "Pull height,width out of a \\e[6;H;Wt response if present.
+Returns (values H W) or (values #f #f) if absent."
+  (let ((hit (string-contains response "\x1b[6;")))
+    (cond
+     ((not hit) (values #f #f))
+     (else
+      (let* ((rest (substring response (+ hit 4)))
+             (tend (string-index rest #\t)))
+        (cond
+         ((not tend) (values #f #f))
+         (else
+          (let* ((body  (substring rest 0 tend))
+                 (parts (string-split body #\;)))
+            (cond
+             ((not (= (length parts) 2)) (values #f #f))
+             (else
+              (let ((h (string->number (car  parts)))
+                    (w (string->number (cadr parts))))
+                (if (and h w (positive? h) (positive? w))
+                    (values h w)
+                    (values #f #f)))))))))))))
+
+(define (detect-kitty-graphics! b)
+  "Send a kitty graphics capability probe, a cell-pixel-size query
+\\e[16t, and DA1. Read the response with a short timeout. Set the
+backend's cell-w/cell-h slots from the response. Return #t iff the
+terminal answered the kitty query with OK."
+  (let ((out (ansi-backend-port b))
+        (in  (current-input-port)))
+    (display "\x1b_Gi=1,a=q;AAAA\x1b\\\x1b[16t\x1b[c" out)
+    (force-output out)
+    (let* ((deadline-ms 250)
+           (start (get-internal-real-time))
+           (units internal-time-units-per-second))
+      (let loop ((buf '()) (saw-c? #f))
+        (cond
+         (saw-c?
+          (let ((s (list->string (reverse buf))))
+            (call-with-values (lambda () (parse-cell-size s))
+              (lambda (h w)
+                (when (and h w)
+                  (set! (cell-h b) h)
+                  (set! (cell-w b) w))))
+            (and (string-contains s "_G")
+                 (string-contains s "OK"))))
+         ((char-ready? in)
+          (let ((ch (read-char in)))
+            (loop (cons ch buf) (eqv? ch #\c))))
+         (else
+          (let ((elapsed-ms (quotient (* (- (get-internal-real-time) start) 1000)
+                                       units)))
+            (if (>= elapsed-ms deadline-ms)
+                (let ((s (list->string (reverse buf))))
+                  (call-with-values (lambda () (parse-cell-size s))
+                    (lambda (h w)
+                      (when (and h w)
+                        (set! (cell-h b) h)
+                        (set! (cell-w b) w))))
+                  (and (string-contains s "_G")
+                       (string-contains s "OK")))
+                (begin (usleep 1000) (loop buf #f))))))))))
+
+(define (count-csi-escapes s)
+  "Scan S for CSI sequences (\\e[…<final>). Return (values sgr cursor),
+counting m-terminated and H-terminated sequences respectively."
+  (let ((n (string-length s)))
+    (let loop ((i 0) (sgr 0) (cur 0))
+      (cond
+       ((>= i n) (values sgr cur))
+       ((and (char=? (string-ref s i) #\esc)
+             (< (+ i 1) n)
+             (char=? (string-ref s (+ i 1)) #\[))
+        (let scan ((j (+ i 2)))
+          (cond
+           ((>= j n) (values sgr cur))
+           (else
+            (let ((c (string-ref s j)))
+              (cond
+               ((char=? c #\m) (loop (+ j 1) (+ sgr 1) cur))
+               ((char=? c #\H) (loop (+ j 1) sgr (+ cur 1)))
+               ((and (char>=? c #\@) (char<=? c #\~))
+                (loop (+ j 1) sgr cur))
+               (else (scan (+ j 1)))))))))
+       (else (loop (+ i 1) sgr cur))))))
+
+(define (stats b)
+  "Return an alist of metrics counters for B since last reset-stats!."
+  (let ((f (ansi-backend-frames b))
+        (bo (ansi-backend-bytes-out b)))
+    `((frames               . ,f)
+      (bytes-out            . ,bo)
+      (bytes-per-frame      . ,(if (zero? f) 0 (exact->inexact (/ bo f))))
+      (sgr-transitions      . ,(ansi-backend-sgr-transitions b))
+      (cursor-moves         . ,(ansi-backend-cursor-moves b))
+      (image-transmits      . ,(ansi-backend-image-transmits b))
+      (image-transmit-bytes . ,(ansi-backend-image-transmit-bytes b))
+      (placements-placed    . ,(ansi-backend-placements-placed b))
+      (placements-deleted   . ,(ansi-backend-placements-deleted b)))))
+
+(define (reset-stats! b)
+  "Zero all metrics counters on B."
+  (set! (ansi-backend-frames b) 0)
+  (set! (ansi-backend-bytes-out b) 0)
+  (set! (ansi-backend-sgr-transitions b) 0)
+  (set! (ansi-backend-cursor-moves b) 0)
+  (set! (ansi-backend-image-transmits b) 0)
+  (set! (ansi-backend-image-transmit-bytes b) 0)
+  (set! (ansi-backend-placements-placed b) 0)
+  (set! (ansi-backend-placements-deleted b) 0))
+
 (define (ensure-term-size! b w h)
   "Ensure the backend's cur and prev terms exist at WxH. Resize or
 allocate as needed. On resize, also clears the physical terminal so
@@ -196,7 +542,7 @@ on screen as ghosts."
       (t:term-clear! prev)))))
 
 (define-method (backend-draw (b <ansi-backend>) cmds)
-  (let* ((sz   (get-terminal-size))
+  (let* ((sz   (backend-size b))         ; goes through method dispatch — subclasses override
          (cur-sz (ansi-backend-size b))
          (w    (if sz (size-width sz)  (size-width cur-sz)))
          (h    (if sz (size-height sz) (size-height cur-sz)))
@@ -204,12 +550,29 @@ on screen as ghosts."
     (ensure-term-size! b w h)
     (let ((cur  (ansi-backend-cur-term b))
           (prev (ansi-backend-prev-term b)))
-      (t:term-clear! cur)
-      (render-cmds-to-term! cur cmds (ansi-backend-theme b))
-      (display +sync-begin+ out)
-      (display (t:term-diff->ansi prev cur) out)
-      (display +sync-end+ out)
-      (force-output out)
+      (call-with-values (lambda () (split-cmds-for-graphics b cmds))
+        (lambda (gfx-cmds grid-cmds)
+          (t:term-clear! cur)
+          (render-cmds-to-term! cur grid-cmds (ansi-backend-theme b))
+          (let ((diff (t:term-diff->ansi prev cur)))
+            (display +sync-begin+ out)
+            (display diff out)
+            (when (pair? gfx-cmds) (emit-images! b gfx-cmds))
+            (display +sync-end+ out)
+            (force-output out)
+            (set! (ansi-backend-frames b)
+                  (+ (ansi-backend-frames b) 1))
+            (set! (ansi-backend-bytes-out b)
+                  (+ (ansi-backend-bytes-out b)
+                     (string-length +sync-begin+)
+                     (string-length diff)
+                     (string-length +sync-end+)))
+            (call-with-values (lambda () (count-csi-escapes diff))
+              (lambda (sgr cur-moves)
+                (set! (ansi-backend-sgr-transitions b)
+                      (+ (ansi-backend-sgr-transitions b) sgr))
+                (set! (ansi-backend-cursor-moves b)
+                      (+ (ansi-backend-cursor-moves b) cur-moves)))))))
       ;; swap cur and prev: this frame's cur becomes next frame's prev,
       ;; last frame's prev gets recycled as next frame's cur.
       (set! (ansi-backend-cur-term  b) prev)
@@ -224,6 +587,11 @@ on screen as ghosts."
   (let ((out (ansi-backend-port b)))
     (display "\x1b[?1004h" out)  ; focus reporting on
     (force-output out))
+  (set! (graphics? b) (detect-kitty-graphics! b))
+  (hash-clear! (ansi-backend-image-ids b))
+  (hash-clear! (ansi-backend-placements b))
+  (set! (ansi-backend-next-image-id b) 1)
+  (set! (ansi-backend-next-placement-id b) 1)
   (let ((sz (get-terminal-size)))
     (set! (ansi-backend-size b) sz)
     (set! (ansi-backend-cur-term b)  #f)
@@ -231,6 +599,10 @@ on screen as ghosts."
 
 (define-method (backend-shutdown (b <ansi-backend>))
   (let ((out (ansi-backend-port b)))
+    (when (graphics? b)
+      ;; a=d,d=A: delete all placements AND free image storage. Without
+      ;; this the terminal holds onto sprite bytes forever.
+      (display "\x1b_Ga=d,d=A\x1b\\" out))
     (display "\x1b[?1004l" out)
     (force-output out))
   (show-cursor)

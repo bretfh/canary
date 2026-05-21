@@ -29,6 +29,22 @@
             clear-cmd?
             make-clear
 
+            <image-cmd>
+            image-cmd?
+            make-image
+            image-col
+            image-row
+            image-w
+            image-h
+            image-px
+            image-py
+            image-src-x
+            image-src-y
+            image-src-w
+            image-src-h
+            image-src
+            image-fallback
+
             cmd?))
 
 (define-record-type <text-cmd>
@@ -60,5 +76,22 @@
   (make-clear)
   clear-cmd?)
 
+(define-record-type <image-cmd>
+  (make-image col row w h px py src-x src-y src-w src-h src fallback)
+  image-cmd?
+  (col      image-col)
+  (row      image-row)
+  (w        image-w)
+  (h        image-h)
+  (px       image-px)
+  (py       image-py)
+  (src-x    image-src-x)
+  (src-y    image-src-y)
+  (src-w    image-src-w)
+  (src-h    image-src-h)
+  (src      image-src)
+  (fallback image-fallback))
+
 (define (cmd? x)
-  (or (text-cmd? x) (fill-cmd? x) (cursor-cmd? x) (clear-cmd? x)))
+  (or (text-cmd? x) (fill-cmd? x) (cursor-cmd? x) (clear-cmd? x)
+      (image-cmd? x)))

@@ -28,6 +28,7 @@
   #:use-module (rnrs bytevectors)
   #:export (<app>
             run-app
+            start-app!
             init update view
             send
             <log-entry> log-entry?
@@ -474,28 +475,35 @@ set! on the queue is safe."
                   (drain last-mouse-time))))))))))))
 
 (define (dispatch-to-user app msg)
+  "Returns #t if MSG actually reached update, #f if filtered out."
   (catch #t
     (lambda ()
       (let* ((flt (app-filter app))
              (msg (if flt (flt msg) msg)))
-        (when msg
+        (cond
+         ((not msg) #f)
+         (else
           (let ((sz (backend-size (app-backend app))))
             (call-with-values
                 (lambda () (update app msg sz))
               (lambda (new-app cmd)
-                (when cmd (run-command app cmd))))))))
+                (when cmd (run-command app cmd)))))
+          #t))))
     (lambda (key . args)
-      (log! app 'update 'error (format #f "~a ~a" key args)))))
+      (log! app 'update 'error (format #f "~a ~a" key args))
+      #f)))
 
 (define (process-one app msg)
+  "Returns #t if MSG produced a real dispatch (update ran), #f if it
+was a no-op (keymap pending/no-match with no fallback, or filter drop)."
   (cond
-   ((eq? msg 'quit) (stop-app! app))
+   ((eq? msg 'quit) (stop-app! app) #t)
    ((or (key? msg) (mouse? msg))
     (receive (action new-km) (feed-key (app-keymap app) msg)
       (set-app-keymap! app new-km)
       (cond
        ((eq? action 'pending) #f)
-       ((eq? action 'quit)    (stop-app! app))
+       ((eq? action 'quit)    (stop-app! app) #t)
        (action                (dispatch-to-user app action))
        (else                  (dispatch-to-user app msg)))))
    (else
@@ -504,25 +512,57 @@ set! on the queue is safe."
 (define (event-loop app)
   (let loop ()
     (when (app-running? app)
-      ;; wait for the bell
       (get-message (app-msg-bell app))
       (set! (app-bell-rung? app) #f)
-      ;; drain everything that's been queued since the last loop iter
-      (let ((msgs (drain-msgs! app)))
-        (for-each (lambda (m) (when (app-running? app) (process-one app m)))
-                  msgs))
-      ;; one render per batch
-      (when (app-running? app)
-        (catch #t
-          (lambda () (render-frame app))
-          (lambda (key . args)
-            (log! app 'render 'error (format #f "~a ~a" key args)))))
+      (let* ((msgs (drain-msgs! app))
+             (dispatched?
+              (let lp ((ms msgs) (any? #f))
+                (cond
+                 ((null? ms) any?)
+                 ((not (app-running? app)) any?)
+                 (else
+                  (let ((d? (process-one app (car ms))))
+                    (lp (cdr ms) (or any? d?))))))))
+        (when (and (app-running? app) dispatched?)
+          (catch #t
+            (lambda () (render-frame app))
+            (lambda (key . args)
+              (log! app 'render 'error (format #f "~a ~a" key args))))))
       (when (app-running? app) (loop)))))
 
 (define %dup2
   (pointer->procedure int
                       (dynamic-func "dup2" (dynamic-link))
                       (list int int)))
+
+(define (start-app! app)
+  "Start APP inside an existing fibers scheduler. Spawns event-loop
+and input-loop fibers, runs the app's init cmd, sends the initial
+resize, then blocks on the stop-channel until the app is stopped.
+Does NOT touch process-global state (signals, stderr capture); the
+caller (an engine running multiple sessions in one image) owns that.
+Returns when the app stops."
+  (backend-init (app-backend app))
+  (when (app-title app)
+    (run-command app (set-title (app-title app))))
+  (run-command app (cursor (app-cursor app)))
+  (run-command app (mouse-mode (app-mouse app)))
+  (unless (app-alt-screen? app)
+    (run-command app (alt-screen 'off)))
+  (let ((guarded (lambda (name thunk)
+                   (lambda ()
+                     (catch #t thunk
+                       (lambda (key . args)
+                         (log! app name 'error (format #f "~a ~a" key args))
+                         (stop-app! app)))))))
+    (spawn-fiber (guarded 'event-loop (lambda () (event-loop app))))
+    (spawn-fiber (guarded 'input-loop (lambda () (input-loop app)))))
+  (let ((init-cmd (init app)))
+    (when init-cmd (run-command app init-cmd)))
+  (let ((sz (backend-size (app-backend app))))
+    (send app (resize (size-width sz) (size-height sz))))
+  (get-message (app-stop-ch app))
+  (backend-shutdown (app-backend app)))
 
 (define (run-app app)
   (let ((cleanup-done #f)

@@ -1,4 +1,5 @@
 (define-module (canary view)
+  #:use-module (canary width)
   #:use-module (srfi srfi-9)
   #:export (<rect>
             rect?
@@ -125,7 +126,21 @@
             static-node-cached-rect
             set-static-node-cached-rect!
             static-node-cached-cmds
-            set-static-node-cached-cmds!))
+            set-static-node-cached-cmds!
+
+            <image-node>
+            image-node?
+            make-image-node
+            image-node-src
+            image-node-w
+            image-node-h
+            image-node-px
+            image-node-py
+            image-node-src-x
+            image-node-src-y
+            image-node-src-w
+            image-node-src-h
+            image-node-fallback))
 
 (define-record-type <rect>
   (make-rect col row w h)
@@ -298,6 +313,20 @@
 
 (define (make-static-node child) (%static-node child #f #f #f))
 
+(define-record-type <image-node>
+  (make-image-node src w h px py src-x src-y src-w src-h fallback)
+  image-node?
+  (src      image-node-src)
+  (w        image-node-w)
+  (h        image-node-h)
+  (px       image-node-px)
+  (py       image-node-py)
+  (src-x    image-node-src-x)
+  (src-y    image-node-src-y)
+  (src-w    image-node-src-w)
+  (src-h    image-node-src-h)
+  (fallback image-node-fallback))
+
 (define (view-node? x)
   (or (text-node? x) (text-runs-node? x)
       (fill-node? x) (spacer-node? x)
@@ -305,9 +334,10 @@
       (pad-node? x) (margin-node? x) (align-node? x)
       (width-node? x) (height-node? x)
       (cursor-node? x) (overlay-node? x) (static-node? x)
+      (image-node? x)
       (string? x) (not x)))
 
-(define (str-visible-length s) (string-length s))
+(define (str-visible-length s) (string-display-width s))
 
 (define-syntax-rule (memo getter setter node expr)
   (or (getter node)
@@ -316,7 +346,7 @@
 (define (compute-size node)
   (cond
    ((not node) (cons 0 0))
-   ((string? node) (cons (string-length node) 1))
+   ((string? node) (cons (string-display-width node) 1))
    ((text-node? node)
     (memo text-node-cache set-text-node-cache! node
           (cons (str-visible-length (text-node-str node)) 1)))
@@ -380,6 +410,8 @@
    ((static-node? node)
     (memo static-node-size-cache set-static-node-size-cache! node
           (view-size (static-node-child node))))
+   ((image-node? node)
+    (cons (image-node-w node) (image-node-h node)))
    (else (cons 0 0))))
 
 (define (view-size node) (compute-size node))

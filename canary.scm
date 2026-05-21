@@ -5,13 +5,15 @@
   #:use-module (canary key)
   #:use-module (canary keymap)
   #:use-module (canary layout)
+  #:use-module (canary image)
   #:use-module (canary protocol)
+  #:use-module (canary spring)
   #:use-module (canary theme)
   #:use-module (canary view)
 
   #:re-export
   (;; app
-   <app> run-app init update view send
+   <app> run-app start-app! init update view send
    <log-entry> log-entry? log-entry-time log-entry-source
    log-entry-level log-entry-text
    log! clear-log! with-engine-error render-log
@@ -23,6 +25,13 @@
 
    ;; backend
    <ansi-backend> make-ansi-backend
+   graphics? cell-w cell-h
+   stats reset-stats!
+
+   ;; spring physics
+   make-spring-animation spring-update
+   make-spring-smooth make-spring-bouncy make-spring-gentle make-spring-snappy
+   fps
 
    ;; key
    <key> key key? key-sym key-mods key=? key->string
@@ -41,7 +50,11 @@
 
    ;; layout — the user-facing way to build views
    txt vbox hbox spacer join pad margin align width height fill
-   place-cursor pin overlay static
+   place-cursor pin overlay static image
+
+   ;; image — asset registry
+   images define-image! image-registered? image-path image-bytes
+   clear-images!
 
    ;; protocol
    <size> size size? size-width size-height

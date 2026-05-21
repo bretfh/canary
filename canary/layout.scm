@@ -17,6 +17,7 @@
             pin
             overlay
             static
+            image
             parse-style-args))
 
 (define %empty-text (make-text-node "" 'default '()))
@@ -138,3 +139,9 @@ Styling kwargs: #:fg #:bg (hex or palette symbol),
 
 (define (overlay base . pins)
   (make-overlay-node base pins))
+
+(define* (image src #:key (w 1) (h 1) (px 0) (py 0)
+                (src-x 0) (src-y 0) (src-w 0) (src-h 0)
+                (fallback #f))
+  (make-image-node src w h px py src-x src-y src-w src-h
+                   (or fallback (make-spacer-node w h))))

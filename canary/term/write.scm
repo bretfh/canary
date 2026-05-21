@@ -1,8 +1,9 @@
 (define-module (canary term write)
   #:use-module (canary term types)
   #:use-module (canary term ops)
-  #:export (term-write!
-            char-display-width))
+  #:use-module (canary width)
+  #:export (term-write!)
+  #:re-export (char-display-width))
 
 (define *dec-line-drawing*
   (let ((h (make-hash-table)))
@@ -33,28 +34,6 @@
     ((g3) (term-g3 term))
     (else 'us-ascii)))
 
-(define (char-display-width ch)
-  (let ((code (char->integer ch)))
-    (cond
-     ((< code 32) 0)
-     ((= code #x7F) 0)
-     ((or (and (<= #x0300 code) (<= code #x036F))
-          (and (<= #x0483 code) (<= code #x0489))
-          (and (<= #x0591 code) (<= code #x05C7))
-          (and (<= #x064B code) (<= code #x065F))
-          (and (<= #x200B code) (<= code #x200F))
-          (and (<= #x20D0 code) (<= code #x20FF))
-          (and (<= #xFE20 code) (<= code #xFE2F)))
-      0)
-     ((or (and (<= #x1100 code) (<= code #x115F))
-          (and (<= #x2E80 code) (<= code #x2FFF))
-          (and (<= #x3000 code) (<= code #x9FFF))
-          (and (<= #xAC00 code) (<= code #xD7A3))
-          (and (<= #xF900 code) (<= code #xFAFF))
-          (and (<= #xFF01 code) (<= code #xFF60))
-          (and (<= #x1F300 code) (<= code #x1F9FF)))
-      2)
-     (else 1))))
 
 (define (current-write-face term)
   (let ((cur (term-attrs term))
@@ -105,11 +84,13 @@
                       (y2 (term-cursor-y term)))
                   (set-term-cell-at! term x2 y2 ch face)
                   (when (and (= cw 2) (< (+ x2 1) w))
-                    (set-term-cell-at! term (+ x2 1) y2 #\space face))
+                    (set-term-cell-at! term (+ x2 1) y2
+                                       (integer->char +wide-cont+) face))
                   (set-term-cursor-x! term (+ x2 cw))))
                (else
                 (set-term-cell-at! term x y ch face)
                 (when (and (= cw 2) (< (+ x 1) w))
-                  (set-term-cell-at! term (+ x 1) y #\space face))
+                  (set-term-cell-at! term (+ x 1) y
+                                     (integer->char +wide-cont+) face))
                 (set-term-cursor-x! term (+ x cw))))))
           (loop (+ idx 1)))))))

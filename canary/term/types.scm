@@ -74,7 +74,9 @@
             term-copy-row!
             term-copy!
             term-reset!
-            term-resize!))
+            term-resize!
+
+            +wide-cont+ wide-cont?))
 
 (define-record-type <face-attrs>
   (%make-face-attrs fg bg bold? faint? italic? underline ul-color
@@ -194,6 +196,14 @@
   (last-write-face  term-last-write-face  set-term-last-write-face!))
 
 (define %space (char->integer #\space))
+
+;; Sentinel code point stored in the cell immediately to the right of a
+;; wide character. The terminal's natural rendering of the wide char
+;; already covered that visual column; the renderer skips sentinel cells
+;; so we don't move the cursor or write garbage on top of the wide char.
+(define +wide-cont+ 0)
+
+(define (wide-cont? cp) (= cp +wide-cont+))
 
 (define (alloc-chars n) (make-u32vector n %space))
 (define (alloc-faces n) (make-vector n #f))
