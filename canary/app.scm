@@ -10,7 +10,10 @@
   #:use-module (canary keymap)
   #:use-module (canary keymap-input)
   #:use-module ((canary view) #:select (make-text-node))
-  #:use-module ((canary draw) #:select (make-clear))
+  #:use-module ((canary draw) #:select (make-clear clickable-cmd?
+                                                   clickable-col clickable-row
+                                                   clickable-w clickable-h
+                                                   clickable-action))
   #:use-module ((canary layout) #:select (txt vbox width overlay pin))
   #:use-module ((canary borders) #:select (boxed border-rounded))
   #:use-module (fibers)
@@ -166,7 +169,11 @@
   (msg-bell    #:init-form (make-bell-pipe)  #:accessor app-msg-bell)
   (stop-ch     #:init-form (make-bell-pipe)  #:accessor app-stop-ch)
   (running?    #:init-value #t               #:accessor app-running?)
-  (log-entries #:init-value '()              #:accessor app-log-entries))
+  (log-entries #:init-value '()              #:accessor app-log-entries)
+  ;; populated by render-frame from the last frame's clickable-cmds.
+  ;; process-one scans this in reverse (topmost first) on mouse-left
+  ;; press before falling through to keymap dispatch.
+  (click-regions #:init-value '() #:accessor app-click-regions))
 
 (define (make-bell-pipe)
   (let ((p (pipe)))
@@ -337,7 +344,10 @@ needed."
              (tree  (compose-log-overlay app sz user))
              (cmds  (cons (make-clear)
                           (render tree (size-width sz) (size-height sz)))))
-        (backend-draw (app-backend app) cmds)))
+        (call-with-values (lambda () (partition clickable-cmd? cmds))
+          (lambda (clicks draws)
+            (set! (app-click-regions app) clicks)
+            (backend-draw (app-backend app) draws)))))
     (lambda (key . args)
       ;; render itself threw — don't recurse into log (would loop); just stderr
       (format (current-error-port) "canary render failed: ~a ~a\n" key args))))
@@ -507,11 +517,52 @@ needed."
       (log! app 'update 'error (format #f "~a ~a" key args))
       #f)))
 
+(define (find-click-region regions x y)
+  "Topmost-wins: regions are appended in render order, later entries are
+drawn on top, so scan from the end backward and return the first
+clickable-cmd whose rect contains (X,Y), or #f."
+  (let lp ((rs (reverse regions)))
+    (cond
+     ((null? rs) #f)
+     (else
+      (let ((r (car rs)))
+        (if (and (<= (clickable-col r) x)
+                 (< x (+ (clickable-col r) (clickable-w r)))
+                 (<= (clickable-row r) y)
+                 (< y (+ (clickable-row r) (clickable-h r))))
+            r
+            (lp (cdr rs))))))))
+
+(define (mouse-left-press? msg)
+  (and (mouse? msg)
+       (eqv? (mouse-button msg) 0)
+       (memq (mouse-action msg) '(press click))))
+
 (define (process-one app msg)
   "Returns #t if MSG produced a real dispatch (update ran), #f if it
 was a no-op (keymap pending/no-match with no fallback, or filter drop)."
   (cond
    ((eq? msg 'quit) (stop-app! app) #t)
+   ((mouse-left-press? msg)
+    (let ((hit (find-click-region (app-click-regions app)
+                                  (mouse-x msg) (mouse-y msg))))
+      (cond
+       (hit
+        (let ((action (clickable-action hit)))
+          (cond
+           ((eq? action 'quit) (stop-app! app) #t)
+           (else               (dispatch-to-user app action)))))
+       (else
+        ;; no clickable hit — fall through so keymap bindings on
+        ;; '(mouse left) still work, and so user update gets the raw
+        ;; mouse msg for ad-hoc handling.
+        (receive (action new-km) (feed-key (app-keymap app) msg)
+          (set-app-keymap! app new-km)
+          (cond
+           ((eq? action 'pending) #f)
+           ((eq? action 'quit)    (stop-app! app) #t)
+           (action                (dispatch-to-user app action))
+           (else                  (dispatch-to-user app msg))))))))
    ((or (key? msg) (mouse? msg))
     (receive (action new-km) (feed-key (app-keymap app) msg)
       (set-app-keymap! app new-km)

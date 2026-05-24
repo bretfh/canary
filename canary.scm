@@ -50,7 +50,7 @@
 
    ;; layout — the user-facing way to build views
    txt vbox hbox spacer join pad margin align width height fill
-   place-cursor pin overlay static image
+   place-cursor pin overlay static image on-click
 
    ;; image — asset registry
    images define-image! image-registered? image-path image-bytes

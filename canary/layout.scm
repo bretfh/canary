@@ -18,6 +18,7 @@
             overlay
             static
             image
+            on-click
             parse-style-args))
 
 (define %empty-text (make-text-node "" 'default '()))
@@ -145,3 +146,9 @@ Styling kwargs: #:fg #:bg (hex or palette symbol),
                 (fallback #f))
   (make-image-node src w h px py src-x src-y src-w src-h
                    (or fallback (make-spacer-node w h))))
+
+(define (on-click action child)
+  "Wrap CHILD so a mouse-left press inside its rendered rect dispatches
+ACTION through the app's update method. ACTION is any msg value the
+app's update knows how to handle (symbol, key, list, …)."
+  (make-click-node action child))

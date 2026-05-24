@@ -140,7 +140,13 @@
             image-node-src-y
             image-node-src-w
             image-node-src-h
-            image-node-fallback))
+            image-node-fallback
+
+            <click-node>
+            click-node?
+            make-click-node
+            click-node-action
+            click-node-child))
 
 (define-record-type <rect>
   (make-rect col row w h)
@@ -327,6 +333,15 @@
   (src-h    image-node-src-h)
   (fallback image-node-fallback))
 
+(define-record-type <click-node>
+  (%click-node action child cache)
+  click-node?
+  (action click-node-action)
+  (child  click-node-child)
+  (cache  click-node-cache set-click-node-cache!))
+
+(define (make-click-node action child) (%click-node action child #f))
+
 (define (view-node? x)
   (or (text-node? x) (text-runs-node? x)
       (fill-node? x) (spacer-node? x)
@@ -334,7 +349,7 @@
       (pad-node? x) (margin-node? x) (align-node? x)
       (width-node? x) (height-node? x)
       (cursor-node? x) (overlay-node? x) (static-node? x)
-      (image-node? x)
+      (image-node? x) (click-node? x)
       (string? x) (not x)))
 
 (define (str-visible-length s) (string-display-width s))
@@ -412,6 +427,9 @@
           (view-size (static-node-child node))))
    ((image-node? node)
     (cons (image-node-w node) (image-node-h node)))
+   ((click-node? node)
+    (memo click-node-cache set-click-node-cache! node
+          (view-size (click-node-child node))))
    (else (cons 0 0))))
 
 (define (view-size node) (compute-size node))
@@ -433,4 +451,5 @@
    ((static-node? node)
     (set-static-node-size-cache!  node #f)
     (set-static-node-cached-rect! node #f)
-    (set-static-node-cached-cmds! node #f))))
+    (set-static-node-cached-cmds! node #f))
+   ((click-node? node)   (set-click-node-cache!   node #f))))

@@ -45,6 +45,15 @@
             image-src
             image-fallback
 
+            <clickable-cmd>
+            clickable-cmd?
+            make-clickable
+            clickable-col
+            clickable-row
+            clickable-w
+            clickable-h
+            clickable-action
+
             cmd?))
 
 (define-record-type <text-cmd>
@@ -92,6 +101,15 @@
   (src      image-src)
   (fallback image-fallback))
 
+(define-record-type <clickable-cmd>
+  (make-clickable col row w h action)
+  clickable-cmd?
+  (col    clickable-col)
+  (row    clickable-row)
+  (w      clickable-w)
+  (h      clickable-h)
+  (action clickable-action))
+
 (define (cmd? x)
   (or (text-cmd? x) (fill-cmd? x) (cursor-cmd? x) (clear-cmd? x)
-      (image-cmd? x)))
+      (image-cmd? x) (clickable-cmd? x)))

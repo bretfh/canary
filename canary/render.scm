@@ -85,6 +85,12 @@
                         (image-node-src-w node) (image-node-src-h node)
                         (image-node-src node)
                         (image-node-fallback node)))))
+   ((click-node? node)
+    (let ((child-cmds (view->cmds (click-node-child node) rect)))
+      (append child-cmds
+              (list (make-clickable (rect-col rect) (rect-row rect)
+                                    (rect-w rect) (rect-h rect)
+                                    (click-node-action node))))))
    (else '())))
 
 (define (image-cmd->fallback-cmds cmd)
