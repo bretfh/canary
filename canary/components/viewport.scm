@@ -26,16 +26,25 @@
   ;; shows items starting at offset.
   (tail?   #:init-keyword #:tail?   #:init-value #f  #:accessor viewport-tail?))
 
-(define (viewport? x) (is-a? x <viewport>))
-(define (make-viewport . args) (apply make <viewport> args))
+(define (viewport? x)
+  "Return #t if X is a <viewport>."
+  (is-a? x <viewport>))
+
+(define (make-viewport . args)
+  "Return a fresh <viewport> initialised from ARGS, a sequence of
+#:items, #:offset, #:step, #:tail? keyword arguments."
+  (apply make <viewport> args))
 
 (define (viewport-scroll-up! v)
-  ;; Leave tail mode when the user actively scrolls.
+  "Scroll V up by its configured step.  Leaves tail mode if it was
+active.  Returns V."
   (set! (viewport-tail? v) #f)
   (set! (viewport-offset v) (max 0 (- (viewport-offset v) (viewport-step v))))
   v)
 
 (define (viewport-scroll-down! v)
+  "Scroll V down by its configured step, clamped to the item count.
+Leaves tail mode if it was active.  Returns V."
   (set! (viewport-tail? v) #f)
   (let ((n (length (viewport-items v))))
     (set! (viewport-offset v) (min (max 0 (- n 1))
@@ -43,18 +52,25 @@
   v)
 
 (define (viewport-scroll-to-start! v)
+  "Jump V to offset 0.  Leaves tail mode if it was active.  Returns V."
   (set! (viewport-tail? v) #f)
   (set! (viewport-offset v) 0)
   v)
 
 (define (viewport-scroll-to-end! v)
-  ;; Re-enter tail mode; offset becomes redundant but updated for
-  ;; consistency.
+  "Jump V to the last item and enter tail mode so future appends
+auto-scroll into view.  Returns V."
   (set! (viewport-tail? v) #t)
   (set! (viewport-offset v) (max 0 (- (length (viewport-items v)) 1)))
   v)
 
 (define-method (view (v <viewport>) sz)
+  "Render <viewport> V at size SZ: a vbox of the items visible in
+the window of SZ's height starting at offset, or the last window
+when tail? is true.  The view is clipped to the window height so
+view-size reports exactly the visible footprint (required for flex
+sizing — without clipping, scrolled history would steal space from
+siblings)."
   (let* ((items (viewport-items v))
          (n (length items))
          (h (max 1 (size-height sz)))
@@ -76,6 +92,10 @@
      (else (apply vbox visible)))))
 
 (define-method (update (v <viewport>) (msg <key>) sz)
+  "React to key MSG for <viewport> V.  Up / k scrolls up; down / j
+scrolls down, re-entering tail mode if it reaches the end; home
+jumps to the start; end pins to tail.  Returns two values: V
+(mutated in place) and #f (no cmd)."
   (let* ((k (key-sym msg))
          (h (max 1 (size-height sz)))
          (n (length (viewport-items v)))

@@ -32,10 +32,21 @@
   (focused?    #:init-keyword #:focused?    #:init-value #f
                #:accessor textinput-focused?))
 
-(define (textinput? x) (is-a? x <textinput>))
-(define (make-textinput . args) (apply make <textinput> args))
+(define (textinput? x)
+  "Return #t if X is a <textinput>."
+  (is-a? x <textinput>))
+
+(define (make-textinput . args)
+  "Return a fresh <textinput> initialised from ARGS, a sequence of
+#:value, #:cursor, #:placeholder, #:prompt, #:width, #:char-limit,
+#:focused? keyword arguments."
+  (apply make <textinput> args))
 
 (define-method (view (ti <textinput>) sz)
+  "Render <textinput> TI at size SZ: the prompt followed by the
+value or, if empty, the placeholder.  When focused, draws a reverse-
+video cell at the cursor position; horizontally scrolls when value
+length exceeds width."
   (let* ((val      (textinput-value ti))
          (prompt   (textinput-prompt ti))
          (w        (textinput-width ti))
@@ -67,6 +78,10 @@
             (hbox (txt prompt) (txt visible))))))))
 
 (define-method (update (ti <textinput>) msg sz)
+  "React to MSG for <textinput> TI.  Mouse press repositions the
+cursor.  Keys handled: backspace, delete, left, right, home, end,
+and self-inserting chars (subject to char-limit when non-zero).
+Returns two values: TI (mutated in place) and #f (no cmd)."
   (cond
    ((and (mouse? msg) (eq? (mouse-action msg) 'press))
     (let* ((pl  (string-length (textinput-prompt ti)))

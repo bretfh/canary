@@ -150,11 +150,26 @@ Styling kwargs: #:fg #:bg (hex or palette symbol),
   (make-image-node src w h px py src-x src-y src-w src-h
                    (or fallback (make-spacer-node w h))))
 
-(define (on-click action child)
-  "Wrap CHILD so a mouse-left press inside its rendered rect dispatches
-ACTION through the app's update method. ACTION is any msg value the
-app's update knows how to handle (symbol, key, list, …)."
-  (make-click-node action child))
+(define* (on-click action-or-child #:optional (child-or-unset #f)
+                   #:key (left #f) (right #f))
+  "Wrap CHILD so mouse presses inside its rendered rect dispatch as
+msgs through update.
+
+Positional (one action): (on-click ACTION CHILD) — left-press
+dispatches ACTION.
+
+Kwarg (left / right):    (on-click CHILD #:left LA #:right RA) —
+left-press dispatches LA; right-press dispatches RA. Either may be #f.
+
+Each action is any value the app's update knows how to match
+(symbol, list, key)."
+  (cond
+   (child-or-unset
+    ;; positional form: action-or-child is the action, child-or-unset is the child.
+    (make-click-node action-or-child child-or-unset right))
+   (else
+    ;; kwarg form: action-or-child is the child.
+    (make-click-node left action-or-child right))))
 
 (define (on-hover child styler)
   "Wrap CHILD so the engine renders STYLER's output instead while the

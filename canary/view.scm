@@ -150,6 +150,7 @@
             click-node?
             make-click-node
             click-node-action
+            click-node-right-action
             click-node-child
 
             <hover-node>
@@ -360,13 +361,15 @@
   (fallback image-node-fallback))
 
 (define-record-type <click-node>
-  (%click-node action child cache)
+  (%click-node action right-action child cache)
   click-node?
-  (action click-node-action)
-  (child  click-node-child)
-  (cache  click-node-cache set-click-node-cache!))
+  (action       click-node-action)
+  (right-action click-node-right-action)
+  (child        click-node-child)
+  (cache        click-node-cache set-click-node-cache!))
 
-(define (make-click-node action child) (%click-node action child #f))
+(define* (make-click-node action child #:optional (right-action #f))
+  (%click-node action right-action child #f))
 
 (define-record-type <hover-node>
   (%hover-node child styler cache)

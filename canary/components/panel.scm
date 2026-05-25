@@ -30,10 +30,21 @@
   (content       #:init-keyword #:content       #:init-value #f
                  #:accessor panel-content))
 
-(define (panel? x) (is-a? x <panel>))
-(define (make-panel . args) (apply make <panel> args))
+(define (panel? x)
+  "Return #t if X is a <panel>."
+  (is-a? x <panel>))
+
+(define (make-panel . args)
+  "Return a fresh <panel> initialised from ARGS, a sequence of
+#:title, #:footer, #:border, #:face, #:hover-face, #:hover-border,
+#:content keyword arguments."
+  (apply make <panel> args))
 
 (define-method (view (p <panel>) sz)
+  "Render <panel> P at size SZ: P's content boxed with the configured
+border, title, optional footer, and base face.  When a hover-face is
+configured, wrap in `on-hover` so the frame face/border swap on
+pointer hover."
   (let* ((base-face (panel-face p))
          (border    (panel-border p))
          (hf        (panel-hover-face p))

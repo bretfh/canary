@@ -53,6 +53,7 @@
             clickable-w
             clickable-h
             clickable-action
+            clickable-right-action
 
             cmd?))
 
@@ -102,13 +103,17 @@
   (fallback image-fallback))
 
 (define-record-type <clickable-cmd>
-  (make-clickable col row w h action)
+  (%make-clickable col row w h action right-action)
   clickable-cmd?
-  (col    clickable-col)
-  (row    clickable-row)
-  (w      clickable-w)
-  (h      clickable-h)
-  (action clickable-action))
+  (col          clickable-col)
+  (row          clickable-row)
+  (w            clickable-w)
+  (h            clickable-h)
+  (action       clickable-action)
+  (right-action clickable-right-action))
+
+(define* (make-clickable col row w h action #:optional (right-action #f))
+  (%make-clickable col row w h action right-action))
 
 (define (cmd? x)
   (or (text-cmd? x) (fill-cmd? x) (cursor-cmd? x) (clear-cmd? x)

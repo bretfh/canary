@@ -9,6 +9,10 @@
 (define *input-log-file* "/tmp/guile-canary-input-debug.log")
 
 (define (enable-input-logging . args)
+  "Enable verbose tracing of every raw input byte to a log file.
+With no arguments, writes to the default path; with one argument,
+treats it as the path to use.  Stamps an enable marker into the
+log and returns #t."
   (when (pair? args)
     (set! *input-log-file* (car args)))
   (set! *input-log-enabled* #t)
@@ -18,10 +22,13 @@
   #t)
 
 (define (disable-input-logging)
+  "Disable input tracing.  Subsequent reads are silent.  Returns #t."
   (set! *input-log-enabled* #f)
   #t)
 
 (define (%ilog fmt . args)
+  "Internal: append a formatted line to the input log when tracing
+is enabled.  No-op otherwise."
   (when *input-log-enabled*
     (let ((port (open-file *input-log-file* "a")))
       (apply format port fmt args)
@@ -29,6 +36,10 @@
       (close-port port))))
 
 (define (read-key-msg)
+  "Read one logical input event from the current input port, or
+return #f if no byte is ready.  Maps ESC into an escape-sequence
+parse, DEL into 'backspace, control bytes (< 32) into ctrl-letter
+keys, and other chars into bare keys."
   (let ((port (current-input-port)))
     (if (char-ready? port)
         (let ((char (read-char port)))
@@ -51,6 +62,9 @@
         #f)))
 
 (define (ctrl-char-to-key char)
+  "Map a control character CHAR (code < 32) to a key symbol or
+letter char.  Recognises BS, TAB, LF, CR by name; everything else
+maps to the corresponding lowercase letter (so C-a = ^A = code 1)."
   (let ((code (char->integer char)))
     (case code
       ((8)  'backspace)
@@ -60,6 +74,10 @@
       (else (integer->char (+ code 96))))))
 
 (define (parse-escape-start port)
+  "Dispatch after reading an ESC byte: waits briefly for a follow-up
+byte (terminals may emit ESC sequences in two writes) and either
+parses the sequence or returns the bare 'escape key when no follow
+arrives within the timeout."
   (let loop ((tries 0))
     (cond
      ((and (not (char-ready? port)) (< tries 8))
@@ -78,6 +96,9 @@
             (key 'escape)))))))
 
 (define (parse-escape-sequence char port)
+  "Dispatch on the byte CHAR following ESC: '[' enters CSI, 'O'
+enters SS3, an alphabetic char becomes alt-LETTER, DEL becomes
+alt-backspace, anything else collapses to 'escape."
   (cond
    ((char=? char #\[)
     (%ilog "parse-escape-sequence: CSI '['")
@@ -131,6 +152,9 @@ Returns a (possibly empty) list of canonical mod symbols."
     (else #f)))
 
 (define (make-key sym mods)
+  "Construct a <key> with symbol SYM and a list of modifier symbols
+MODS.  Thin wrapper around `key` that takes mods as a list rather
+than a rest arg."
   (apply key sym mods))
 
 (define (read-csi-params-and-final port first-char)
@@ -158,6 +182,11 @@ Returns (#f #f) if the stream ends before a terminator."
             (values final-params c)))))))))
 
 (define (parse-csi-sequence port)
+  "Parse a CSI (Control Sequence Introducer) sequence after ESC[
+has been consumed.  Branches on the next byte: '<' = SGR mouse, 'I'
+= focus-in, 'O' = focus-out, a final letter (A-H/F/Z/P-S) = arrow
+or function key, a digit starts a parameter list terminated by '~'
+or a final letter.  Returns the synthesised event or 'unknown."
   (if (not (char-ready? port))
       (key 'unknown)
       (let ((ch (read-char port)))
@@ -192,6 +221,9 @@ Returns (#f #f) if the stream ends before a terminator."
           (key 'unknown))))))
 
 (define (parse-ss3-sequence port)
+  "Parse an SS3 (Single Shift 3) sequence after ESC O has been
+consumed.  Used by some terminals for arrows and home/end in
+application keypad mode."
   (if (not (char-ready? port))
       (key 'unknown)
       (let ((ch (read-char port)))
@@ -206,6 +238,12 @@ Returns (#f #f) if the stream ends before a terminator."
           (else  (key 'unknown))))))
 
 (define (parse-mouse-sequence port)
+  "Parse an SGR mouse report after ESC[< has been consumed.
+Reads three semicolon-separated numeric params and a terminator (M
+for press, m for release), then decodes the button byte to either a
+scroll event (bit 6 set), motion event (bit 5 set, low 2 bits are
+the held button or 3 for naked hover), or press/release.  Returns
+a <mouse> event with 0-indexed coordinates."
   (let ((params '())
         (term #f))
     (let loop ()
@@ -251,6 +289,10 @@ Returns (#f #f) if the stream ends before a terminator."
         (key 'unknown))))
 
 (define (parse-bracketed-paste port)
+  "Consume a bracketed-paste payload (ESC[200~ has already been
+read) and discard it through to the ESC[201~ end marker.  Returns
+a single 'paste key event; the actual pasted text is currently
+dropped on the floor."
   (%ilog "parse-bracketed-paste: reading pasted text")
   (let ((text ""))
     (let loop ()

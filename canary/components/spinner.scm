@@ -33,15 +33,27 @@
   (hz        #:init-keyword #:hz        #:init-value 10
              #:accessor spinner-hz))
 
-(define (spinner? x) (is-a? x <spinner>))
-(define (make-spinner . args) (apply make <spinner> args))
+(define (spinner? x)
+  "Return #t if X is a <spinner>."
+  (is-a? x <spinner>))
+
+(define (make-spinner . args)
+  "Return a fresh <spinner> initialised from ARGS, a sequence of
+#:frames, #:frame-idx, #:face, #:hz keyword arguments."
+  (apply make <spinner> args))
 
 (define-method (view (s <spinner>) sz)
+  "Render <spinner> S at size SZ: the current frame from S's frame
+list, drawn in the spinner's face."
   (let ((fr (spinner-frames s)))
     (txt (list-ref fr (modulo (spinner-frame-idx s) (length fr)))
          #:fg (spinner-face s))))
 
 (define-method (update (s <spinner>) msg sz)
+  "React to MSG for <spinner> S.  On <init>, install a periodic
+ticker tagged with S so `spinner-stop!` can later cancel it.  On
+each <tick>, advance the frame index.  Returns two values: the
+updated spinner and an optional cmd."
   (cond
    ((init? msg)
     (values s (every #:hz (spinner-hz s)

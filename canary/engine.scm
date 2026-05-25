@@ -243,6 +243,11 @@
        (eqv? (mouse-button msg) 0)
        (memq (mouse-action msg) '(press click))))
 
+(define (mouse-right-press? msg)
+  (and (mouse? msg)
+       (eqv? (mouse-button msg) 2)
+       (memq (mouse-action msg) '(press click))))
+
 (define (note-mouse-pos! eng msg)
   (let ((nx (mouse-x msg)) (ny (mouse-y msg)))
     (cond
@@ -512,6 +517,12 @@ Routing policy:
        (hit
         (let ((action (clickable-action hit)))
           (cond
+           ((not action)
+            ;; left-press in a region with no left action → fall through
+            ;; so raw mouse can flow to focus, e.g. the canvas drag.
+            (let* ((m (apply-filter eng msg))
+                   (cmd (and m (route-to-focus! eng m))))
+              (run-cmd! eng cmd) #t))
            ((eq? action 'quit) (stop-engine! eng) #t)
            (else
             (let* ((m (apply-filter eng action))
@@ -532,6 +543,34 @@ Routing policy:
                         (cmd (and m (route-to-focus! eng m))))
                    (run-cmd! eng cmd)
                    #t))))))))
+   ((mouse-right-press? msg)
+    ;; Right-press: same click-region machinery, but dispatch the
+    ;; region's right-action. If the region has no right-action, fall
+    ;; through to keymap then to raw routing (canvas sample, etc.).
+    (note-mouse-pos! eng msg)
+    (let ((hit (find-click-region (engine-click-regions eng)
+                                  (mouse-x msg) (mouse-y msg))))
+      (let ((right (and hit (clickable-right-action hit))))
+        (cond
+         (right
+          (cond
+           ((eq? right 'quit) (stop-engine! eng) #t)
+           (else
+            (let* ((m (apply-filter eng right))
+                   (cmd (and m (cascade! eng m))))
+              (run-cmd! eng cmd) #t))))
+         (else
+          (receive (action new-km) (feed-key (engine-keymap eng) msg)
+            (set-engine-keymap! eng new-km)
+            (cond
+             ((eq? action 'pending) #f)
+             ((eq? action 'quit) (stop-engine! eng) #t)
+             (action (let* ((m (apply-filter eng action))
+                            (cmd (and m (cascade! eng m))))
+                       (run-cmd! eng cmd) #t))
+             (else (let* ((m (apply-filter eng msg))
+                          (cmd (and m (route-to-focus! eng m))))
+                     (run-cmd! eng cmd) #t)))))))))
    ((and (mouse? msg) (eq? (mouse-action msg) 'motion))
     ;; Motion always updates the tracked cursor (for hover restyle). If
     ;; a button is held (low 2 bits != 3 = "no button"), also route to

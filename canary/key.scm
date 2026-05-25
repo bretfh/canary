@@ -11,6 +11,8 @@
   (mods #:init-keyword #:mods #:accessor key-mods))
 
 (define (canon-mod m)
+  "Return the canonical symbol for modifier alias M.  Recognised
+aliases: ctrl→control, meta/option→alt, cmd/command→super."
   (case m
     ((control ctrl)        'control)
     ((alt meta option)     'alt)
@@ -19,20 +21,31 @@
     (else (error "key: unknown modifier" m))))
 
 (define (canon-mods mods)
+  "Return MODS canonicalised: each entry mapped via canon-mod,
+deduplicated, and sorted alphabetically so two equal modifier sets
+compare equal."
   (sort (delete-duplicates (map canon-mod mods))
         (lambda (a b) (string<? (symbol->string a) (symbol->string b)))))
 
-(define (key? x) (is-a? x <key>))
+(define (key? x)
+  "Return #t if X is a <key>."
+  (is-a? x <key>))
 
 (define (key sym . mods)
+  "Return a fresh <key> with symbol SYM and modifiers MODS.  MODS
+are canonicalised; aliases (ctrl, meta, cmd, …) accepted."
   (make <key> #:sym sym #:mods (canon-mods mods)))
 
 (define (key=? a b)
+  "Return #t if A and B are <key>s with equal symbol and modifier
+set."
   (and (key? a) (key? b)
        (equal? (key-sym a) (key-sym b))
        (equal? (key-mods a) (key-mods b))))
 
 (define (key->string k)
+  "Return Emacs-style readable form of <key> K, e.g. \"C-a\",
+\"C-S-tab\"."
   (let ((s (key-sym k)))
     (string-append
      (apply string-append
@@ -50,6 +63,9 @@
       (else        (format #f "~a" s))))))
 
 (define (normalize-key x)
+  "Coerce X into a <key>.  Accepted shapes: a <key> (returned as-is),
+a char or symbol (treated as bare key), `(mouse BUTTON)` or
+`(mouse-scroll DIR)`, or `(SYM MOD …)`.  Raises an error otherwise."
   (cond
    ((key? x)    x)
    ((char? x)   (make <key> #:sym x #:mods '()))

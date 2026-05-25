@@ -68,6 +68,13 @@
                       (cursor 'hidden) (alt-screen? #t) filter root
                       msg-bell stop-ch
                       (log-cap 200) (show-log? #t) (log-height-frac 1/5))
+  "Return a fresh <engine> wired up with the supplied collaborators.
+BACKEND, THEME, KEYMAP, ROOT and the message-bell / stop-channel
+plumbing come from `start-engine!`; the rest are operational defaults
+controlling input mode, cursor visibility, alt-screen use, log overlay
+size, and the optional msg filter.  Mutable bookkeeping (queue, mouse
+position, click regions, log entries, focus chain, sub table) starts
+empty."
   (%make-engine backend theme keymap title mouse-mode cursor alt-screen?
                 filter root #t '() (make-mutex) msg-bell
                 stop-ch '() -1 -1 '() log-cap show-log? log-height-frac

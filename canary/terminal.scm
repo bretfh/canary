@@ -64,6 +64,10 @@
   (pointer->procedure int (dynamic-func "fcntl" %libc) (list int int int)))
 
 (define (enter-raw-mode)
+  "Switch stdin into raw mode (no canonical processing, no echo) and
+non-blocking I/O.  Stashes the original termios + flags on the first
+call so `exit-raw-mode` can restore them.  Errors when stdin is not
+a TTY or termios syscalls fail."
   (unless (= 1 (%isatty %stdin-fd))
     (error "stdin is not a TTY"))
   ;; Set termios to raw mode
@@ -83,6 +87,8 @@
       (%fcntl %stdin-fd %F_SETFL (logior flags %O_NONBLOCK)))))
 
 (define (exit-raw-mode)
+  "Restore the termios state and stdin flags captured by the most
+recent `enter-raw-mode`.  No-op if raw mode wasn't entered."
   ;; Restore original termios
   (when %original-termios
     (%tcsetattr %stdin-fd 0 (bytevector->pointer %original-termios))
@@ -93,33 +99,41 @@
     (set! %original-flags #f)))
 
 (define (esc str)
+  "Return STR prefixed with an ESC byte."
   (string-append "\x1b" str))
 
 (define (csi . args)
+  "Return the concatenation of ARGS prefixed with CSI (ESC[)."
   (apply string-append "\x1b[" args))
 
 (define (hide-cursor)
+  "Emit the DECTCEM hide-cursor sequence to stdout and flush."
   (display (csi "?25l"))
   (force-output))
 
 (define (show-cursor)
+  "Emit the DECTCEM show-cursor sequence to stdout and flush."
   (display (csi "?25h"))
   (force-output))
 
 (define (clear-screen)
+  "Emit ESC[2J ESC[H to clear the screen and home the cursor."
   (display (csi "2J"))
   (display (csi "H"))
   (force-output))
 
 (define (enter-alternate-screen)
+  "Switch the terminal into its alternate-screen buffer."
   (display (csi "?1049h"))
   (force-output))
 
 (define (exit-alternate-screen)
+  "Switch the terminal back to the primary-screen buffer."
   (display (csi "?1049l"))
   (force-output))
 
 (define (enable-mouse)
+  "Enable SGR-format mouse reporting (press / motion)."
   (display (csi "?1000h"))
   (display (csi "?1002h"))
   (display (csi "?1015h"))
@@ -127,6 +141,7 @@
   (force-output))
 
 (define (disable-mouse)
+  "Disable mouse reporting (undoing the modes enable-mouse set)."
   (display (csi "?1006l"))
   (display (csi "?1015l"))
   (display (csi "?1002l"))
@@ -134,10 +149,13 @@
   (force-output))
 
 (define (move-to x y)
+  "Move the cursor to 1-indexed column X, row Y."
   (display (csi (number->string y) ";" (number->string x) "H"))
   (force-output))
 
 (define (get-terminal-size)
+  "Return the terminal size as a <size>.  Tries TIOCGWINSZ via
+ioctl first, then falls back to `stty size`, then to 80x24."
   (or (catch #t
         (lambda ()
           (let ((ws (make-bytevector 8 0)))
@@ -162,6 +180,9 @@
         (lambda _ (size 80 24)))))
 
 (define-syntax-rule (with-raw-terminal body ...)
+  "Evaluate BODY with stdin in raw mode, the cursor hidden, and the
+screen cleared.  Always restores the cursor and termios on exit
+(normal or via non-local return)."
   (dynamic-wind
     (lambda ()
       (enter-raw-mode)

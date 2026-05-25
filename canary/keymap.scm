@@ -41,20 +41,29 @@ Last positional value is the action. `#:timeout-ms` may trail."
         (binding (map normalize-key raw-keys) timeout action))))))
 
 (define (keymap . bindings)
+  "Return a fresh <keymap> made of BINDINGS (each a <binding> from
+`bind`), with an empty pending-key buffer."
   (%keymap bindings '()))
 
 (define (keymap-reset km)
+  "Return KM with its pending-key buffer cleared.  Leaves bindings
+intact."
   (%keymap (keymap-bindings km) '()))
 
 (define (key-list=? a b)
+  "Return #t if key lists A and B are equal element-wise."
   (and (= (length a) (length b))
        (every key=? a b)))
 
 (define (key-list-prefix? prefix candidate)
+  "Return #t if PREFIX is a key-by-key prefix of CANDIDATE."
   (and (<= (length prefix) (length candidate))
        (key-list=? prefix (take candidate (length prefix)))))
 
 (define (keymap-step km k)
+  "Advance KM by feeding it key K.  Returns two values: the next
+action (a value, or 'pending if still consuming a chord, or #f if K
+was unbound) and the updated <keymap>."
   (let* ((pending  (append (keymap-pending km) (list (normalize-key k))))
          (bindings (keymap-bindings km))
          (exact    (find (lambda (b) (key-list=? pending (binding-keys b)))

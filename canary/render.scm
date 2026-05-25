@@ -145,7 +145,8 @@ flat list of line strings."
       (append child-cmds
               (list (make-clickable (rect-col rect) (rect-row rect)
                                     (rect-w rect) (rect-h rect)
-                                    (click-node-action node))))))
+                                    (click-node-action node)
+                                    (click-node-right-action node))))))
    ((hover-node? node)
     (let* ((child     (hover-node-child node))
            (hot?      (rect-contains? rect mx my))

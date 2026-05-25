@@ -21,7 +21,9 @@
   (name    #:init-keyword #:name    #:accessor palette-name)
   (entries #:init-keyword #:entries #:accessor palette-entries))
 
-(define (palette? x) (is-a? x <palette>))
+(define (palette? x)
+  "Return #t if X is a <palette>."
+  (is-a? x <palette>))
 
 (define-syntax palette
   (syntax-rules ()
@@ -34,17 +36,23 @@
   (palettes #:init-keyword #:palettes #:accessor theme-palettes)
   (active   #:init-value 0            #:accessor theme-active-idx))
 
-(define (theme? x) (is-a? x <theme>))
+(define (theme? x)
+  "Return #t if X is a <theme>."
+  (is-a? x <theme>))
 
 (define (theme . palettes)
+  "Return a fresh <theme> holding PALETTES, with the first palette
+active.  At least one palette is required."
   (when (null? palettes)
     (error "theme: at least one palette required"))
   (make <theme> #:palettes palettes))
 
 (define (theme-active th)
+  "Return the currently active <palette> in <theme> TH."
   (list-ref (theme-palettes th) (theme-active-idx th)))
 
 (define (theme-active-name th)
+  "Return the name symbol of TH's currently active palette."
   (palette-name (theme-active th)))
 
 (define (theme-resolve th name)

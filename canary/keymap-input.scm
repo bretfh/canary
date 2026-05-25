@@ -6,6 +6,10 @@
             mouse->key))
 
 (define (mouse->key msg)
+  "Translate a <mouse> event MSG into the equivalent synthetic <key>
+for keymap matching, or #f if the action isn't bindable.  Press and
+click both produce `(mouse left|middle|right)`; scroll-up and
+scroll-down produce `(mouse-scroll up|down)`."
   (let ((a (mouse-action msg))
         (b (mouse-button msg)))
     (case a
@@ -20,6 +24,9 @@
       (else #f))))
 
 (define (feed-key km msg)
+  "Advance keymap KM by an input MSG (either a <key> or a <mouse>),
+returning two values: the matched action (or 'pending, or #f) and
+the updated keymap.  Non-input msgs pass through with no advance."
   (cond
    ((key? msg)   (keymap-step km msg))
    ((mouse? msg) (let ((k (mouse->key msg)))

@@ -27,10 +27,20 @@
   (border       #:init-keyword #:border       #:init-value border-rounded
                 #:accessor button-border))
 
-(define (button? x) (is-a? x <button>))
-(define (make-button . args) (apply make <button> args))
+(define (button? x)
+  "Return #t if X is a <button>."
+  (is-a? x <button>))
+
+(define (make-button . args)
+  "Return a fresh <button> initialised from ARGS, a sequence of
+#:label, #:action, #:face, #:focused-face, #:focused?, #:border
+keyword arguments."
+  (apply make <button> args))
 
 (define-method (view (b <button>) sz)
+  "Render <button> B at size SZ: a bordered label whose face flips
+to button-focused-face when B is focused, wrapped in `on-click` so
+the configured action fires on press."
   (let* ((focused? (button-focused? b))
          (face     (if focused? (button-focused-face b) (button-face b))))
     (on-click

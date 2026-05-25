@@ -35,24 +35,40 @@
   (arabic-format #:init-keyword #:arabic-format #:init-value "~d/~d"
                  #:accessor paginator-arabic-format))
 
-(define (paginator? x) (is-a? x <paginator>))
-(define (make-paginator . args) (apply make <paginator> args))
+(define (paginator? x)
+  "Return #t if X is a <paginator>."
+  (is-a? x <paginator>))
+
+(define (make-paginator . args)
+  "Return a fresh <paginator> initialised from ARGS, a sequence of
+#:type, #:page, #:per-page, #:total-pages, #:active-dot,
+#:inactive-dot, #:arabic-format keyword arguments."
+  (apply make <paginator> args))
 
 (define (paginator-prev-page! p)
+  "Decrement P's page index, clamping at 0.  Returns P."
   (when (> (paginator-page p) 0)
     (set! (paginator-page p) (- (paginator-page p) 1)))
   p)
 
 (define (paginator-next-page! p)
+  "Increment P's page index, clamping at total-pages - 1.  Returns P."
   (when (< (paginator-page p) (- (paginator-total-pages p) 1))
     (set! (paginator-page p) (+ (paginator-page p) 1)))
   p)
 
-(define (paginator-on-first-page? p) (= (paginator-page p) 0))
+(define (paginator-on-first-page? p)
+  "Return #t if P is positioned on the first page."
+  (= (paginator-page p) 0))
+
 (define (paginator-on-last-page? p)
+  "Return #t if P is positioned on the last page."
   (= (paginator-page p) (- (paginator-total-pages p) 1)))
 
 (define (paginator-get-slice-bounds p length)
+  "Return two values: the [start, end) item indices that P's current
+page maps to within a sequence of LENGTH items.  Clamps so end never
+exceeds LENGTH; returns (0, 0) if LENGTH is zero."
   (if (zero? length)
       (values 0 0)
       (let* ((page     (paginator-page p))
@@ -62,6 +78,8 @@
         (values start end))))
 
 (define (paginator-dots-view p)
+  "Render P as a row of dots, one per page, with the active page's
+dot in accent face and the rest in muted."
   (apply hbox
          (map (lambda (i)
                 (if (= i (paginator-page p))
@@ -70,15 +88,21 @@
               (iota (paginator-total-pages p)))))
 
 (define (paginator-arabic-view p)
+  "Render P as \"N/M\" text in muted face."
   (txt (format #f "~d/~d" (+ 1 (paginator-page p)) (paginator-total-pages p))
        #:fg 'muted))
 
 (define-method (view (p <paginator>) sz)
+  "Render <paginator> P at size SZ, dispatching on P's type slot
+('dots or 'arabic, defaulting to arabic)."
   (case (paginator-type p)
     ((dots) (paginator-dots-view p))
     (else   (paginator-arabic-view p))))
 
 (define-method (update (p <paginator>) msg sz)
+  "React to MSG for <paginator> P.  Right / page-down / `l` advances
+the page; left / page-up / `h` retreats.  Other input is ignored.
+Returns two values: P (mutated in place) and #f (no cmd)."
   (when (key? msg)
     (let ((k (key-sym msg)))
       (match k

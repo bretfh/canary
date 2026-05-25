@@ -56,13 +56,19 @@
   (placements-deleted      #:init-value 0 #:accessor ansi-backend-placements-deleted))
 
 (define (set-ansi-backend-theme! b th)
+  "Replace the theme on backend B with TH."
   (set! (ansi-backend-theme b) th))
 
 (define* (make-ansi-backend #:key (port (current-output-port))
                             (theme default-theme))
+  "Return a fresh <ansi-backend> writing to PORT (defaults to
+current-output-port) under THEME (defaults to default-theme)."
   (make <ansi-backend> #:port port #:theme theme))
 
 (define (hex->rgb hex)
+  "Parse an HTML color string like \"#ff00aa\" or \"ff00aa\" into a
+three-element list (R G B) of integers 0-255.  Returns white when
+the string isn't 6 hex digits."
   (let ((h (if (and (>= (string-length hex) 1)
                     (char=? (string-ref hex 0) #\#))
                (substring hex 1) hex)))
@@ -74,24 +80,35 @@
      (else '(255 255 255)))))
 
 (define (sgr-fg-rgb hex)
+  "Return the SGR parameter string for a true-color foreground given
+HEX (e.g. \"38;2;255;0;170\")."
   (let ((rgb (hex->rgb hex)))
     (string-append "38;2;" (number->string (car rgb)) ";"
                    (number->string (cadr rgb)) ";"
                    (number->string (caddr rgb)))))
 
 (define (sgr-bg-rgb hex)
+  "Return the SGR parameter string for a true-color background given
+HEX (e.g. \"48;2;255;0;170\")."
   (let ((rgb (hex->rgb hex)))
     (string-append "48;2;" (number->string (car rgb)) ";"
                    (number->string (cadr rgb)) ";"
                    (number->string (caddr rgb)))))
 
 (define (attr->sgr a)
+  "Return the SGR numeric parameter for an attribute symbol A
+(bold/dim/italic/underline/blink/reverse/strikethrough), or #f if A
+isn't a recognised attribute."
   (case a
     ((bold) "1") ((dim) "2") ((italic) "3") ((underline) "4")
     ((blink) "5") ((reverse) "7") ((strikethrough) "9")
     (else #f)))
 
 (define (face->sgr face extra-attrs)
+  "Return the full ESC[…m SGR sequence representing FACE plus
+EXTRA-ATTRS (a list of attribute symbols to union into face's own
+attrs).  Returns a reset (ESC[0m) when FACE is #f or carries no
+visible state."
   (cond
    ((not face) "\x1b[0m")
    (else
@@ -108,6 +125,9 @@
        (else (string-append "\x1b[" (string-join parts ";" 'infix) "m")))))))
 
 (define (resolve-color v th)
+  "Resolve a face color slot V against theme TH.  A string passes
+through as-is, a symbol is looked up in the active palette, anything
+else returns #f."
   (cond
    ((string? v) v)
    ((symbol? v) (theme-resolve th v))
@@ -119,6 +139,9 @@ either a <face> record or #f for 'default."
   (cond ((face? f) f) (else #f)))
 
 (define (apply-face-to-term-attrs! tattrs face extra-attrs th)
+  "Mutate term attribute slot TATTRS in place to reflect FACE
+(resolved against theme TH) plus EXTRA-ATTRS.  Resets first so old
+attrs don't bleed into the new cell."
   (t:reset-face-attrs! tattrs)
   (when face
     (let ((fg (resolve-color (face-fg face) th))
@@ -138,6 +161,9 @@ either a <face> record or #f for 'default."
      (append (or (face-attrs face) '()) (or extra-attrs '())))))
 
 (define (render-cmds-to-term! term cmds th)
+  "Apply each draw cmd in CMDS to TERM, resolving faces against
+theme TH.  Handles clear, text, fill, cursor, and image cmds; image
+cmds use the registered fallback if graphics support is off."
   (for-each
    (lambda (cmd)
      (cond
@@ -173,11 +199,24 @@ either a <face> record or #f for 'default."
 ;;   #(placement-id img-id src src-x src-y src-w src-h w h px py)
 ;;        0          1     2   3     4     5     6    7 8 9  10
 
-(define (pos-key col row) (+ (* row 100000) col))
-(define (key->col k) (modulo k 100000))
-(define (key->row k) (quotient k 100000))
+(define (pos-key col row)
+  "Encode a (COL, ROW) cell origin into a single integer key for
+hash lookups.  Inverse of `key->col` / `key->row`.  Assumes COL <
+100000."
+  (+ (* row 100000) col))
+
+(define (key->col k)
+  "Decode the column from a position key produced by `pos-key`."
+  (modulo k 100000))
+
+(define (key->row k)
+  "Decode the row from a position key produced by `pos-key`."
+  (quotient k 100000))
 
 (define (placement-content-eq? a b)
+  "Return #t if placement vectors A and B describe the same image
+content (same img-id, src/dst rectangle, and pixel offsets).
+Placement ids are not compared."
   (and (= (vector-ref a 1)  (vector-ref b 1))
        (= (vector-ref a 3)  (vector-ref b 3))
        (= (vector-ref a 4)  (vector-ref b 4))
@@ -268,6 +307,8 @@ off, all image-cmds stay in the term-grid list and render as fallback."
        (else (lp (cdr cs) gfx (cons (car cs) rest))))))))
 
 (define (cmds-extent cmds)
+  "Return a (W . H) cons giving the smallest grid size that contains
+every text, fill, and cursor cmd in CMDS.  Image cmds are ignored."
   (let lp ((cs cmds) (mw 1) (mh 1))
     (cond
      ((null? cs) (cons mw mh))
@@ -289,6 +330,9 @@ off, all image-cmds stay in the term-grid list and render as fallback."
          (else (lp (cdr cs) mw mh))))))))
 
 (define* (cmds->ansi cmds th #:key cols rows)
+  "Render CMDS as a full-frame ANSI string under theme TH.  COLS and
+ROWS override the autodetected extent.  Uses a fresh term grid as
+the diff baseline, so the output is a complete repaint, not a diff."
   (let* ((ext (cmds-extent cmds))
          (w (or cols (car ext)))
          (h (or rows (cdr ext)))
@@ -303,6 +347,9 @@ off, all image-cmds stay in the term-grid list and render as fallback."
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 
 (define (base64-encode bv)
+  "Return the standard-alphabet base64 encoding of bytevector BV as
+a string.  Trailing input chunks are zero-padded internally and the
+output is `=`-padded to a multiple of four characters."
   (let* ((n   (bytevector-length bv))
          (out (make-string (* 4 (quotient (+ n 2) 3)) #\=)))
     (let loop ((i 0) (j 0))
@@ -327,6 +374,9 @@ off, all image-cmds stay in the term-grid list and render as fallback."
 (define +chunk-size+ 3072)   ; pre-base64; b64 expansion ≤ 4096 limit
 
 (define (emit-image-transmit! port id bv)
+  "Send a kitty graphics-protocol transmit (a=t) command to PORT
+for image ID with payload BV.  Splits BV across chunks so each
+emitted frame is ≤4096 bytes of base64 (the kitty per-frame limit)."
   (let* ((b64 (base64-encode bv))
          (n   (string-length b64)))
     (let loop ((off 0))
@@ -345,6 +395,11 @@ off, all image-cmds stay in the term-grid list and render as fallback."
         (when more? (loop (+ off size)))))))
 
 (define (emit-image-place! port img-id pid col row w h sx sy sw sh px py)
+  "Send a kitty graphics place (a=p) command to PORT: position the
+cursor at (COL, ROW), then place IMG-ID's already-transmitted image
+as placement PID into a W-cells × H-cells slot, optionally cropped
+to source rectangle (SX, SY, SW, SH) and offset within the cell by
+(PX, PY) pixels."
   (display "\x1b[" port)
   (display (number->string (+ row 1)) port)
   (display ";" port)
@@ -370,6 +425,8 @@ off, all image-cmds stay in the term-grid list and render as fallback."
   (display ",z=1\x1b\\" port))
 
 (define (emit-image-delete-placement! port img-id pid)
+  "Send a kitty graphics delete-placement (a=d, d=i) command to
+PORT, removing placement PID of image IMG-ID."
   (display "\x1b_Ga=d,d=i,i=" port)
   (display (number->string img-id) port)
   (display ",p=" port)
@@ -377,6 +434,8 @@ off, all image-cmds stay in the term-grid list and render as fallback."
   (display "\x1b\\" port))
 
 (define (next-placement-id! b)
+  "Allocate and return the next unused placement id on backend B,
+advancing the counter."
   (let ((id (ansi-backend-next-placement-id b)))
     (set! (ansi-backend-next-placement-id b) (+ id 1))
     id))
@@ -403,6 +462,8 @@ use. Returns #f if SRC isn't registered."
       id))))
 
 (define (partition-image-cmds cmds)
+  "Return two values: the image cmds from CMDS (in input order) and
+everything else (also in input order)."
   (let lp ((cs cmds) (gfx '()) (rest '()))
     (cond
      ((null? cs) (values (reverse gfx) (reverse rest)))
@@ -542,6 +603,11 @@ on screen as ghosts."
       (t:term-clear! prev)))))
 
 (define-method (backend-draw (b <ansi-backend>) cmds)
+  "Render frame CMDS on backend B: partition graphics vs grid cmds,
+replay grid cmds onto B's current term, diff against the previous
+term, and emit the diff (plus any graphics placements) wrapped in
+synchronized-output markers.  Updates metrics and swaps cur/prev so
+the next frame diffs against this one."
   (let* ((sz   (backend-size b))         ; goes through method dispatch — subclasses override
          (cur-sz (ansi-backend-size b))
          (w    (if sz (size-width sz)  (size-width cur-sz)))
@@ -581,6 +647,9 @@ on screen as ghosts."
         (set! (ansi-backend-size b) (size w h))))))
 
 (define-method (backend-init (b <ansi-backend>))
+  "Prepare the terminal for B: raw mode, alt screen, hidden cursor,
+focus reporting on, kitty-graphics capability probe, fresh image
+state, and a cached terminal size."
   (enter-raw-mode)
   (enter-alternate-screen)
   (hide-cursor)
@@ -598,6 +667,9 @@ on screen as ghosts."
     (set! (ansi-backend-prev-term b) #f)))
 
 (define-method (backend-shutdown (b <ansi-backend>))
+  "Restore the terminal after B was running: delete all kitty
+placements and image storage (when graphics? was on), turn off focus
+reporting, restore cursor, leave the alt screen, and exit raw mode."
   (let ((out (ansi-backend-port b)))
     (when (graphics? b)
       ;; a=d,d=A: delete all placements AND free image storage. Without
@@ -610,4 +682,6 @@ on screen as ghosts."
   (exit-raw-mode))
 
 (define-method (backend-size (b <ansi-backend>))
+  "Return the current terminal <size>, falling back to B's cached
+size if the live query fails."
   (or (get-terminal-size) (ansi-backend-size b)))
