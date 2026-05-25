@@ -1,6 +1,5 @@
 (define-module (canary)
   #:use-module (canary engine)
-  #:use-module (canary cmd)
   #:use-module (canary backend-ansi)
   #:use-module (canary key)
   #:use-module (canary keymap)
@@ -17,8 +16,6 @@
   (run-app start-engine! send
    <log-entry> log-entry? log-entry-time log-entry-source
    log-entry-level log-entry-text engine-log!
-
-   run-command
 
    <ansi-backend> make-ansi-backend
    graphics? cell-w cell-h

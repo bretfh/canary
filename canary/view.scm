@@ -3,6 +3,7 @@
   #:use-module (srfi srfi-9)
   #:use-module (oop goops)
   #:export (view update init
+            with-view-cache memoized-view invalidate-cached-view!
             <rect>
             rect?
             make-rect
@@ -373,6 +374,24 @@ swap glyphs, wrap with overlay, return a static replacement node."
 (define-generic view)
 (define-generic update)
 (define-generic init)
+
+(define %view-cache (make-parameter #f))
+
+(define (with-view-cache cache thunk)
+  (parameterize ((%view-cache cache)) (thunk)))
+
+(define (memoized-view node sz)
+  (let ((cache (%view-cache)))
+    (cond
+     ((not cache) (view node sz))
+     ((hash-ref cache node) => (lambda (tree) tree))
+     (else (let ((tree (view node sz)))
+             (hash-set! cache node tree)
+             tree)))))
+
+(define (invalidate-cached-view! node)
+  (let ((cache (%view-cache)))
+    (when cache (hash-remove! cache node))))
 
 (define (view-node? x)
   (or (text-node? x) (text-runs-node? x)

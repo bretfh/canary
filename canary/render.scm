@@ -97,7 +97,8 @@
            (effective (if hot? ((hover-node-styler node) child) child)))
       (view->cmds effective rect mx my)))
    ((is-a? node <object>)
-    (view->cmds (view node (size (rect-w rect) (rect-h rect))) rect mx my))
+    (view->cmds (memoized-view node (size (rect-w rect) (rect-h rect)))
+                rect mx my))
    (else '())))
 
 (define (image-cmd->fallback-cmds cmd)

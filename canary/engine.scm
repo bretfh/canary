@@ -1,6 +1,5 @@
 (define-module (canary engine)
   #:use-module (canary engine-types)
-  #:use-module (canary cmd)
   #:use-module (canary terminal)
   #:use-module (canary protocol)
   #:use-module (canary input)
@@ -24,6 +23,7 @@
   #:use-module ((fibers timers) #:select ((sleep . fiber-sleep)))
   #:use-module (ice-9 threads)
   #:use-module (ice-9 receive)
+  #:use-module (ice-9 match)
   #:use-module (ice-9 binary-ports)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
@@ -37,17 +37,6 @@
             <log-entry> log-entry? log-entry-time log-entry-source
             log-entry-level log-entry-text
             log! engine-log!))
-
-;; engine.scm — owns the event loop, render pipeline, and msg dispatch.
-;; Users never construct an <engine> directly. They call run-app with a
-;; root node and optional kwargs; the engine wraps everything.
-;;
-;; The cascade: when a msg arrives, the engine walks the LAST RENDERED
-;; node tree depth-first and calls react on every <stateful> node it
-;; finds. No widget-children declaration — the tree IS the children.
-;; Each react returns #f or a cmd; state mutates in place via the
-;; setters. Cmds collected into a batch and
-;; run after the cascade completes.
 
 ;;; ── log entries (engine-side, surfaced via log overlay) ────────────
 
@@ -187,7 +176,7 @@
               (overlay-node-overlays node)))
    ((is-a? node <object>)
     (proc node)
-    (walk-nodes (view node sz) sz proc))
+    (walk-nodes (memoized-view node sz) sz proc))
    (else #f)))
 
 ;;; ── input + dispatch ───────────────────────────────────────────────
@@ -253,7 +242,8 @@
                                 ((null? (cdr vs)) #f)
                                 (else (cadr vs)))))
                  (when cmd (set! cmds (cons cmd cmds))))))
-           (invalidate-size! node))
+           (invalidate-size! node)
+           (invalidate-cached-view! node))
          (lambda (key . args)
            (engine-log! eng 'update 'error (format #f "~a ~a" key args))))))
     (cond
@@ -265,12 +255,121 @@
   (let ((f (engine-filter eng)))
     (if f (f msg) msg)))
 
+(define (cmd-error! eng key args context)
+  (engine-log! eng 'cmd 'error
+               (format #f "~a: ~a ~a" context key args)))
+
 (define (run-cmd! eng cmd)
-  (when cmd
-    (run-command eng cmd
-                 (lambda (m) (send eng m))
-                 (lambda () (stop-engine! eng))
-                 (lambda (src lvl txt) (engine-log! eng src lvl txt)))))
+  (let ((out (lambda () (ansi-backend-port (engine-backend eng))))
+        (mark-dirty! (lambda ()
+                       (set! (ansi-backend-prev-term (engine-backend eng)) #f))))
+    (match cmd
+      (#f #f)
+      ('quit (stop-engine! eng))
+      ('clear-screen (mark-dirty!))
+      ('cycle-palette
+       (theme-cycle! (engine-theme eng))
+       (mark-dirty!))
+      ('clear-log-cmd
+       (set-engine-log-entries! eng '()))
+      ('suspend-cmd
+       (backend-shutdown (engine-backend eng))
+       (kill (getpid) 20)                                ; Linux SIGTSTP
+       (backend-init (engine-backend eng))
+       (send eng (resumed)))
+      (('set-title text)
+       (let ((o (out)))
+         (display (string-append "\x1b]0;" text "\x07") o)
+         (force-output o)))
+      (('cursor mode)
+       (let ((o (out)))
+         (case mode
+           ((hidden hide)  (display "\x1b[?25l" o))
+           ((visible show) (display "\x1b[?25h" o))
+           ((bar)          (display "\x1b[5 q"  o))
+           ((underline)    (display "\x1b[3 q"  o))
+           ((block)        (display "\x1b[1 q"  o)))
+         (force-output o)))
+      (('alt-screen mode)
+       (let ((o (out)))
+         (display (if (eq? mode 'on) "\x1b[?1049h" "\x1b[?1049l") o)
+         (force-output o)))
+      (('mouse-mode mode)
+       (let ((o (out)))
+         (case mode
+           ((off)
+            (display "\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1003l\x1b[?1000l" o))
+           ((click)
+            (display "\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1006h" o))
+           ((cell)
+            (display "\x1b[?1003l\x1b[?1002h\x1b[?1006h" o))
+           ((all)
+            (display "\x1b[?1003h\x1b[?1006h" o)))
+         (force-output o)))
+      (('println . parts)
+       (let ((o (out))
+             (line (apply string-append
+                          (map (lambda (p) (if (string? p) p (format #f "~a" p)))
+                               parts))))
+         (display "\x1b[?1049l" o)
+         (display line o)
+         (newline o)
+         (display "\x1b[?1049h" o)
+         (mark-dirty!)
+         (force-output o)))
+      (('set-palette name)
+       (when (theme-set! (engine-theme eng) name) (mark-dirty!)))
+      (('exec command on-done)
+       (backend-shutdown (engine-backend eng))
+       (let ((status (system command)))
+         (backend-init (engine-backend eng))
+         (when on-done
+           (let ((msg (on-done status)))
+             (when msg (send eng msg))))))
+      (('batch . cmds)
+       (for-each (lambda (c) (run-cmd! eng c)) cmds))
+      (('sequence . cmds)
+       (spawn-fiber
+        (lambda ()
+          (catch #t
+            (lambda ()
+              (for-each (lambda (c)
+                          (when (and c (engine-running? eng))
+                            (let ((msg (c)))
+                              (when msg (send eng msg)))))
+                        cmds))
+            (lambda (key . args) (cmd-error! eng key args 'sequence))))))
+      (('every period producer)
+       (spawn-fiber
+        (lambda ()
+          (let loop ()
+            (when (engine-running? eng)
+              (fiber-sleep period)
+              (catch #t
+                (lambda ()
+                  (let ((msg (producer)))
+                    (when msg (send eng msg))))
+                (lambda (key . args) (cmd-error! eng key args 'every)))
+              (loop))))))
+      (('after delay producer)
+       (spawn-fiber
+        (lambda ()
+          (fiber-sleep delay)
+          (when (engine-running? eng)
+            (catch #t
+              (lambda ()
+                (let ((msg (producer)))
+                  (when msg (send eng msg))))
+              (lambda (key . args) (cmd-error! eng key args 'after)))))))
+      ((? procedure?)
+       (spawn-fiber
+        (lambda ()
+          (catch #t
+            (lambda ()
+              (let ((msg (cmd)))
+                (when msg (send eng msg))))
+            (lambda (key . args) (cmd-error! eng key args 'thunk))))))
+      (_ #f))))
 
 (define (process-one eng msg)
   "Returns #t if anything reacted/should re-render, #f otherwise."
@@ -343,20 +442,23 @@
       (when (engine-running? eng)
         (perform-operation (wait-until-port-readable-operation rd))
         (drain-bell! (engine-msg-bell eng))
-        (let* ((msgs (drain-msgs! eng))
-               (dispatched?
-                (let lp ((ms msgs) (any? #f))
-                  (cond
-                   ((null? ms) any?)
-                   ((not (engine-running? eng)) any?)
-                   (else
-                    (let ((d? (process-one eng (car ms))))
-                      (lp (cdr ms) (or any? d?))))))))
-          (when (and (engine-running? eng) dispatched?)
-            (catch #t
-              (lambda () (render-frame eng))
-              (lambda (key . args)
-                (engine-log! eng 'render 'error (format #f "~a ~a" key args))))))
+        (with-view-cache
+         (make-hash-table)
+         (lambda ()
+           (let* ((msgs (drain-msgs! eng))
+                  (dispatched?
+                   (let lp ((ms msgs) (any? #f))
+                     (cond
+                      ((null? ms) any?)
+                      ((not (engine-running? eng)) any?)
+                      (else
+                       (let ((d? (process-one eng (car ms))))
+                         (lp (cdr ms) (or any? d?))))))))
+             (when (and (engine-running? eng) dispatched?)
+               (catch #t
+                 (lambda () (render-frame eng))
+                 (lambda (key . args)
+                   (engine-log! eng 'render 'error (format #f "~a ~a" key args))))))))
         (when (engine-running? eng) (loop))))))
 
 ;;; ── stderr capture (engine-owned, surfaces in log overlay) ─────────
@@ -451,9 +553,9 @@ session server) owns those."
 (define* (run-app root #:key title (keymap #f) (theme #f) (mouse 'off)
                   (cursor 'hidden) (alt-screen? #t) (filter #f) (backend #f)
                   (show-log? #t) (log-cap 200) (log-height-frac 1/5))
-  "Run an app rooted at ROOT (a node — typically a stateful one).
-Engine kwargs replace the old <app> slots: title, keymap, theme, mouse,
-cursor, alt-screen?, filter, backend, plus log-overlay config."
+  "Run an app rooted at ROOT (a GOOPS instance with a `view' method).
+Kwargs: title, keymap, theme, mouse, cursor, alt-screen?, filter,
+backend, plus log-overlay config."
   (let* ((b (or backend (make-ansi-backend #:theme (or theme default-theme))))
          (th (or theme default-theme))
          (km (or keymap (keymap)))
