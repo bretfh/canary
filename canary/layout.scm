@@ -19,6 +19,7 @@
             static
             image
             on-click
+            on-hover
             parse-style-args))
 
 (define %empty-text (make-text-node "" 'default '()))
@@ -152,3 +153,10 @@ Styling kwargs: #:fg #:bg (hex or palette symbol),
 ACTION through the app's update method. ACTION is any msg value the
 app's update knows how to handle (symbol, key, list, …)."
   (make-click-node action child))
+
+(define (on-hover child styler)
+  "Wrap CHILD so the engine renders STYLER's output instead while the
+mouse cursor is inside the child's rect. STYLER is a unary procedure
+(lambda (child) → view-node) — return whatever view should replace the
+child on hover. For a static substitute, use (lambda (_) replacement)."
+  (make-hover-node child styler))

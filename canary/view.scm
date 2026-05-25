@@ -58,6 +58,7 @@
             boxed-node-child
             boxed-node-border
             boxed-node-face
+            boxed-node-title
 
             <pad-node>
             pad-node?
@@ -146,7 +147,22 @@
             click-node?
             make-click-node
             click-node-action
-            click-node-child))
+            click-node-child
+
+            <hover-node>
+            hover-node?
+            make-hover-node
+            hover-node-child
+            hover-node-styler
+
+            <stateful>
+            stateful?
+            make-stateful
+            stateful-state set-stateful-state!
+            stateful-view-proc
+            stateful-react-proc
+            stateful-init-proc
+            stateful-initialized? set-stateful-initialized?!))
 
 (define-record-type <rect>
   (make-rect col row w h)
@@ -220,14 +236,16 @@
 (define (make-hbox-node children face) (%hbox-node children face #f))
 
 (define-record-type <boxed-node>
-  (%boxed-node child border face cache)
+  (%boxed-node child border face title cache)
   boxed-node?
   (child boxed-node-child)
   (border boxed-node-border)
   (face boxed-node-face)
+  (title boxed-node-title)
   (cache boxed-node-cache set-boxed-node-cache!))
 
-(define (make-boxed-node child border face) (%boxed-node child border face #f))
+(define* (make-boxed-node child border face #:optional (title #f))
+  (%boxed-node child border face title #f))
 
 (define-record-type <pad-node>
   (%pad-node child top right bottom left face cache)
@@ -342,6 +360,67 @@
 
 (define (make-click-node action child) (%click-node action child #f))
 
+(define-record-type <hover-node>
+  (%hover-node child styler cache)
+  hover-node?
+  (child   hover-node-child)
+  (styler  hover-node-styler)
+  (cache   hover-node-cache set-hover-node-cache!))
+
+(define (make-hover-node child styler)
+  "STYLER is a unary procedure (lambda (child) → view-node) that
+returns the view to render whenever the cursor is inside the node's
+assigned rect. Any view transformation works — restyle the child,
+swap glyphs, wrap with overlay, return a static replacement node."
+  (unless (procedure? styler)
+    (error "make-hover-node: STYLER must be a procedure (lambda (child) → view-node)"
+           styler))
+  (%hover-node child styler #f))
+
+;; A <stateful> node carries mutable state plus three procs:
+;;   view-proc  : (lambda (node) → child-node-tree)
+;;   react-proc : (lambda (node msg) → #f | cmd)
+;;   init-proc  : (lambda (node) → unspecified)
+;;
+;; State mutates in place through the setters that `define-node`
+;; generates; the engine doesn't read what view/react/init return for
+;; state. react-proc's return is interpreted as a cmd (or #f for
+;; none) — see (canary cmd). init-proc runs once before the first
+;; render — seed state from IO (read a file, scandir, hit a socket);
+;; its return is discarded.
+;;
+;; STATE is the author's record holding all per-instance state. The
+;; engine never inspects it — it only calls the procs. This is the
+;; entire stateful API. Authors typically build these via the
+;; `define-node` macro (canary/node.scm) rather than calling
+;; make-stateful directly.
+(define-record-type <stateful>
+  (%stateful state view-proc react-proc init-proc initialized? cache)
+  stateful?
+  (state         stateful-state         set-stateful-state!)
+  (view-proc     stateful-view-proc)
+  (react-proc    stateful-react-proc)
+  (init-proc     stateful-init-proc)
+  (initialized?  stateful-initialized?  set-stateful-initialized?!)
+  (cache         stateful-cache         set-stateful-cache!))
+
+(define* (make-stateful state view-proc
+                        #:key (react-proc #f) (init-proc #f))
+  "Create a stateful node. VIEW-PROC is (lambda (self) → child-node);
+inside it, the author can read (*frame-size*) for the current terminal
+size if their layout needs it. REACT-PROC is (lambda (self msg) → #f
+or cmd); state mutates in place through `define-node`-generated
+setters, the return is interpreted as a cmd (or #f). INIT-PROC is
+(lambda (self) → unspecified) called once before first render — mutate
+self in place; the return is discarded."
+  (unless (procedure? view-proc)
+    (error "make-stateful: VIEW-PROC must be a procedure" view-proc))
+  (when (and react-proc (not (procedure? react-proc)))
+    (error "make-stateful: REACT-PROC must be a procedure" react-proc))
+  (when (and init-proc (not (procedure? init-proc)))
+    (error "make-stateful: INIT-PROC must be a one-arg procedure" init-proc))
+  (%stateful state view-proc react-proc init-proc #f #f))
+
 (define (view-node? x)
   (or (text-node? x) (text-runs-node? x)
       (fill-node? x) (spacer-node? x)
@@ -349,7 +428,8 @@
       (pad-node? x) (margin-node? x) (align-node? x)
       (width-node? x) (height-node? x)
       (cursor-node? x) (overlay-node? x) (static-node? x)
-      (image-node? x) (click-node? x)
+      (image-node? x) (click-node? x) (hover-node? x)
+      (stateful? x)
       (string? x) (not x)))
 
 (define (str-visible-length s) (string-display-width s))
@@ -430,6 +510,15 @@
    ((click-node? node)
     (memo click-node-cache set-click-node-cache! node
           (view-size (click-node-child node))))
+   ((hover-node? node)
+    (memo hover-node-cache set-hover-node-cache! node
+          (view-size (hover-node-child node))))
+   ((stateful? node)
+    ;; A stateful node's size is its rendered child's size. The cache
+    ;; is per-instance and invalidated when the engine mutates state
+    ;; via react (the engine calls invalidate-size! after react).
+    (memo stateful-cache set-stateful-cache! node
+          (view-size ((stateful-view-proc node) node))))
    (else (cons 0 0))))
 
 (define (view-size node) (compute-size node))
@@ -452,4 +541,6 @@
     (set-static-node-size-cache!  node #f)
     (set-static-node-cached-rect! node #f)
     (set-static-node-cached-cmds! node #f))
-   ((click-node? node)   (set-click-node-cache!   node #f))))
+   ((click-node? node)   (set-click-node-cache!   node #f))
+   ((hover-node? node)   (set-hover-node-cache!   node #f))
+   ((stateful? node)     (set-stateful-cache!     node #f))))

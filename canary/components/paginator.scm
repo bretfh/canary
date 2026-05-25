@@ -1,138 +1,82 @@
-;;; components/paginator.scm --- Pagination component
-
 (define-module (canary components paginator)
-  #:use-module (canary protocol)
-  #:use-module (canary component)
+  #:use-module (canary node)
   #:use-module (canary layout)
+  #:use-module (canary protocol)
   #:use-module (canary key)
   #:use-module (ice-9 match)
-  #:use-module (oop goops)
-  #:export (make-paginator
+  #:export (<paginator-state>
+            paginator?
+            make-paginator
+            paginator-type
             paginator-page
             paginator-per-page
             paginator-total-pages
-            paginator-set-total-pages!
-            paginator-get-slice-bounds
             paginator-prev-page!
             paginator-next-page!
             paginator-on-first-page?
             paginator-on-last-page?
-            paginator-update
-            paginator-view
-            <paginator>))
+            paginator-get-slice-bounds))
 
-;;; Display types
-(define paginator-arabic 'arabic)
-(define paginator-dots 'dots)
+(define-node paginator
+  #:state ((type 'arabic)
+           (page 0)
+           (per-page 10)
+           (total-pages 1)
+           (active-dot "•")
+           (inactive-dot "○")
+           (arabic-format "~d/~d"))
+  #:view
+  (lambda (p)
+    (case (paginator-type p)
+      ((dots) (paginator-dots-view p))
+      (else   (paginator-arabic-view p))))
+  #:react
+  (lambda (p msg)
+    (when (key? msg)
+      (let ((k (key-sym msg)))
+        (match k
+          ((or 'right 'page-down) (paginator-next-page! p))
+          ((or 'left  'page-up)   (paginator-prev-page! p))
+          (_ (cond
+              ((and (char? k) (char=? k #\l)) (paginator-next-page! p))
+              ((and (char? k) (char=? k #\h)) (paginator-prev-page! p)))))))))
 
-;;; Paginator class
-(define-class <paginator> (<component>)
-  (type #:init-keyword #:type #:init-value 'arabic #:accessor paginator-type)
-  (page #:init-keyword #:page #:init-value 0 #:accessor paginator-page)
-  (per-page #:init-keyword #:per-page #:init-value 10 #:accessor paginator-per-page)
-  (total-pages #:init-keyword #:total-pages #:init-value 1 #:accessor paginator-total-pages)
-  (active-dot #:init-keyword #:active-dot #:init-value "•" #:accessor paginator-active-dot)
-  (inactive-dot #:init-keyword #:inactive-dot #:init-value "○" #:accessor paginator-inactive-dot)
-  (arabic-format #:init-keyword #:arabic-format #:init-value "~d/~d" #:accessor paginator-arabic-format))
+(define (paginator-prev-page! p)
+  (when (> (paginator-page p) 0)
+    (set! (paginator-page p (- (paginator-page p) 1)))
+  p)
 
-(define* (make-paginator #:key (type 'arabic) (per-page 10) (total-pages 1))
-  "Create a new paginator"
-  (make <paginator> #:type type #:per-page per-page #:total-pages total-pages))
+(define (paginator-next-page! p)
+  (when (< (paginator-page p) (- (paginator-total-pages p) 1))
+    (set! (paginator-page p (+ (paginator-page p) 1)))
+  p)
 
-;;; Helper functions
-(define (paginator-set-total-pages! paginator items)
-  "Calculate and set total pages from number of items"
-  (when (< items 1)
-    (paginator-total-pages paginator))
-  (let* ((per-page (paginator-per-page paginator))
-         (n (ceiling (/ items per-page))))
-    (set! (paginator-total-pages paginator) n)
-    n))
+(define (paginator-on-first-page? p) (= (paginator-page p) 0))
+(define (paginator-on-last-page? p)
+  (= (paginator-page p) (- (paginator-total-pages p) 1)))
 
-(define (paginator-get-slice-bounds paginator length)
-  "Get start and end indices for current page"
+(define (paginator-get-slice-bounds p length)
   (if (zero? length)
       (values 0 0)
-      (let* ((page (paginator-page paginator))
-             (per-page (paginator-per-page paginator))
-             (start (min (* page per-page) length))
-             (end (min (+ start per-page) length)))
+      (let* ((page     (paginator-page p))
+             (per-page (paginator-per-page p))
+             (start    (min (* page per-page) length))
+             (end      (min (+ start per-page) length)))
         (values start end))))
 
-(define (paginator-prev-page! paginator)
-  "Navigate to previous page"
-  (when (> (paginator-page paginator) 0)
-    (set! (paginator-page paginator) (1- (paginator-page paginator))))
-  paginator)
-
-(define (paginator-next-page! paginator)
-  "Navigate to next page"
-  (when (< (paginator-page paginator) (1- (paginator-total-pages paginator)))
-    (set! (paginator-page paginator) (1+ (paginator-page paginator))))
-  paginator)
-
-(define (paginator-on-first-page? paginator)
-  "Check if on first page"
-  (= (paginator-page paginator) 0))
-
-(define (paginator-on-last-page? paginator)
-  "Check if on last page"
-  (= (paginator-page paginator)
-     (1- (paginator-total-pages paginator))))
-
-(define (paginator-dots-view paginator)
-  (let ((total (paginator-total-pages paginator))
-        (current (paginator-page paginator))
-        (active (paginator-active-dot paginator))
-        (inactive (paginator-inactive-dot paginator)))
+(define (paginator-dots-view p)
+  (let ((total   (paginator-total-pages p))
+        (current (paginator-page p)))
     (apply hbox
            (map (lambda (i)
                   (if (= i current)
-                      (txt active #:fg 'accent)
-                      (txt inactive #:fg 'muted)))
+                      (txt "•" #:fg 'accent)
+                      (txt "○" #:fg 'muted)))
                 (iota total)))))
 
-(define (paginator-arabic-view paginator)
-  (let ((fmt (paginator-arabic-format paginator))
-        (current (1+ (paginator-page paginator)))
-        (total (paginator-total-pages paginator)))
-    (txt (format #f fmt current total) #:fg 'muted)))
+(define (paginator-arabic-view p)
+  (let ((current (+ 1 (paginator-page p)))
+        (total   (paginator-total-pages p)))
+    (txt (format #f "~d/~d" current total) #:fg 'muted)))
 
-;;; Update
-(define (paginator-update paginator msg)
-  "Update paginator with message"
-  (cond
-   ((key? msg)
-    (let ((k (key-sym msg)))
-      (match k
-        ((or 'right 'page-down)
-         (paginator-next-page! paginator)
-         (values paginator #t))
-
-        ((or 'left 'page-up)
-         (paginator-prev-page! paginator)
-         (values paginator #t))
-
-        (_
-         (if (and (char? k)
-                  (or (char=? k #\l) (char=? k #\h)))
-             (begin
-               (if (char=? k #\l)
-                   (paginator-next-page! paginator)
-                   (paginator-prev-page! paginator))
-               (values paginator #t))
-             (values paginator #f))))))
-
-   (else (values paginator #f))))
-
-;;; Component protocol
-(define-method (react (paginator <paginator>) msg)
-  "Handle messages via component protocol"
-  (paginator-update paginator msg))
-
-;;; View
-(define (paginator-view paginator)
-  "Render paginator"
-  (case (paginator-type paginator)
-    ((dots) (paginator-dots-view paginator))
-    (else (paginator-arabic-view paginator))))
+(use-modules (srfi srfi-1))

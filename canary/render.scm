@@ -3,15 +3,38 @@
   #:use-module (canary draw)
   #:use-module (canary borders)
   #:use-module (canary width)
+  #:use-module (canary protocol)
   #:use-module (srfi srfi-1)
   #:export (render
             view->cmds
-            image-cmd->fallback-cmds))
+            image-cmd->fallback-cmds
+            *mouse-x*
+            *mouse-y*
+            *frame-size*))
 
 (define (clamp s max-w) (string-display-clamp s max-w))
 
-(define (render node cols rows)
-  (view->cmds node (make-rect 0 0 cols rows)))
+;; Cursor position threaded into render. -1 means "no cursor seen yet";
+;; hover-nodes won't trigger styling. Engine rebinds per-frame.
+(define *mouse-x* (make-parameter -1))
+(define *mouse-y* (make-parameter -1))
+
+;; Current frame size — a <size> (or #f if unavailable). View-procs in
+;; <stateful> nodes can read this to layout against the terminal. The
+;; engine binds this in render-frame.
+(define *frame-size* (make-parameter #f))
+
+(define (rect-contains? rect x y)
+  (and (<= (rect-col rect) x)
+       (< x (+ (rect-col rect) (rect-w rect)))
+       (<= (rect-row rect) y)
+       (< y (+ (rect-row rect) (rect-h rect)))))
+
+(define* (render node cols rows #:key (mouse-x #f) (mouse-y #f) (frame-size #f))
+  (parameterize ((*mouse-x* (or mouse-x (*mouse-x*)))
+                 (*mouse-y* (or mouse-y (*mouse-y*)))
+                 (*frame-size* (or frame-size (size cols rows))))
+    (view->cmds node (make-rect 0 0 cols rows))))
 
 (define (view->cmds node rect)
   (cond
@@ -91,6 +114,20 @@
               (list (make-clickable (rect-col rect) (rect-row rect)
                                     (rect-w rect) (rect-h rect)
                                     (click-node-action node))))))
+   ((hover-node? node)
+    (let* ((child  (hover-node-child node))
+           (hot?   (rect-contains? rect (*mouse-x*) (*mouse-y*)))
+           (effective (if hot? ((hover-node-styler node) child) child)))
+      (view->cmds effective rect)))
+   ;; Stateful nodes expand into their view-proc's tree. The renderer
+   ;; doesn't inspect state — it just walks through. State lifecycle
+   ;; (init, react, invalidate) is the engine's job; render only reads.
+   ((stateful? node)
+    (when (and (stateful-init-proc node)
+               (not (stateful-initialized? node)))
+      ((stateful-init-proc node) node)
+      (set-stateful-initialized?! node #t))
+    (view->cmds ((stateful-view-proc node) node) rect))
    (else '())))
 
 (define (image-cmd->fallback-cmds cmd)
@@ -141,12 +178,32 @@
            (loop (cdr cs) (+ col cw) (- remaining cw)
                  (append (reverse cmds) acc)))))))))
 
+(define (splice-title top-mid title)
+  "Embed TITLE into the top border. Single space padding on each side;
+the border's own glyph runs right up to it (no ┤ ├ bracket sigils).
+Falls back to plain TOP-MID if the title wouldn't fit."
+  (cond
+   ((not title) top-mid)
+   ((not (string? title)) top-mid)
+   (else
+    (let* ((tag    (string-append " " title " "))
+           (tag-w  (string-length tag))
+           (mid-w  (string-length top-mid))
+           (offset 2))
+      (cond
+       ((> (+ offset tag-w) mid-w) top-mid)
+       (else
+        (string-append (substring top-mid 0 offset)
+                       tag
+                       (substring top-mid (+ offset tag-w) mid-w))))))))
+
 (define (render-boxed node rect)
   (cond
    ((or (< (rect-w rect) 2) (< (rect-h rect) 2)) '())
    (else
     (let* ((border (boxed-node-border node))
            (face (boxed-node-face node))
+           (title (boxed-node-title node))
            (col (rect-col rect))
            (row (rect-row rect))
            (w (rect-w rect))
@@ -154,7 +211,9 @@
            (inner-w (- w 2))
            (inner-h (- h 2))
            (inner-rect (make-rect (+ col 1) (+ row 1) inner-w inner-h))
-           (top-mid (make-string inner-w (string-ref (border-top border) 0)))
+           (top-mid (splice-title
+                     (make-string inner-w (string-ref (border-top border) 0))
+                     title))
            (bot-mid (make-string inner-w (string-ref (border-bottom border) 0))))
       (append
        (bg-fill-cmds face rect)

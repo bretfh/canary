@@ -15,6 +15,8 @@
             <blur>   blur   blur?
             <resume> resumed resume?
 
+            <init>   init    init?
+
             batch sequence batch? sequence?
             every every?
             after after?
@@ -68,6 +70,14 @@
 (define-class <resume> ())
 (define (resume? x) (is-a? x <resume>))
 (define (resumed) (make <resume>))
+
+;; <init> — sent once by the engine before the first user input msg.
+;; Authors handle it in react and return startup cmds (install a
+;; ticker, scandir, hit a socket, etc.). State mutation happens in
+;; place; the cmd return is what reaches the engine.
+(define-class <init> ())
+(define (init? x) (is-a? x <init>))
+(define (init) (make <init>))
 
 (define (batch . cmds) (cons 'batch cmds))
 (define (sequence . cmds) (cons 'sequence cmds))

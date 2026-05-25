@@ -1,130 +1,126 @@
 # canary — design
 
-A live-coded TUI library for Guile. Elm-style loop with a typed view tree.
+A live-coded TUI library for Guile. View tree + per-node state + a msg
+cascade. No GOOPS in author code.
 
 Two bets that shape every decision:
 
-1. **View is a tree, not a styled string.** Composition, overlays, sizing
-   and diffing are engine primitives. The user describes structure; the
-   engine handles cells. This is the axis tea+lipgloss don't cover — they
-   hand the user strings to concatenate and styles to chain.
+1. **View is a tree, not a styled string.** Composition, overlays,
+   sizing and diffing are engine primitives. The user describes
+   structure; the engine handles cells. The axis tea+lipgloss don't
+   cover — they hand the user strings to concatenate and styles to
+   chain.
 
-2. **Styling is a palette + boolean flags.** `#:fg`/`#:bg` accept a hex
-   string *or* a palette name (`#:fg 'accent`). Attribute flags are
-   individual booleans (`#:bold`, `#:italic`). Multiple palettes register
-   under one theme; `(cycle-palette)` swaps the active one and every
-   palette-named reference recolors. No `if dark-mode-then` at call sites,
-   no separate style-name layer.
+2. **Styling is a palette + boolean flags.** `#:fg`/`#:bg` accept a
+   hex string *or* a palette name (`#:fg 'accent`). Attribute flags
+   are individual booleans (`#:bold`, `#:italic`). Multiple palettes
+   register under one theme; `(cycle-palette)` swaps the active one
+   and every palette-named reference recolors. No `if dark-mode-then`
+   at call sites, no separate style-name layer.
 
-Aim: clearer than tea+lipgloss for visual/composable TUIs, with REPL-driven
-iteration. Not optimising for smallest binary, lowest baseline CPU, or
-ecosystem size.
+Aim: clearer than tea+lipgloss for visual/composable TUIs, with
+REPL-driven iteration. Not optimising for smallest binary, lowest
+baseline CPU, or ecosystem size.
 
 ## Architecture
 
-An app is a GOOPS class extending `<app>`. The Elm loop is three generics
-specialised on the user's subclass:
+Everything is a **node**. Layout primitives (`txt`, `vbox`, `hbox`,
+`boxed`, …) are nodes. Stateful UI elements (textinput, panel, your
+app's root) are also nodes — they're `<stateful>` nodes carrying a
+mutable state record and three procs:
 
-```scheme
-init   : <app>          → cmd
-update : <app> msg size → (values app cmd)
-view   : <app> size     → view-node
+```
+view-proc  : (lambda (self) → child-node)
+react-proc : (lambda (self msg) → #f | cmd)        ; optional
+init-proc  : (lambda (self) → unspecified)          ; optional
 ```
 
-The engine calls them as `(init the-app)`, `(update the-app msg sz)`,
-`(view the-app sz)`. Generic dispatch on the app class resolves to the
-user's methods. There is no kwarg-proc plumbing.
+State mutates in place through setters; return values from view/react/
+init are not used to replace state. `react-proc` returns `#f` for no
+effect or a cmd value (see [Cmds](#cmds)).
 
 The engine:
 
 - runs the channel-backed event loop
 - reads input (keys, mouse) and emits typed msgs
-- dispatches msgs through an optional filter then to `update`
-- renders the view tree after each dispatch (no fixed-fps render loop)
+- renders the view tree, populates click regions, draws cell diffs
+- on each msg, walks the rendered tree depth-first and calls every
+  stateful's `react-proc` with the msg (the **cascade**)
+- collects cmds returned from react, batches them, runs them
 - spawns fibers for cmds that need them (`every`, `after`, user thunks)
 
-Method names are looked up by generic at every call, so redefining a method
-at the REPL takes effect on the next event.
+No fixed-fps render loop — render runs after any msg that produced
+something to redraw. Authors never construct `<engine>`; they pass a
+root node to `run-app` and the engine wraps it.
+
+### The cascade
+
+Every stateful in the rendered tree sees every msg. This is closer to
+actor-style broadcast than to Elm-TEA's single update or React's
+parent-to-child props. Each node filters in its own `react-proc` —
+typically with `(when (key? msg) ...)` or `(case (and (symbol? msg) msg) ...)`.
+
+The tree IS the children. No `widget-children` declaration to keep in
+sync; the engine pulls children by calling `view-proc`, then walks the
+returned node. Containers (vbox, boxed, overlay, …) are walked
+transparently.
 
 ## A "hello, world" app
 
 ```scheme
 (use-modules (canary))
 
-(define-class <hello> (<app>)
-  (greeting #:init-value "world" #:accessor hello-greeting))
+(define-node hello
+  #:state ((greeting "world"))
+  #:view  (lambda (self)
+            (txt "hello, " (txt (hello-greeting self) #:fg 'accent #:bold))))
 
-(define-method (view (h <hello>) sz)
-  (align (txt "hello, " (txt (hello-greeting h) #:fg 'accent #:bold))
-         'center #:width (size-width sz)))
-
-(run-app (make <hello>
-              #:keymap (keymap (bind #\q 'quit))))
+(run-app (make-hello)
+         #:keymap (keymap (bind #\q 'quit)))
 ```
 
-Everything else has defaults: `init` returns `#f`, `update` returns
-`(values app #f)`, all UI state is engine-managed (alt-screen on, cursor
-hidden, mouse off, title = program name).
+`define-node` generates the state record, per-slot accessors
+(`hello-greeting` / `set-hello-greeting!`), a predicate (`hello?`),
+and a constructor (`make-hello [#:greeting ...]`) returning a
+`<stateful>` node ready to drop into a tree.
 
-## `<app>` base class
+## `define-node`
 
-User subclasses extend this. Slots define both static config (`#:keymap`,
-`#:theme`, `#:title`, ...) and the user's own model fields.
+The author surface. Expansion:
 
 ```scheme
-(define-class <app> ()
-  (title       #:init-keyword #:title       #:init-value #f
-               #:accessor app-title)
-  (keymap      #:init-keyword #:keymap      #:init-value (keymap)
-               #:accessor app-keymap)
-  (theme       #:init-keyword #:theme       #:init-value #f
-               #:accessor app-theme)
-  (alt-screen? #:init-keyword #:alt-screen? #:init-value #t
-               #:accessor app-alt-screen?)
-  (cursor      #:init-keyword #:cursor      #:init-value 'hidden
-               #:accessor app-cursor)
-  (mouse       #:init-keyword #:mouse       #:init-value 'off
-               #:accessor app-mouse)
-  (filter      #:init-keyword #:filter      #:init-value #f
-               #:accessor app-filter)
-  (backend     #:init-keyword #:backend     #:init-value #f
-               #:accessor app-backend))
+(define-node counter
+  #:state ((n 0)
+           (label "count"))
+  #:view  (lambda (self)
+            (txt (counter-label self) ": " (number->string (counter-n self))))
+  #:react (lambda (self msg)
+            (case (and (symbol? msg) msg)
+              ((bump) (set-counter-n! self (+ 1 (counter-n self))))
+              (else #f)))
+  #:init  (lambda (self) #f))         ; optional
 ```
 
-User subclasses add their own slots:
+generates:
 
-```scheme
-(define-class <tweet> (<app>)
-  (frame #:init-value 0   #:accessor tweet-frame)
-  (notes #:init-value '() #:accessor tweet-notes)
-  (input #:init-form (make-textinput …) #:accessor tweet-input))
-```
+- a hidden state record (slots not visible to user code)
+- public per-slot accessors: `counter-n`, `set-counter-n!`,
+  `counter-label`, `set-counter-label!`
+- public predicate `counter?`
+- public constructor `(make-counter [#:n 0] [#:label "count"])` →
+  `<stateful>`
 
-`run-app` accepts any `<app>` instance:
+Required: `#:state` (use `#:state ()` for stateless) and `#:view`.
+`#:react` and `#:init` are optional.
 
-```scheme
-(run-app (make <tweet>
-              #:title  "canary tweet"
-              #:keymap %keymap
-              #:theme  ui
-              #:mouse  'cell))
-```
-
-## Default methods
-
-`<app>` ships with default methods so a barebones subclass works:
-
-```scheme
-(define-method (init   (m <app>))        #f)
-(define-method (update (m <app>) msg sz) (values m #f))
-(define-method (view   (m <app>) sz)     (txt ""))
-```
-
-User overrides any subset by specialising on their subclass.
+`view-proc` should be pure. The cascade walker calls it to find the
+node's children before the renderer calls it to produce cmds; side
+effects fire twice. Read `(*frame-size*)` inside view if the layout
+needs to know the terminal size.
 
 ## Msgs
 
-Records produced by the engine, matched by `update`.
+Engine-emitted records matched in `react-proc`.
 
 | record       | when                                          |
 |--------------|-----------------------------------------------|
@@ -134,61 +130,81 @@ Records produced by the engine, matched by `update`.
 | `<resize>`   | terminal size changed                         |
 | `<focus>`    | terminal gained focus                         |
 | `<blur>`     | terminal lost focus                           |
-| `<suspend>`  | engine about to release tty (after Ctrl-Z)    |
-| `<resume>`   | engine reacquired tty                         |
-| symbol       | keymap action; user-issued msg                |
-| list         | any user-defined shape via `(send app …)`     |
+| `<resume>`   | engine reacquired tty after suspend           |
+| symbol       | keymap action; `on-click` action; user msg    |
+| list         | any user-defined shape via `(send eng …)`     |
 
-Multi-method dispatch on msg records gives one `update` per case:
-
-```scheme
-(define-method (update (m <tweet>) (msg <tick>)  sz) …)
-(define-method (update (m <tweet>) (msg <key>)   sz) …)
-(define-method (update (m <tweet>) (msg <mouse>) sz) …)
-```
-
-Symbols and lists need a catch-all method with internal `match`:
+Idiomatic react:
 
 ```scheme
-(define-method (update (m <tweet>) msg sz)
-  (match msg
-    ('cycle-palette (values m (cycle-palette)))
-    ('redraw        (values m (clear-screen)))
-    (_              (values m #f))))
+#:react
+(lambda (self msg)
+  (cond
+   ((key? msg)
+    (case (key-sym msg)
+      ((#\q) 'quit)
+      (else  #f)))
+   ((tick? msg)
+    (set-self-frame! self (+ 1 (self-frame self)))
+    #f)
+   ((eq? msg 'bump)
+    (set-self-n! self (+ 1 (self-n self)))
+    #f)
+   (else #f)))
 ```
 
-(Use `(next-method)` if you want to fall through to the type-specialised
-methods after a symbol catch-all.)
+Return either `#f` (no cmd) or a cmd value. Cascade collects cmds from
+every reacting node, batches them, dispatches.
 
 ## Cmds
 
-Returned as values from `init` and `update`. Cmds are constructor calls,
-not quoted literals.
+Returned from `react-proc` and `init-proc`. Cmds are constructor
+calls, not quoted literals.
 
-| cmd                                 | effect                                  |
-|-------------------------------------|-----------------------------------------|
-| `#f`                                | no-op                                   |
-| `'quit`                             | exit run-app                            |
-| `(batch c1 c2 …)`                   | parallel                                |
-| `(sequence c1 c2 …)`                | sequential, awaits each                 |
+| cmd                                 | effect                                       |
+|-------------------------------------|----------------------------------------------|
+| `#f`                                | no-op                                        |
+| `'quit`                             | exit `run-app`                               |
+| `(batch c1 c2 …)`                   | parallel                                     |
+| `(sequence c1 c2 …)`                | sequential, awaits each                      |
 | `(every #:hz N producer)`           | persistent ticker — one fiber, no reschedule |
-| `(every #:ms N producer)`           | same                                    |
-| `(every #:seconds S producer)`      | same                                    |
-| `(after #:ms N producer)`           | one-shot timer                          |
-| `(println "string" …)`              | line to scrollback above alt-screen     |
-| `(set-title "name")`                | runtime OS title change                 |
-| `(clear-screen)`                    | force full repaint                      |
-| `(cursor 'hidden│'visible│'bar│'underline)` | runtime cursor change           |
-| `(alt-screen 'on│'off)`             | runtime alt-screen toggle               |
-| `(mouse 'off│'click│'cell│'all)`    | runtime mouse mode change               |
-| `(set-palette 'name)`               | switch active palette                   |
-| `(cycle-palette)`                   | next palette in theme's declared order  |
-| `(suspend)`                         | hand tty to shell, resume on SIGCONT    |
-| `(exec "cmd args" #:on-done thunk)` | tear down, run process, restore, msg    |
-| user thunk                          | engine spawns fiber; thunk returns msg  |
+| `(every #:ms N producer)`           | same                                         |
+| `(every #:seconds S producer)`      | same                                         |
+| `(after #:ms N producer)`           | one-shot timer                               |
+| `(println "string" …)`              | line to scrollback above alt-screen          |
+| `(set-title "name")`                | runtime OS title change                      |
+| `(clear-screen)`                    | force full repaint                           |
+| `(cursor 'hidden│'visible│'bar│…)`  | runtime cursor change                        |
+| `(alt-screen 'on│'off)`             | runtime alt-screen toggle                    |
+| `(mouse-mode 'off│'click│'cell│'all)` | runtime mouse mode change                  |
+| `(set-palette 'name)`               | switch active palette                        |
+| `(cycle-palette)`                   | next palette in theme's declared order       |
+| `(suspend)`                         | hand tty to shell, resume on SIGCONT         |
+| `(exec "cmd args" #:on-done thunk)` | tear down, run process, restore, msg         |
+| user thunk                          | engine spawns fiber; thunk returns msg       |
 
-The engine intercepts `'quit` directly. Everything else flows through
-`update`.
+The engine intercepts `'quit` directly. Everything else routes
+through `(canary cmd)`.
+
+## Click & hover
+
+```scheme
+(on-click action child)
+(on-hover child styler-proc)
+```
+
+`on-click` wraps any child so a left-press inside its rendered rect
+dispatches `action` as a msg through the cascade. `action` is any
+value — a symbol, a list, anything `react-proc`s can match on.
+
+`on-hover` swaps `child` for `(styler-proc child)` whenever the cursor
+is inside the rect — purely visual, no msg.
+
+```scheme
+(on-click 'save
+          (on-hover (txt " save " #:fg 'muted)
+                    (lambda (_) (txt " save " #:fg 'accent #:bold))))
+```
 
 ## Keys and keymap
 
@@ -200,19 +216,17 @@ The engine intercepts `'quit` directly. Everything else flows through
 
 A key is one of:
 
-| form                                  | meaning                              |
-|---------------------------------------|--------------------------------------|
-| `#\h`, `#\?`, `#\:`                   | literal char                         |
-| `#\tab`, `#\escape`, `#\space`, `#\return`, `#\delete`, `#\backspace` | Guile's built-in named chars |
-| `'left`, `'right`, `'up`, `'down`, `'home`, `'end`, `'pgup`, `'pgdn`, `'f1`…`'f12` | symbols for keys without literals |
-| `'(#\x ctrl)`, `'(left ctrl)`, `'(#\tab shift)` | modifier list           |
-| `'(mouse left)`, `'(mouse right)`, `'(mouse middle)` | mouse button         |
-| `'(mouse-scroll up)`, `'(mouse-scroll down)` | scroll wheel                  |
+| form                                              | meaning                              |
+|---------------------------------------------------|--------------------------------------|
+| `#\h`, `#\?`, `#\:`                               | literal char                         |
+| `#\tab`, `#\escape`, `#\space`, `#\return`, `#\delete`, `#\backspace` | Guile's named chars |
+| `'left`, `'right`, `'up`, `'down`, `'home`, `'end`, `'pgup`, `'pgdn`, `'f1`…`'f12` | symbols |
+| `'(#\x ctrl)`, `'(left ctrl)`, `'(#\tab shift)`   | modifier list                        |
+| `'(mouse left)`, `'(mouse right)`, `'(mouse middle)` | mouse button                      |
+| `'(mouse-scroll up)`, `'(mouse-scroll down)`      | scroll wheel                         |
 
-Modifiers: `control` / `ctrl`, `alt` / `meta` / `option`, `shift`,
-`super` / `cmd` / `command`. Canonicalised, sorted, deduped internally.
-
-Bindings:
+Modifiers: `control`/`ctrl`, `alt`/`meta`/`option`, `shift`,
+`super`/`cmd`/`command`. Canonicalised, sorted, deduped internally.
 
 ```scheme
 (bind #\q 'quit)                          ; single key
@@ -223,16 +237,13 @@ Bindings:
 (bind '(mouse left) 'select)              ; mouse
 ```
 
-Last positional arg is the action. `#:timeout-ms` resets pending state if
-the next key doesn't arrive in time.
-
-The action can be any value. `'quit` is engine-intercepted. Anything else
-is dispatched to `update` as a msg.
+The action can be any value. `'quit` is engine-intercepted. Anything
+else is cascaded as a msg.
 
 ## Theme
 
-One concept: named palettes of hex colors. Multiple palettes can register
-under one theme; `(cycle-palette)` walks them.
+Named palettes of hex colors; multiple palettes register under one
+theme; `(cycle-palette)` walks them.
 
 ```scheme
 (define ui
@@ -252,15 +263,14 @@ under one theme; `(cycle-palette)` walks them.
      (note   "#c01666"))))
 ```
 
-Rules:
-
 - `palette` blocks list named hex colors. First declared is the default.
-- Every palette must define the same set of names. Names not present in
-  every palette fall back to the default palette's value when swapped.
+- Every palette must define the same set of names. Names not present
+  in every palette fall back to the default palette's value when
+  swapped.
 - Engine tracks the registered palettes; `(cycle-palette)` and
   `(set-palette 'light)` work without the user maintaining a list.
 
-There is no style-name layer. To reuse a styling combo, define a helper:
+No style-name layer. To reuse a styling combo, define a helper:
 
 ```scheme
 (define (hint s) (txt s #:fg 'muted #:italic))
@@ -292,8 +302,8 @@ Layout primitives:
 ```scheme
 (vbox a b c)
 (hbox a b c)
-(spacer n)                       ; height in vbox
-(spacer #:w n)                   ; width  in hbox
+(spacer n)                                ; height in vbox
+(spacer #:w n)                            ; width  in hbox
 (pad    child #:top n #:left n …)         ; inner whitespace
 (margin child #:top n #:left n …)         ; outer whitespace
 (align  child 'left│'center│'right #:width n)
@@ -302,39 +312,35 @@ Layout primitives:
 (fill   w h #:bg 'name-or-hex)
 (pin    col row child)
 (overlay base p1 p2 …)
-(boxed  child #:border border-rounded #:fg 'name-or-hex)
-(static child)                   ; cache rendered cmds keyed on the rect
+(boxed  child #:border border-rounded #:fg 'name-or-hex #:title "name")
+(static child)                            ; cache rendered cmds keyed on rect
+(on-click action child)
+(on-hover child styler-proc)
 ```
 
-`pad` and `margin` are distinct on purpose: `pad` adds space *inside* a
-boxed/styled region, `margin` adds space *outside*. Lipgloss conflates
-them; canary keeps them separate.
+`pad` and `margin` are distinct on purpose: `pad` adds space *inside*
+a boxed/styled region, `margin` adds space *outside*. Lipgloss
+conflates them; canary keeps them separate.
 
 ## Components
 
-Each is a GOOPS class with a `react` method:
+Each is a `define-node`. Embed by dropping the result of `make-X`
+into your tree; the cascade routes msgs to them automatically.
 
 ```scheme
-(define-method (react (c <my-component>) msg) …)
+(define-node tweet
+  #:state ((input  (make-textinput #:prompt "> "))
+           (notes  '()))
+  #:view (lambda (t)
+           (vbox (tweet-input t)
+                 (txt (format #f "~a notes" (length (tweet-notes t)))))))
 ```
 
-Embed in an app slot, forward explicitly from `update`:
+No `react` forwarding needed — `tweet-input t` IS a stateful node in
+the rendered tree, so the cascade hits it directly.
 
-```scheme
-(define-class <tweet> (<app>)
-  (input #:init-form (make-textinput …) #:accessor tweet-input))
-
-(define-method (update (m <tweet>) (msg <key>) sz)
-  (react (tweet-input m) msg)
-  (values m #f))
-```
-
-No reflection over slots, no auto-delegate. Components compose by being
-ordinary records embedded in the user's app class.
-
-Bundled: `<spinner>`, `<progress>`, `<textinput>`, `<textarea>`,
-`<paginator>`, `<viewport>`. Planned: `<list>`, `<help>` (renders a keymap
-into a hint footer), `<filepicker>`.
+Bundled: `textinput`, `button`, `progress`, `spinner`, `paginator`,
+`panel`.
 
 ## Live coding
 
@@ -345,42 +351,50 @@ make run
 Launches the app and exposes a Geiser-listenable Guile image on
 `localhost:37146`. From an Emacs/VS Code Geiser session:
 
-- redefine an `update` / `view` / `init` method — next msg uses the new
-  method (generic dispatch picks up the new definition)
-- mutate slots of the live app instance directly between events
+- redefine a node's view-proc or react-proc — the wrapper holds a
+  reference, so the next render/cascade picks up the new closure
+  *after* recreating the node. To swap behaviour live without
+  reconstruction, dispatch on a slot rather than capturing in the
+  closure body.
+- mutate slots of any live stateful directly between events
 - re-evaluate the theme to swap palettes or restyle
 
 No rebuild loop. The instance and process state survive code changes.
 
 ## Anti-patterns
 
-- **Don't** define `init` / `update` / `view` as standalone procs and
-  pass them via kwarg. They're methods on the app class.
+- **Don't** return state from react/init. Mutate via the setters
+  `define-node` generates; return `#f` or a cmd from react, nothing
+  from init. The engine ignores returned state.
+- **Don't** declare a parent's children separately. The tree IS the
+  children — if a node appears in another node's `view-proc` output,
+  it's wired automatically.
 - **Don't** construct cmds as quoted lists: `'(set-title "x")` ✗,
   `(set-title "x")` ✓.
 - **Don't** put style flags in a list: `#:attrs '(bold italic)` ✗,
   `#:bold #:italic` ✓.
 - **Don't** thread palette lists in user code. Declare palettes inside
   `theme`; `cycle-palette` iterates them.
-- **Don't** look for a `#:style` kwarg on `txt`. Reference palette colors
-  through `#:fg`/`#:bg`; bundle reuse with a helper proc.
+- **Don't** look for a `#:style` kwarg on `txt`. Reference palette
+  colors through `#:fg`/`#:bg`; bundle reuse with a helper proc.
 - **Don't** poll for state changes. Every transition is a msg; every
   side-effect is a cmd.
-- **Don't** issue `(alt-screen 'on)` / `(cursor 'hide)` / `(set-title …)`
-  from `init` for the defaults. They're slots on the app class with the
-  right defaults.
-- **Don't** reach into engine state from user code. For runtime changes,
-  emit a cmd.
+- **Don't** issue `(alt-screen 'on)` / `(cursor 'hide)` / `(set-title
+  …)` from `init` for the defaults. Pass them as kwargs to `run-app`.
+- **Don't** side-effect inside `view-proc`. The cascade walker calls
+  it once to find children before render calls it again to produce
+  cmds; any effect fires twice per msg.
 
 ## What canary doesn't try to do
 
-- A statically-typed API. Match patterns and GOOPS classes are honest
+- A statically-typed API. Match patterns and runtime checks are honest
   about the dynamic-Scheme nature.
 - A single statically-linked binary. The runtime is Guile + fibers.
 - Sub-millisecond idle CPU. Native Go beats this in absolute terms; the
   intentional trade is REPL-driven dev and a richer view IR.
-- A wide ecosystem of pre-built widgets. The bundled components cover the
-  common cases; the design favours composition over a sprawling library.
+- A wide ecosystem of pre-built widgets. The bundled components cover
+  the common cases; the design favours composition over a sprawling
+  library.
 
 ## Module surface
 
@@ -390,19 +404,23 @@ No rebuild loop. The instance and process state survive code changes.
 
 Re-exports every public name from:
 
-- `(canary app)`           — `<app>`, `run-app`, generic stubs for `init`,
-                             `update`, `view`, `send`
-- `(canary protocol)`      — msg + cmd types/constructors
-- `(canary key)`           — `<key>`, `key`, `key=?`, modifier helpers
-- `(canary keymap)`        — `keymap`, `bind`
-- `(canary theme)`         — `theme`, palette forms
-- `(canary layout)`        — `txt`, `vbox`, `hbox`, `spacer`, `pad`,
-                             `margin`, `align`, `width`, `height`, `fill`,
-                             `pin`, `overlay`, `static`, `boxed`
-- `(canary borders)`       — `border-normal`, `border-rounded`,
-                             `border-thick`, `border-double`, `border-ascii`
-- `(canary backend-ansi)`  — `make-ansi-backend`
-- `(canary component)`     — `<component>`, `react`, focus accessors
+- `(canary engine)`      — `run-app`, `start-engine!`, `send`, log entries
+- `(canary cmd)`         — `run-command`
+- `(canary node)`        — `define-node`
+- `(canary view)`        — `<stateful>`, `make-stateful`, `view-size`,
+                           `view-node?` (escape hatch — most authors use
+                           `define-node`)
+- `(canary protocol)`    — msg types + cmd constructors
+- `(canary key)`         — `<key>`, `key`, `key=?`, modifier helpers
+- `(canary keymap)`      — `keymap`, `bind`
+- `(canary theme)`       — `theme`, palette forms
+- `(canary layout)`      — `txt`, `vbox`, `hbox`, `spacer`, `pad`,
+                           `margin`, `align`, `width`, `height`, `fill`,
+                           `pin`, `overlay`, `static`, `on-click`,
+                           `on-hover`
+- `(canary borders)`     — `boxed`, `border-normal`, `border-rounded`,
+                           `border-thick`, `border-double`, `border-ascii`
+- `(canary backend-ansi)` — `make-ansi-backend`
 
 Components are imported individually:
 

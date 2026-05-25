@@ -228,15 +228,26 @@ Returns (#f #f) if the stream ends before a terminator."
             (read-char port)
             (loop))))))
     (if (and term (= (length params) 3))
+        ;; SGR mouse coords are 1-indexed; render rects are 0-indexed.
+        ;; Subtract 1 here so x/y on <mouse> messages line up with view
+        ;; rectangles directly — no off-by-one at every comparison site.
         (let ((button (list-ref params 2))
-              (x      (list-ref params 1))
-              (y      (list-ref params 0))
+              (x      (max 0 (- (list-ref params 1) 1)))
+              (y      (max 0 (- (list-ref params 0) 1)))
               (action (if (char=? term #\M) 'press 'release)))
           (%ilog "parse-mouse-sequence: btn=~a x=~a y=~a action=~a" button x y action)
           (cond
-           ((= button 64) (mouse x y 64 'scroll-up))
-           ((= button 65) (mouse x y 65 'scroll-down))
-           (else          (mouse x y button action))))
+           ;; wheel: bit 6 (value 64) set. low 2 bits = direction.
+           ((not (zero? (logand button 64)))
+            (let ((dir (logand button 1)))
+              (mouse x y button (if (zero? dir) 'scroll-up 'scroll-down))))
+           ;; motion: bit 5 (value 32) set. low 2 bits = which button is
+           ;; held (0 left, 1 middle, 2 right) or 3 for "no button held",
+           ;; i.e. naked hover. Strip the motion bit before reporting so
+           ;; downstream code sees a clean button code.
+           ((not (zero? (logand button 32)))
+            (mouse x y (logand button 3) 'motion))
+           (else (mouse x y button action))))
         (key 'unknown))))
 
 (define (parse-bracketed-paste port)

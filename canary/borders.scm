@@ -47,6 +47,9 @@
 (define border-ascii
   (make-border "-" "-" "|" "|" "+" "+" "+" "+"))
 
-(define* (boxed child #:key (border border-normal) (fg #f) (bg #f))
+(define* (boxed child #:key (border border-normal) (fg #f) (bg #f)
+                (title #f))
+  "TITLE, if non-#f, is spliced into the top border as ┤ TITLE ├ near
+the left corner. Renders as standard boxed when TITLE is #f."
   (let ((f (if (or fg bg) (face #:fg fg #:bg bg #:attrs '()) #f)))
-    (make-boxed-node child border f)))
+    (make-boxed-node child border f title)))
