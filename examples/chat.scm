@@ -1,80 +1,58 @@
-;;; chat.scm — two stateful nodes composed: a message list + an input.
+;;; chat.scm — composition of two nodes: a message list and an input.
 ;;;
 ;;; Run: guile -L /path/to/guile-canary examples/chat.scm
-;;;
-;;; Type a line and press enter to add it to the log. ctrl-c to quit.
-;;;
-;;; What this shows:
-;;;   - composition of two independent stateful nodes (chatlog + input)
-;;;     inside a layout — no msg forwarding by the parent. The cascade
-;;;     hits each one with each msg; each filters via subscribes.
-;;;   - a user-defined msg ('chat-submit) sent from one node's react,
-;;;     dispatched into the cascade, picked up by the other node.
-;;;   - the bundled textinput component as a drop-in node.
+;;; Type a line and press enter. ctrl-c to quit.
 
 (use-modules (canary)
              (canary components panel)
-             (canary components textinput))
+             (canary components textinput)
+             (oop goops))
 
-;; ── chatlog: appends a line whenever it sees a 'chat-submit msg. ────
+(define-class <chat> ()
+  (lines #:init-value '() #:accessor chat-lines)
+  (input #:init-form (make-textinput #:prompt "> "
+                                     #:placeholder "say something"
+                                     #:width 40
+                                     #:focused? #t)
+         #:accessor chat-input))
 
-(define-node chatlog
-  #:state ((lines '()))
-  #:subscribes ((lambda (m)
-                  (and (pair? m) (eq? (car m) 'chat-submit))))
-  #:view (lambda (cl)
-           (let ((ls (chatlog-lines cl)))
-             (cond
-              ((null? ls)
-               (txt "(no messages yet — type below)" #:fg 'muted #:italic))
-              (else
-               (apply vbox
-                      (map (lambda (line)
-                             (hbox (txt "▸ " #:fg 'accent)
-                                   (txt line)))
-                           (reverse ls)))))))
-  #:react (lambda (cl msg)
-            (set! (chatlog-lines cl) (cons (cadr msg) (chatlog-lines cl)))
-            #f))
+(define-method (view (c <chat>) sz)
+  (let ((ls (chat-lines c)))
+    (vbox
+     (make-panel #:title "chat" #:face 'muted
+                 #:content
+                 (cond
+                  ((null? ls)
+                   (txt "(no messages yet — type below)"
+                        #:fg 'muted #:italic))
+                  (else
+                   (apply vbox
+                          (map (lambda (line)
+                                 (hbox (txt "▸ " #:fg 'accent)
+                                       (txt line)))
+                               (reverse ls))))))
+     (spacer 1)
+     (view (chat-input c) sz))))
 
-;; ── input row: textinput + a node that watches for the return key,
-;; sends 'chat-submit with the input's contents, and clears it. ──────
+(define-method (update (c <chat>) (msg <key>) sz)
+  (let ((k (key-sym msg)))
+    (cond
+     ((or (eq? k 'return) (eqv? k #\newline) (eqv? k #\return))
+      (let ((val (textinput-value (chat-input c))))
+        (unless (zero? (string-length val))
+          (set! (chat-lines c) (cons val (chat-lines c)))
+          (set! (textinput-value (chat-input c)) "")
+          (set! (textinput-cursor (chat-input c)) 0)))
+      (values c #f))
+     (else
+      (update (chat-input c) msg sz)
+      (values c #f)))))
 
-(define ti (make-textinput #:prompt "> " #:placeholder "say something" #:width 40))
+(define-method (update (c <chat>) msg sz)
+  (update (chat-input c) msg sz)
+  (values c #f))
 
-(set! (textinput-focused? ti) #t)
-
-(define-node submitter
-  #:state ((input ti))
-  #:subscribes (key?)
-  #:view (lambda (_) (spacer 0))   ; no visible UI
-  #:react (lambda (s msg)
-            (let ((k (key-sym msg)))
-              (cond
-               ((or (eq? k 'return) (eqv? k #\newline) (eqv? k #\return))
-                (let ((val (textinput-value (submitter-input s))))
-                  (cond
-                   ((zero? (string-length val)) #f)
-                   (else
-                    (set! (textinput-value (submitter-input s)) "")
-                    (set! (textinput-cursor (submitter-input s)) 0)
-                    ;; user thunk → engine spawns fiber → returns msg
-                    ;; that re-enters the cascade. chatlog picks it up.
-                    (lambda () `(chat-submit ,val))))))
-               (else #f)))))
-
-(define cl (make-chatlog))
-
-(define app
-  (vbox
-   (make-panel #:title "chat" #:face 'muted #:content cl)
-   (spacer 1)
-   ti
-   ;; submitter is invisible but lives in the tree so the cascade
-   ;; reaches it. Same trick works for any "controller" node.
-   (make-submitter)))
-
-(run-app app
+(run-app (make <chat>)
          #:title  "chat"
          #:keymap (keymap (bind '(#\c ctrl) 'quit))
          #:mouse  'off)

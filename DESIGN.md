@@ -16,195 +16,152 @@ Color is by name. `#:fg 'accent` reads from the active palette;
 Styling attributes are individual flags (`#:bold #:italic`), not a
 list.
 
+## Hello, counter
+
+```scheme
+(use-modules (canary) (oop goops))
+
+(define-class <counter> ()
+  (n #:init-keyword #:n #:init-value 0 #:accessor counter-n))
+
+(define-method (view (c <counter>) sz)
+  (txt (number->string (counter-n c))))
+
+(define-method (update (c <counter>) (msg <key>) sz)
+  (case (key-sym msg)
+    ((#\+) (set! (counter-n c) (+ 1 (counter-n c))) (values c #f))
+    ((#\-) (set! (counter-n c) (- (counter-n c) 1)) (values c #f))
+    (else  (values c #f))))
+
+(define-method (update (c <counter>) msg sz) (values c #f))
+
+(run-app (make <counter>)
+         #:title  "counter"
+         #:keymap (keymap (bind 'escape 'quit)))
+```
+
+That's everything. A GOOPS class for state, methods for `view` and
+`update`, `run-app` to launch.
+
 ## Architecture
 
-A stateful node is a record plus three procs:
+Three generics drive every node:
 
 ```
-view-proc  : (lambda (self) → child-node)
-react-proc : (lambda (self msg) → #f | cmd)        ; optional
-init-proc  : (lambda (self) → unspecified)          ; optional
+view   : (lambda (self sz)     → child-node)
+update : (lambda (self msg sz) → (values self cmd-or-#f))   ; optional
+init   : (lambda (self)        → cmd-or-#f)                 ; optional
 ```
 
-State mutates in place through setters. Return values from view, react,
-and init don't replace state — react's return is interpreted as a cmd
-(or `#f`), the others are discarded. See [Cmds](#cmds) for what react
-can hand back.
-
-Layout primitives (`txt`, `vbox`, `hbox`, `boxed`, …) are also nodes,
-but pure data — no state, no react. They're records the renderer knows
-how to walk. Whether you wrote a stateful node or a layout record, the
-parent treats it the same.
+Specialise them on your class. Layout records (`txt`, `vbox`, `hbox`,
+`boxed`, `pad`, `align`, `width`, `height`, `overlay`, `pin`,
+`on-click`, `on-hover`) are pure data — no methods, no state. The
+renderer walks them by type-check. When it reaches a GOOPS instance
+in the tree, it calls `(view instance sz)` to expand.
 
 The engine:
 
-- runs the channel-backed event loop
+- runs a channel-backed event loop
 - reads input (keys, mouse) and emits typed msgs
-- renders the view tree, populates click regions, draws cell diffs
-- on each msg, walks the rendered tree depth-first and calls every
-  stateful's `react-proc` with the msg (the **cascade**)
-- collects cmds returned from react, batches them, runs them
+- renders `(view root sz)`, populates click regions, draws cell diffs
+- on each msg, walks the rendered tree and calls `(update node msg sz)`
+  on every GOOPS instance found
+- collects cmds from each update's second return value, batches them,
+  runs them
 - spawns fibers for cmds that need them (`every`, `after`, user thunks)
 
-No fixed-fps render loop — render runs after any msg that produced
-something to redraw. Authors never construct `<engine>`; they pass a
-root node to `run-app` and the engine wraps it.
+`run-app` takes any GOOPS instance and config kwargs. No `<app>` base
+class to subclass — your class inherits from whatever you want, or
+nothing.
 
-### The cascade
+### Composition
 
-Every stateful in the rendered tree sees every msg. This is closer to
-actor-style broadcast than to Elm-TEA's single update or React's
-parent-to-child props. Each node filters in its own `react-proc` —
-typically with `(when (key? msg) ...)` or `(case (and (symbol? msg) msg) ...)`.
-
-The tree IS the children. No `widget-children` declaration to keep in
-sync; the engine pulls children by calling `view-proc`, then walks the
-returned node. Containers (vbox, boxed, overlay, …) are walked
-transparently.
-
-## A "hello, world" app
+`view` returns a tree containing other nodes — layout records or
+GOOPS instances — and the engine handles the rest.
 
 ```scheme
-(use-modules (canary))
+(define-class <chat> ()
+  (lines #:init-value '()                #:accessor chat-lines)
+  (input #:init-form (make-textinput)    #:accessor chat-input))
 
-(define-node hello
-  #:state ((greeting "world"))
-  #:view  (lambda (self)
-            (txt "hello, " (txt (hello-greeting self) #:fg 'accent #:bold))))
-
-(run-app (make-hello)
-         #:keymap (keymap (bind #\q 'quit)))
+(define-method (view (c <chat>) sz)
+  (vbox (apply vbox (map (lambda (l) (txt l)) (chat-lines c)))
+        (view (chat-input c) sz)))
 ```
 
-`define-node` generates the state record, per-slot accessors
-(`hello-greeting` / `set-hello-greeting!`), a predicate (`hello?`),
-and a constructor (`make-hello [#:greeting ...]`) returning a
-`<stateful>` node ready to drop into a tree.
+The cascade visits both `<chat>` and the embedded `<textinput>` on
+every msg. Each `update` decides what to do or returns `(values self
+#f)` to ignore.
 
-## `define-node`
+## Live coding
 
-The author surface. Expansion:
-
-```scheme
-(define-node counter
-  #:state ((n 0)
-           (label "count"))
-  #:view  (lambda (self)
-            (txt (counter-label self) ": " (number->string (counter-n self))))
-  #:react (lambda (self msg)
-            (case (and (symbol? msg) msg)
-              ((bump) (set-counter-n! self (+ 1 (counter-n self))))
-              (else #f)))
-  #:init  (lambda (self) #f))         ; optional
+```
+make repl
 ```
 
-generates:
+opens a Geiser-listenable image. From an Emacs/VS Code Geiser session:
 
-- a hidden state record (slots not visible to user code)
-- public per-slot accessors: `counter-n`, `set-counter-n!`,
-  `counter-label`, `set-counter-label!`
-- public predicate `counter?`
-- public constructor `(make-counter [#:n 0] [#:label "count"])` →
-  `<stateful>`
+- `C-M-x` on a `(define-method (view (c <counter>) sz) …)` form
+  replaces the method body. Existing instances dispatch to the new
+  body on the next render.
+- `C-M-x` on a `(define-class <counter> () …)` form triggers Guile's
+  class-redefinition protocol. Existing instances migrate to the new
+  slot layout.
+- `(set! (counter-n c) 99)` from the REPL mutates a slot directly.
+- Re-evaluate a theme to swap palettes or restyle.
 
-Required: `#:state` (use `#:state ()` for stateless) and `#:view`.
-`#:react`, `#:init`, and `#:subscribes` are optional.
-
-`view-proc` should be pure. The cascade walker calls it to find the
-node's children before the renderer calls it to produce cmds; side
-effects fire twice. Read `(*frame-size*)` inside view if the layout
-needs to know the terminal size.
-
-### `#:subscribes` — msg filtering
-
-By default, every msg reaches every stateful node's `react-proc`. A
-node that only cares about a few msg types can declare them:
-
-```scheme
-(define-node spinner
-  #:state ((frame-idx 0))
-  #:subscribes (init? tick?)
-  #:view  (lambda (s) (txt (current-frame s)))
-  #:react (lambda (s msg)
-            (cond
-             ((init? msg) (every #:hz 10 (lambda () (tick))))
-             ((tick? msg) (set! (spinner-frame-idx s)
-                                (+ 1 (spinner-frame-idx s))) #f))))
-```
-
-The cascade calls each predicate in turn; if any returns truthy, the
-node receives the msg. Omitting `#:subscribes` (or setting it to `()`)
-keeps the receive-all behaviour. Bundled predicates: `key?`, `mouse?`,
-`tick?`, `resize?`, `init?`, `focus?`, `blur?`, `resume?`. Any unary
-predicate procedure works — `symbol?`, your own `(lambda (m) …)`.
+No rebuild loop. The process keeps running across edits.
 
 ## Msgs
 
-Engine-emitted records matched in `react-proc`.
+Engine-emitted records matched in `update`.
 
-| record       | when                                          |
-|--------------|-----------------------------------------------|
-| `<key>`      | a keystroke (with optional modifiers)         |
-| `<mouse>`    | mouse button / motion / scroll                |
-| `<tick>`     | an `every` or `after` fired                   |
-| `<resize>`   | terminal size changed                         |
-| `<focus>`    | terminal gained focus                         |
-| `<blur>`     | terminal lost focus                           |
-| `<resume>`   | engine reacquired tty after suspend           |
-| symbol       | keymap action; `on-click` action; user msg    |
-| list         | any user-defined shape via `(send eng …)`     |
+| record    | when                                          |
+|-----------|-----------------------------------------------|
+| `<key>`   | a keystroke (with optional modifiers)         |
+| `<mouse>` | mouse button / motion / scroll                |
+| `<tick>`  | an `every` or `after` cmd fired               |
+| `<resize>`| terminal size changed                         |
+| `<init>`  | once before the first user input              |
+| `<focus>` | terminal gained focus                         |
+| `<blur>`  | terminal lost focus                           |
+| `<resume>`| engine reacquired tty after suspend           |
+| symbol    | keymap action; `on-click` action; user msg    |
+| list      | any user-defined shape via `(send eng …)`     |
 
-Idiomatic react:
+Multi-method dispatch on the msg class is the natural shape:
 
 ```scheme
-#:react
-(lambda (self msg)
-  (cond
-   ((key? msg)
-    (case (key-sym msg)
-      ((#\q) 'quit)
-      (else  #f)))
-   ((tick? msg)
-    (set-self-frame! self (+ 1 (self-frame self)))
-    #f)
-   ((eq? msg 'bump)
-    (set-self-n! self (+ 1 (self-n self)))
-    #f)
-   (else #f)))
+(define-method (update (c <my>) (msg <tick>) sz) …)
+(define-method (update (c <my>) (msg <key>)  sz) …)
+(define-method (update (c <my>) msg sz) (values c #f))   ; catch-all
 ```
-
-Return either `#f` (no cmd) or a cmd value. Cascade collects cmds from
-every reacting node, batches them, dispatches.
 
 ## Cmds
 
-Returned from `react-proc` and `init-proc`. Cmds are constructor
+Returned from `update` (second value) and `init`. Cmds are constructor
 calls, not quoted literals.
 
-| cmd                                 | effect                                       |
-|-------------------------------------|----------------------------------------------|
-| `#f`                                | no-op                                        |
-| `'quit`                             | exit `run-app`                               |
-| `(batch c1 c2 …)`                   | parallel                                     |
-| `(sequence c1 c2 …)`                | sequential, awaits each                      |
-| `(every #:hz N producer)`           | persistent ticker — one fiber, no reschedule |
-| `(every #:ms N producer)`           | same                                         |
-| `(every #:seconds S producer)`      | same                                         |
-| `(after #:ms N producer)`           | one-shot timer                               |
-| `(println "string" …)`              | line to scrollback above alt-screen          |
-| `(set-title "name")`                | runtime OS title change                      |
-| `(clear-screen)`                    | force full repaint                           |
-| `(cursor 'hidden│'visible│'bar│…)`  | runtime cursor change                        |
-| `(alt-screen 'on│'off)`             | runtime alt-screen toggle                    |
-| `(mouse-mode 'off│'click│'cell│'all)` | runtime mouse mode change                  |
-| `(set-palette 'name)`               | switch active palette                        |
-| `(cycle-palette)`                   | next palette in theme's declared order       |
-| `(suspend)`                         | hand tty to shell, resume on SIGCONT         |
-| `(exec "cmd args" #:on-done thunk)` | tear down, run process, restore, msg         |
-| user thunk                          | engine spawns fiber; thunk returns msg       |
-
-The engine intercepts `'quit` directly. Everything else routes
-through `(canary cmd)`.
+| cmd                                 | effect                                  |
+|-------------------------------------|-----------------------------------------|
+| `#f`                                | no-op                                   |
+| `'quit`                             | exit `run-app`                          |
+| `(batch c1 c2 …)`                   | parallel                                |
+| `(sequence c1 c2 …)`                | sequential, awaits each                 |
+| `(every #:hz N producer)`           | persistent ticker — one fiber           |
+| `(every #:ms N producer)`           | same                                    |
+| `(after #:ms N producer)`           | one-shot timer                          |
+| `(println "string" …)`              | line to scrollback above alt-screen     |
+| `(set-title "name")`                | runtime OS title change                 |
+| `(clear-screen)`                    | force full repaint                      |
+| `(cursor 'hidden│'visible│'bar│…)`  | runtime cursor change                   |
+| `(alt-screen 'on│'off)`             | runtime alt-screen toggle               |
+| `(mouse-mode 'off│'click│'cell│'all)` | runtime mouse mode change             |
+| `(set-palette 'name)`               | switch active palette                   |
+| `(cycle-palette)`                   | next palette in theme's declared order  |
+| `(suspend)`                         | hand tty to shell, resume on SIGCONT    |
+| `(exec "cmd args" #:on-done thunk)` | tear down, run process, restore, msg    |
+| user thunk                          | engine spawns fiber; thunk returns msg  |
 
 ## Click & hover
 
@@ -213,12 +170,10 @@ through `(canary cmd)`.
 (on-hover child styler-proc)
 ```
 
-`on-click` wraps any child so a left-press inside its rendered rect
-dispatches `action` as a msg through the cascade. `action` is any
-value — a symbol, a list, anything `react-proc`s can match on.
-
-`on-hover` swaps `child` for `(styler-proc child)` whenever the cursor
-is inside the rect — purely visual, no msg.
+`on-click` wraps any child so a left-press inside its rendered area
+dispatches `action` as a msg. `on-hover` swaps `child` for
+`(styler-proc child)` whenever the cursor is inside the area — purely
+visual.
 
 ```scheme
 (on-click 'save
@@ -234,36 +189,30 @@ is inside the rect — purely visual, no msg.
  …)
 ```
 
-A key is one of:
-
-| form                                              | meaning                              |
-|---------------------------------------------------|--------------------------------------|
-| `#\h`, `#\?`, `#\:`                               | literal char                         |
-| `#\tab`, `#\escape`, `#\space`, `#\return`, `#\delete`, `#\backspace` | Guile's named chars |
-| `'left`, `'right`, `'up`, `'down`, `'home`, `'end`, `'pgup`, `'pgdn`, `'f1`…`'f12` | symbols |
-| `'(#\x ctrl)`, `'(left ctrl)`, `'(#\tab shift)`   | modifier list                        |
-| `'(mouse left)`, `'(mouse right)`, `'(mouse middle)` | mouse button                      |
-| `'(mouse-scroll up)`, `'(mouse-scroll down)`      | scroll wheel                         |
+| form                                    | meaning                    |
+|-----------------------------------------|----------------------------|
+| `#\h`, `#\?`, `#\:`                     | literal char               |
+| `#\tab` `#\escape` `#\space` `#\return` `#\delete` `#\backspace` | named chars |
+| `'left` `'right` `'up` `'down` `'home` `'end` `'pgup` `'pgdn` `'f1`…`'f12` | symbols |
+| `'(#\x ctrl)` `'(left ctrl)`            | modifier list              |
+| `'(mouse left)` `'(mouse right)`        | mouse button               |
+| `'(mouse-scroll up)` `'(mouse-scroll down)` | scroll wheel           |
 
 Modifiers: `control`/`ctrl`, `alt`/`meta`/`option`, `shift`,
 `super`/`cmd`/`command`. Canonicalised, sorted, deduped internally.
 
 ```scheme
-(bind #\q 'quit)                          ; single key
-(bind 'escape 'cancel)                    ; named key
-(bind '(#\x ctrl) 'cut)                   ; modified
-(bind #\g #\g 'top #:timeout-ms 500)      ; sequence with timeout
-(bind '(#\x ctrl) '(#\s ctrl) 'save)      ; modified sequence
-(bind '(mouse left) 'select)              ; mouse
+(bind #\q 'quit)
+(bind 'escape 'cancel)
+(bind '(#\x ctrl) 'cut)
+(bind #\g #\g 'top #:timeout-ms 500)
+(bind '(mouse left) 'select)
 ```
 
-The action can be any value. `'quit` is engine-intercepted. Anything
-else is cascaded as a msg.
+`'quit` is engine-intercepted. Anything else is dispatched to
+`update`.
 
 ## Theme
-
-Named palettes of hex colors; multiple palettes register under one
-theme; `(cycle-palette)` walks them.
 
 ```scheme
 (define ui
@@ -284,25 +233,20 @@ theme; `(cycle-palette)` walks them.
 ```
 
 - `palette` blocks list named hex colors. First declared is the default.
-- Every palette must define the same set of names. Names not present
+- Every palette should define the same set of names. Names not present
   in every palette fall back to the default palette's value when
   swapped.
-- Engine tracks the registered palettes; `(cycle-palette)` and
+- The engine tracks registered palettes; `(cycle-palette)` and
   `(set-palette 'light)` work without the user maintaining a list.
 
-No style-name layer. To reuse a styling combo, define a helper:
+For reusable styling combos, define a helper:
 
 ```scheme
 (define (hint s) (txt s #:fg 'muted #:italic))
 (define (note s) (txt s #:fg 'note  #:bold))
 ```
 
-Helpers are ordinary procs in user code, not a separate engine concept.
-
-## View nodes
-
-`txt` accepts strings, nested `txt` nodes (inline spans), and styling
-kwargs:
+## Layout primitives
 
 ```scheme
 (txt "hello")
@@ -311,13 +255,13 @@ kwargs:
 (txt "tmp" #:fg "#ff0000")                     ; inline hex
 ```
 
-Kwargs:
+Styling kwargs on `txt`:
 
 - `#:fg` / `#:bg` — hex string (`"#abc123"`) or palette name (`'accent`)
 - `#:bold` `#:italic` `#:underline` `#:reverse` `#:strike` `#:dim` —
-  individual boolean flags. **No `#:attrs '(bold italic)` list.**
+  individual boolean flags.
 
-Layout primitives:
+Containers:
 
 ```scheme
 (vbox a b c)
@@ -328,96 +272,49 @@ Layout primitives:
 (margin child #:top n #:left n …)         ; outer whitespace
 (align  child 'left│'center│'right #:width n)
 (width  child n)
-(height child n)
+(height child n #:valign 'top│'center│'bottom)
 (fill   w h #:bg 'name-or-hex)
 (pin    col row child)
 (overlay base p1 p2 …)
-(boxed  child #:border border-rounded #:fg 'name-or-hex #:title "name")
+(boxed  child #:border border-rounded #:fg 'name #:title "name")
 (static child)                            ; cache rendered cmds keyed on rect
 (on-click action child)
 (on-hover child styler-proc)
 ```
 
-`pad` and `margin` are distinct on purpose: `pad` adds space *inside*
-a boxed/styled region, `margin` adds space *outside*. Lipgloss
-conflates them; canary keeps them separate.
+`pad` and `margin` are distinct: `pad` adds space *inside* a
+boxed/styled region, `margin` adds space *outside*.
 
-## Components
+## Bundled components
 
-Each is a `define-node`. Embed by dropping the result of `make-X`
-into your tree; the cascade routes msgs to them automatically.
+Plain GOOPS classes in `canary/components/`:
 
-```scheme
-(define-node tweet
-  #:state ((input  (make-textinput #:prompt "> "))
-           (notes  '()))
-  #:view (lambda (t)
-           (vbox (tweet-input t)
-                 (txt (format #f "~a notes" (length (tweet-notes t)))))))
-```
+- `<button>` — title + on-click
+- `<panel>`  — title + border + footer + content, with hover affordance
+- `<textinput>` — single-line input with cursor
+- `<spinner>` — animated frames, installs its own ticker via `init`
+- `<progress>` — bar with percentage
+- `<paginator>` — page indicator with key bindings
 
-No `react` forwarding needed — `tweet-input t` IS a stateful node in
-the rendered tree, so the cascade hits it directly.
-
-Bundled: `textinput`, `button`, `progress`, `spinner`, `paginator`,
-`panel`.
-
-## Live coding
-
-```
-make run
-```
-
-Launches the app and exposes a Geiser-listenable Guile image on
-`localhost:37146`. From an Emacs/VS Code Geiser session:
-
-- **Redefine a view, react, or init.** `define-node` emits the procs
-  as named top-level bindings (`%counter-view`, `%counter-react`,
-  `%counter-init`) and the node holds thunks that re-resolve them on
-  every call. `(set! %counter-view (lambda (c) …))` from the REPL
-  updates every live instance on the next render.
-- **Mutate state slots directly** between events. `(set! (counter-n c)
-  99)` at the REPL.
-- **Re-evaluate the theme** to swap palettes or restyle.
-
-Caveat: re-evaluating the entire `define-node` form creates a fresh
-`<name-state>` record type and orphans existing instances. Stick to
-`(set! %name-view …)` and slot mutation to keep your running state.
+Each exposes `make-X` as the constructor and a small set of accessors.
+Embed an instance as a slot on your app class; the engine cascades
+msgs into it automatically.
 
 ## Anti-patterns
 
-- **Don't** return state from react/init. Mutate via the setters
-  `define-node` generates; return `#f` or a cmd from react, nothing
-  from init. The engine ignores returned state.
-- **Don't** declare a parent's children separately. The tree IS the
-  children — if a node appears in another node's `view-proc` output,
-  it's wired automatically.
+- **Don't** return new state from `update`. Mutate in place with the
+  accessors, return `(values self cmd)`.
 - **Don't** construct cmds as quoted lists: `'(set-title "x")` ✗,
   `(set-title "x")` ✓.
 - **Don't** put style flags in a list: `#:attrs '(bold italic)` ✗,
   `#:bold #:italic` ✓.
-- **Don't** thread palette lists in user code. Declare palettes inside
-  `theme`; `cycle-palette` iterates them.
-- **Don't** look for a `#:style` kwarg on `txt`. Reference palette
-  colors through `#:fg`/`#:bg`; bundle reuse with a helper proc.
 - **Don't** poll for state changes. Every transition is a msg; every
   side-effect is a cmd.
 - **Don't** issue `(alt-screen 'on)` / `(cursor 'hide)` / `(set-title
   …)` from `init` for the defaults. Pass them as kwargs to `run-app`.
-- **Don't** side-effect inside `view-proc`. The cascade walker calls
-  it once to find children before render calls it again to produce
+- **Don't** side-effect inside `view`. The cascade walker calls it
+  once to find children before render calls it again to produce
   cmds; any effect fires twice per msg.
-
-## What canary doesn't try to do
-
-- A statically-typed API. Match patterns and runtime checks are honest
-  about the dynamic-Scheme nature.
-- A single statically-linked binary. The runtime is Guile + fibers.
-- Sub-millisecond idle CPU. Native Go beats this in absolute terms; the
-  intentional trade is REPL-driven dev and a richer view IR.
-- A wide ecosystem of pre-built widgets. The bundled components cover
-  the common cases; the design favours composition over a sprawling
-  library.
 
 ## Module surface
 
@@ -425,30 +322,15 @@ Caveat: re-evaluating the entire `define-node` form creates a fresh
 (use-modules (canary))
 ```
 
-Re-exports every public name from:
-
-- `(canary engine)`      — `run-app`, `start-engine!`, `send`, log entries
-- `(canary cmd)`         — `run-command`
-- `(canary node)`        — `define-node`
-- `(canary view)`        — `<stateful>`, `make-stateful`, `view-size`,
-                           `view-node?` (escape hatch — most authors use
-                           `define-node`)
-- `(canary protocol)`    — msg types + cmd constructors
-- `(canary key)`         — `<key>`, `key`, `key=?`, modifier helpers
-- `(canary keymap)`      — `keymap`, `bind`
-- `(canary theme)`       — `theme`, palette forms
-- `(canary layout)`      — `txt`, `vbox`, `hbox`, `spacer`, `pad`,
-                           `margin`, `align`, `width`, `height`, `fill`,
-                           `pin`, `overlay`, `static`, `on-click`,
-                           `on-hover`
-- `(canary borders)`     — `boxed`, `border-normal`, `border-rounded`,
-                           `border-thick`, `border-double`, `border-ascii`
-- `(canary backend-ansi)` — `make-ansi-backend`
+Re-exports the public surface — `view`, `update`, `init` generics,
+layout primitives, theme/palette forms, keymap helpers, msg + cmd
+constructors, `run-app`, `send`, `<key>` / `<mouse>` / `<tick>` etc.
+See `canary.scm` for the full list.
 
 Components are imported individually:
 
 ```scheme
 (use-modules (canary)
-             (canary components textinput)
-             (canary components spinner))
+             (canary components panel)
+             (canary components textinput))
 ```

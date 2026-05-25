@@ -4,25 +4,13 @@
   #:use-module (canary borders)
   #:use-module (canary width)
   #:use-module (canary protocol)
+  #:use-module (oop goops)
   #:use-module (srfi srfi-1)
   #:export (render
             view->cmds
-            image-cmd->fallback-cmds
-            *mouse-x*
-            *mouse-y*
-            *frame-size*))
+            image-cmd->fallback-cmds))
 
 (define (clamp s max-w) (string-display-clamp s max-w))
-
-;; Cursor position threaded into render. -1 means "no cursor seen yet";
-;; hover-nodes won't trigger styling. Engine rebinds per-frame.
-(define *mouse-x* (make-parameter -1))
-(define *mouse-y* (make-parameter -1))
-
-;; Current frame size — a <size> (or #f if unavailable). View-procs in
-;; <stateful> nodes can read this to layout against the terminal. The
-;; engine binds this in render-frame.
-(define *frame-size* (make-parameter #f))
 
 (define (rect-contains? rect x y)
   (and (<= (rect-col rect) x)
@@ -30,13 +18,10 @@
        (<= (rect-row rect) y)
        (< y (+ (rect-row rect) (rect-h rect)))))
 
-(define* (render node cols rows #:key (mouse-x #f) (mouse-y #f) (frame-size #f))
-  (parameterize ((*mouse-x* (or mouse-x (*mouse-x*)))
-                 (*mouse-y* (or mouse-y (*mouse-y*)))
-                 (*frame-size* (or frame-size (size cols rows))))
-    (view->cmds node (make-rect 0 0 cols rows))))
+(define* (render node cols rows #:key (mouse-x -1) (mouse-y -1))
+  (view->cmds node (make-rect 0 0 cols rows) mouse-x mouse-y))
 
-(define (view->cmds node rect)
+(define (view->cmds node rect mx my)
   (cond
    ((rect-empty? rect) '())
    ((not node) '())
@@ -50,7 +35,7 @@
                      (text-node-face node)
                      (text-node-attrs node))))
    ((text-runs-node? node)
-    (render-text-runs node rect))
+    (render-text-runs node rect mx my))
    ((fill-node? node)
     (let* ((w (min (fill-node-w node) (rect-w rect)))
            (h (min (fill-node-h node) (rect-h rect))))
@@ -61,24 +46,16 @@
     (list (make-cursor (+ (rect-col rect) (cursor-node-col node))
                        (+ (rect-row rect) (cursor-node-row node))
                        (cursor-node-style node))))
-   ((vbox-node? node)
-    (render-vbox node rect))
-   ((hbox-node? node)
-    (render-hbox node rect))
-   ((boxed-node? node)
-    (render-boxed node rect))
-   ((pad-node? node)
-    (render-pad node rect))
-   ((margin-node? node)
-    (render-margin node rect))
-   ((align-node? node)
-    (render-align node rect))
-   ((width-node? node)
-    (render-width node rect))
-   ((height-node? node)
-    (render-height node rect))
+   ((vbox-node? node)    (render-vbox    node rect mx my))
+   ((hbox-node? node)    (render-hbox    node rect mx my))
+   ((boxed-node? node)   (render-boxed   node rect mx my))
+   ((pad-node? node)     (render-pad     node rect mx my))
+   ((margin-node? node)  (render-margin  node rect mx my))
+   ((align-node? node)   (render-align   node rect mx my))
+   ((width-node? node)   (render-width   node rect mx my))
+   ((height-node? node)  (render-height  node rect mx my))
    ((overlay-node? node)
-    (append (view->cmds (overlay-node-base node) rect)
+    (append (view->cmds (overlay-node-base node) rect mx my)
             (append-map
              (lambda (p)
                (let* ((col   (placement-col p))
@@ -89,13 +66,13 @@
                                           (- col (rect-col rect)))))
                       (ch (min (cdr s) (- (rect-h rect)
                                           (- row (rect-row rect))))))
-                 (view->cmds child (make-rect col row cw ch))))
+                 (view->cmds child (make-rect col row cw ch) mx my)))
              (overlay-node-overlays node))))
    ((static-node? node)
     (let ((cached (static-node-cached-rect node)))
       (if (and cached (rect=? cached rect))
           (static-node-cached-cmds node)
-          (let ((cmds (view->cmds (static-node-child node) rect)))
+          (let ((cmds (view->cmds (static-node-child node) rect mx my)))
             (set-static-node-cached-rect! node rect)
             (set-static-node-cached-cmds! node cmds)
             cmds))))
@@ -109,31 +86,25 @@
                         (image-node-src node)
                         (image-node-fallback node)))))
    ((click-node? node)
-    (let ((child-cmds (view->cmds (click-node-child node) rect)))
+    (let ((child-cmds (view->cmds (click-node-child node) rect mx my)))
       (append child-cmds
               (list (make-clickable (rect-col rect) (rect-row rect)
                                     (rect-w rect) (rect-h rect)
                                     (click-node-action node))))))
    ((hover-node? node)
-    (let* ((child  (hover-node-child node))
-           (hot?   (rect-contains? rect (*mouse-x*) (*mouse-y*)))
+    (let* ((child     (hover-node-child node))
+           (hot?      (rect-contains? rect mx my))
            (effective (if hot? ((hover-node-styler node) child) child)))
-      (view->cmds effective rect)))
-   ;; Stateful nodes expand into their view-proc's tree. The renderer
-   ;; doesn't inspect state — it just walks through. State lifecycle
-   ;; (init, react, invalidate) is the engine's job; render only reads.
-   ((stateful? node)
-    (when (and (stateful-init-proc node)
-               (not (stateful-initialized? node)))
-      ((stateful-init-proc node) node)
-      (set-stateful-initialized?! node #t))
-    (view->cmds ((stateful-view-proc node) node) rect))
+      (view->cmds effective rect mx my)))
+   ((is-a? node <object>)
+    (view->cmds (view node (size (rect-w rect) (rect-h rect))) rect mx my))
    (else '())))
 
 (define (image-cmd->fallback-cmds cmd)
   (view->cmds (image-fallback cmd)
               (make-rect (image-col cmd) (image-row cmd)
-                         (image-w cmd) (image-h cmd))))
+                         (image-w cmd) (image-h cmd))
+              -1 -1))
 
 (define (bg-fill-cmds face rect)
   (if face
@@ -142,7 +113,7 @@
                        face))
       '()))
 
-(define (render-vbox node rect)
+(define (render-vbox node rect mx my)
   (let ((face (vbox-node-face node))
         (children (vbox-node-children node)))
     (append
@@ -152,15 +123,17 @@
         ((or (null? cs) (<= remaining 0)) (reverse acc))
         (else
          (let* ((child (car cs))
-                (s (view-size child))
+                (s  (if (is-a? child <object>)
+                        (cons (rect-w rect) remaining)
+                        (view-size child)))
                 (cw (min (car s) (rect-w rect)))
                 (ch (min (cdr s) remaining))
                 (sub (make-rect (rect-col rect) row cw ch))
-                (cmds (view->cmds child sub)))
+                (cmds (view->cmds child sub mx my)))
            (loop (cdr cs) (+ row ch) (- remaining ch)
                  (append (reverse cmds) acc)))))))))
 
-(define (render-hbox node rect)
+(define (render-hbox node rect mx my)
   (let ((face (hbox-node-face node))
         (children (hbox-node-children node)))
     (append
@@ -170,18 +143,17 @@
         ((or (null? cs) (<= remaining 0)) (reverse acc))
         (else
          (let* ((child (car cs))
-                (s (view-size child))
+                (s  (if (is-a? child <object>)
+                        (cons remaining (rect-h rect))
+                        (view-size child)))
                 (cw (min (car s) remaining))
                 (ch (min (cdr s) (rect-h rect)))
                 (sub (make-rect col (rect-row rect) cw ch))
-                (cmds (view->cmds child sub)))
+                (cmds (view->cmds child sub mx my)))
            (loop (cdr cs) (+ col cw) (- remaining cw)
                  (append (reverse cmds) acc)))))))))
 
 (define (splice-title top-mid title)
-  "Embed TITLE into the top border. Single space padding on each side;
-the border's own glyph runs right up to it (no ┤ ├ bracket sigils).
-Falls back to plain TOP-MID if the title wouldn't fit."
   (cond
    ((not title) top-mid)
    ((not (string? title)) top-mid)
@@ -197,7 +169,7 @@ Falls back to plain TOP-MID if the title wouldn't fit."
                        tag
                        (substring top-mid (+ offset tag-w) mid-w))))))))
 
-(define (render-boxed node rect)
+(define (render-boxed node rect mx my)
   (cond
    ((or (< (rect-w rect) 2) (< (rect-h rect) 2)) '())
    (else
@@ -231,9 +203,9 @@ Falls back to plain TOP-MID if the title wouldn't fit."
        (list (make-text col (+ row h -1)
                         (string-append (border-bl border) bot-mid (border-br border))
                         face '()))
-       (view->cmds (boxed-node-child node) inner-rect))))))
+       (view->cmds (boxed-node-child node) inner-rect mx my))))))
 
-(define (render-pad node rect)
+(define (render-pad node rect mx my)
   (let* ((t (pad-node-top node))
          (r (pad-node-right node))
          (b (pad-node-bottom node))
@@ -243,9 +215,9 @@ Falls back to plain TOP-MID if the title wouldn't fit."
                            (max 0 (- (rect-w rect) l r))
                            (max 0 (- (rect-h rect) t b)))))
     (append (bg-fill-cmds (pad-node-face node) rect)
-            (view->cmds (pad-node-child node) inner))))
+            (view->cmds (pad-node-child node) inner mx my))))
 
-(define (render-margin node rect)
+(define (render-margin node rect mx my)
   (let* ((t (margin-node-top    node))
          (r (margin-node-right  node))
          (b (margin-node-bottom node))
@@ -254,9 +226,9 @@ Falls back to plain TOP-MID if the title wouldn't fit."
                            (+ (rect-row rect) t)
                            (max 0 (- (rect-w rect) l r))
                            (max 0 (- (rect-h rect) t b)))))
-    (view->cmds (margin-node-child node) inner)))
+    (view->cmds (margin-node-child node) inner mx my)))
 
-(define (render-text-runs node rect)
+(define (render-text-runs node rect mx my)
   (let loop ((runs (text-runs-node-runs node))
              (col  (rect-col rect))
              (acc  '())
@@ -268,10 +240,10 @@ Falls back to plain TOP-MID if the title wouldn't fit."
              (s   (view-size run))
              (w   (min (car s) rem))
              (sub (make-rect col (rect-row rect) w 1))
-             (cmds (view->cmds run sub)))
+             (cmds (view->cmds run sub mx my)))
         (loop (cdr runs) (+ col w) (append (reverse cmds) acc) (- rem w)))))))
 
-(define (render-align node rect)
+(define (render-align node rect mx my)
   (let* ((child (align-node-child node))
          (mode (align-node-mode node))
          (target-w (or (align-node-width node) (rect-w rect)))
@@ -286,9 +258,9 @@ Falls back to plain TOP-MID if the title wouldn't fit."
                          (rect-row rect)
                          cw
                          (rect-h rect))))
-    (view->cmds child sub)))
+    (view->cmds child sub mx my)))
 
-(define (render-width node rect)
+(define (render-width node rect mx my)
   (let* ((target-w (min (width-node-w node) (rect-w rect)))
          (child (width-node-child node))
          (align (width-node-align node))
@@ -303,9 +275,9 @@ Falls back to plain TOP-MID if the title wouldn't fit."
                          (rect-row rect)
                          cw
                          (rect-h rect))))
-    (view->cmds child sub)))
+    (view->cmds child sub mx my)))
 
-(define (render-height node rect)
+(define (render-height node rect mx my)
   (let* ((target-h (min (height-node-h node) (rect-h rect)))
          (child (height-node-child node))
          (valign (height-node-valign node))
@@ -320,4 +292,4 @@ Falls back to plain TOP-MID if the title wouldn't fit."
                          (+ (rect-row rect) offset)
                          (rect-w rect)
                          ch)))
-    (view->cmds child sub)))
+    (view->cmds child sub mx my)))

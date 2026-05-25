@@ -1,9 +1,9 @@
 (define-module (canary components panel)
-  #:use-module (canary node)
+  #:use-module (canary view)
   #:use-module (canary layout)
   #:use-module (canary borders)
-  #:use-module (canary view)
-  #:export (<panel-state>
+  #:use-module (oop goops)
+  #:export (<panel>
             panel?
             make-panel
             panel-title
@@ -14,43 +14,44 @@
             panel-hover-border
             panel-content))
 
-;; A panel is just a node. Its content slot accepts any node — there's
-;; no widget vs view-tree distinction because everything is a node.
-;; Hover: when hover-face is set, the rendered frame swaps to that face
-;; (and to hover-border if supplied) while the cursor is inside.
+(define-class <panel> ()
+  (title         #:init-keyword #:title         #:init-value #f
+                 #:accessor panel-title)
+  (footer        #:init-keyword #:footer        #:init-value #f
+                 #:accessor panel-footer)
+  (border        #:init-keyword #:border        #:init-value border-rounded
+                 #:accessor panel-border)
+  (face          #:init-keyword #:face          #:init-value 'muted
+                 #:accessor panel-face)
+  (hover-face    #:init-keyword #:hover-face    #:init-value #f
+                 #:accessor panel-hover-face)
+  (hover-border  #:init-keyword #:hover-border  #:init-value #f
+                 #:accessor panel-hover-border)
+  (content       #:init-keyword #:content       #:init-value #f
+                 #:accessor panel-content))
 
-(define-node panel
-  #:state ((title #f)
-           (footer #f)
-           (border border-rounded)
-           (face 'muted)
-           (hover-face #f)
-           (hover-border #f)
-           (content #f))
-  #:view
-  (lambda (p)
-    (let* ((base-face (panel-face p))
-           (border    (panel-border p))
-           (hf        (panel-hover-face p))
-           (hb        (or (panel-hover-border p) border))
-           (body      (let ((c (panel-content p)))
-                        (cond
-                         ((not c) (txt ""))
-                         ((procedure? c) (c #f))
-                         (else c))))
-           (footer    (panel-footer p))
-           (wrap-footer
-            (lambda (face)
-              (cond ((not footer) body)
-                    (else (vbox body (txt footer #:fg face #:italic))))))
-           (frame
-            (lambda (face brd)
-              (boxed (wrap-footer face)
-                     #:border brd
-                     #:fg     face
-                     #:title  (panel-title p)))))
-      (cond
-       ((not hf) (frame base-face border))
-       (else
+(define (panel? x) (is-a? x <panel>))
+(define (make-panel . args) (apply make <panel> args))
+
+(define-method (view (p <panel>) sz)
+  (let* ((base-face (panel-face p))
+         (border    (panel-border p))
+         (hf        (panel-hover-face p))
+         (hb        (or (panel-hover-border p) border))
+         (body      (or (panel-content p) (txt "")))
+         (footer    (panel-footer p))
+         (with-footer
+          (lambda (face)
+            (if footer
+                (vbox body (txt footer #:fg face #:italic))
+                body)))
+         (frame
+          (lambda (face brd)
+            (boxed (with-footer face)
+                   #:border brd
+                   #:fg     face
+                   #:title  (panel-title p)))))
+    (if hf
         (on-hover (frame base-face border)
-                  (lambda (_) (frame hf hb))))))))
+                  (lambda (_) (frame hf hb)))
+        (frame base-face border))))

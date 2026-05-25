@@ -1,23 +1,20 @@
 (define-module (canary components spinner)
-  #:use-module (canary node)
+  #:use-module (canary view)
   #:use-module (canary layout)
   #:use-module (canary protocol)
-  #:export (<spinner-state>
+  #:use-module (oop goops)
+  #:export (<spinner>
             spinner?
             make-spinner
-            spinner-tick!
             spinner-frame-idx
             spinner-face
+            spinner-hz
+            spinner-frames
             spinner-dots
             spinner-line
             spinner-circle
             spinner-moon
             spinner-arrow))
-
-;; A spinner is an exemplar for the cmd flow: on <init> it returns
-;; (every #:hz 10 …) so the engine spawns a ticker fiber on its
-;; behalf. Each <tick> advances frame-idx. View renders the current
-;; frame. No user wiring required — drop one into a vbox and it spins.
 
 (define spinner-dots   '("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏"))
 (define spinner-line   '("-" "\\" "|" "/"))
@@ -25,25 +22,29 @@
 (define spinner-moon   '("🌑" "🌒" "🌓" "🌔" "🌕" "🌖" "🌗" "🌘"))
 (define spinner-arrow  '("←" "↖" "↑" "↗" "→" "↘" "↓" "↙"))
 
-(define-node spinner
-  #:state ((frames spinner-dots)
-           (frame-idx 0)
-           (face 'accent)
-           (hz  10))
-  #:subscribes (init? tick?)
-  #:view  (lambda (s)
-            (let ((fr (spinner-frames s)))
-              (txt (list-ref fr (modulo (spinner-frame-idx s) (length fr)))
-                   #:fg (spinner-face s))))
-  #:react (lambda (s msg)
-            (cond
-             ((init? msg)
-              ;; on first dispatch, install a ticker; engine runs the cmd.
-              (every #:hz (spinner-hz s) (lambda () (tick))))
-             ((tick? msg)
-              (set! (spinner-frame-idx s) (+ 1 (spinner-frame-idx s)))
-              #f))))
+(define-class <spinner> ()
+  (frames    #:init-keyword #:frames    #:init-value spinner-dots
+             #:accessor spinner-frames)
+  (frame-idx #:init-keyword #:frame-idx #:init-value 0
+             #:accessor spinner-frame-idx)
+  (face      #:init-keyword #:face      #:init-value 'accent
+             #:accessor spinner-face)
+  (hz        #:init-keyword #:hz        #:init-value 10
+             #:accessor spinner-hz))
 
-(define (spinner-tick! s)
-  (set! (spinner-frame-idx s) (+ 1 (spinner-frame-idx s)))
-  s)
+(define (spinner? x) (is-a? x <spinner>))
+(define (make-spinner . args) (apply make <spinner> args))
+
+(define-method (view (s <spinner>) sz)
+  (let ((fr (spinner-frames s)))
+    (txt (list-ref fr (modulo (spinner-frame-idx s) (length fr)))
+         #:fg (spinner-face s))))
+
+(define-method (update (s <spinner>) msg sz)
+  (cond
+   ((init? msg)
+    (values s (every #:hz (spinner-hz s) (lambda () (tick)))))
+   ((tick? msg)
+    (set! (spinner-frame-idx s) (+ 1 (spinner-frame-idx s)))
+    (values s #f))
+   (else (values s #f))))

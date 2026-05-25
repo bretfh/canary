@@ -1,7 +1,9 @@
 (define-module (canary view)
   #:use-module (canary width)
   #:use-module (srfi srfi-9)
-  #:export (<rect>
+  #:use-module (oop goops)
+  #:export (view update init
+            <rect>
             rect?
             make-rect
             rect-col
@@ -153,17 +155,7 @@
             hover-node?
             make-hover-node
             hover-node-child
-            hover-node-styler
-
-            <stateful>
-            stateful?
-            make-stateful
-            stateful-state set-stateful-state!
-            stateful-view-proc
-            stateful-react-proc
-            stateful-init-proc
-            stateful-subscribes
-            stateful-initialized? set-stateful-initialized?!))
+            hover-node-styler))
 
 (define-record-type <rect>
   (make-rect col row w h)
@@ -378,59 +370,9 @@ swap glyphs, wrap with overlay, return a static replacement node."
            styler))
   (%hover-node child styler #f))
 
-;; A <stateful> node carries mutable state plus three procs:
-;;   view-proc  : (lambda (node) → child-node-tree)
-;;   react-proc : (lambda (node msg) → #f | cmd)
-;;   init-proc  : (lambda (node) → unspecified)
-;;
-;; State mutates in place through the setters that `define-node`
-;; generates; the engine doesn't read what view/react/init return for
-;; state. react-proc's return is interpreted as a cmd (or #f for
-;; none) — see (canary cmd). init-proc runs once before the first
-;; render — seed state from IO (read a file, scandir, hit a socket);
-;; its return is discarded.
-;;
-;; STATE is the author's record holding all per-instance state. The
-;; engine never inspects it — it only calls the procs. This is the
-;; entire stateful API. Authors typically build these via the
-;; `define-node` macro (canary/node.scm) rather than calling
-;; make-stateful directly.
-(define-record-type <stateful>
-  (%stateful state view-proc react-proc init-proc subscribes
-             initialized? cache)
-  stateful?
-  (state         stateful-state         set-stateful-state!)
-  (view-proc     stateful-view-proc)
-  (react-proc    stateful-react-proc)
-  (init-proc     stateful-init-proc)
-  ;; A list of msg predicates (key?, mouse?, tick?, init?, …) that this
-  ;; node is interested in. The engine cascade only calls react when
-  ;; some predicate accepts the msg. #f or '() = receive everything.
-  (subscribes    stateful-subscribes)
-  (initialized?  stateful-initialized?  set-stateful-initialized?!)
-  (cache         stateful-cache         set-stateful-cache!))
-
-(define* (make-stateful state view-proc
-                        #:key (react-proc #f) (init-proc #f) (subscribes #f))
-  "Create a stateful node. VIEW-PROC is (lambda (self) → child-node);
-inside it, the author can read (*frame-size*) for the current terminal
-size if their layout needs it. REACT-PROC is (lambda (self msg) → #f
-or cmd); state mutates in place, the return is a cmd or #f. INIT-PROC
-is (lambda (self) → unspecified) called once before first render —
-mutate self in place; return discarded. SUBSCRIBES is an optional list
-of msg predicates (key?, tick?, init?, …); when set, the engine cascade
-only delivers msgs matching one of them, dropping cascade cost from
-O(N) to O(interested-N) per event."
-  (unless (procedure? view-proc)
-    (error "make-stateful: VIEW-PROC must be a procedure" view-proc))
-  (when (and react-proc (not (procedure? react-proc)))
-    (error "make-stateful: REACT-PROC must be a procedure" react-proc))
-  (when (and init-proc (not (procedure? init-proc)))
-    (error "make-stateful: INIT-PROC must be a one-arg procedure" init-proc))
-  (when (and subscribes (not (list? subscribes)))
-    (error "make-stateful: SUBSCRIBES must be a list of predicate procs"
-           subscribes))
-  (%stateful state view-proc react-proc init-proc subscribes #f #f))
+(define-generic view)
+(define-generic update)
+(define-generic init)
 
 (define (view-node? x)
   (or (text-node? x) (text-runs-node? x)
@@ -440,7 +382,7 @@ O(N) to O(interested-N) per event."
       (width-node? x) (height-node? x)
       (cursor-node? x) (overlay-node? x) (static-node? x)
       (image-node? x) (click-node? x) (hover-node? x)
-      (stateful? x)
+      (is-a? x <object>)
       (string? x) (not x)))
 
 (define (str-visible-length s) (string-display-width s))
@@ -524,12 +466,8 @@ O(N) to O(interested-N) per event."
    ((hover-node? node)
     (memo hover-node-cache set-hover-node-cache! node
           (view-size (hover-node-child node))))
-   ((stateful? node)
-    ;; A stateful node's size is its rendered child's size. The cache
-    ;; is per-instance and invalidated when the engine mutates state
-    ;; via react (the engine calls invalidate-size! after react).
-    (memo stateful-cache set-stateful-cache! node
-          (view-size ((stateful-view-proc node) node))))
+   ((is-a? node <object>)
+    (cons 0 0))
    (else (cons 0 0))))
 
 (define (view-size node) (compute-size node))
@@ -553,5 +491,4 @@ O(N) to O(interested-N) per event."
     (set-static-node-cached-rect! node #f)
     (set-static-node-cached-cmds! node #f))
    ((click-node? node)   (set-click-node-cache!   node #f))
-   ((hover-node? node)   (set-hover-node-cache!   node #f))
-   ((stateful? node)     (set-stateful-cache!     node #f))))
+   ((hover-node? node)   (set-hover-node-cache!   node #f))))

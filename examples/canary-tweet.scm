@@ -55,6 +55,7 @@
     "....C..........n...........C...."
     "....C..........n...........C...."
     "....CCCCCCCCCCCCCCCCCCCCCCCC...."))
+
 (define %sprite-two
   '(".............CCCCCC............."
     "...............CC..............."
@@ -76,6 +77,7 @@
     "....C..........n...........C...."
     "....C..........n...........C...."
     "....CCCCCCCCCCCCCCCCCCCCCCCC...."))
+
 (define %sprite-three
   '(".............CCCCCC............."
     "...............CC..............."
@@ -111,11 +113,11 @@
 (define %beak-row 8)
 
 (define (sprite-node-for frame)
-  (at %sprite-nodes (modulo (quotient frame 3) 4)))
+  (vector-ref %sprite-nodes (modulo (quotient frame 3) 4)))
 
 (define-class <note> ()
-  (age   #:init-value 0       #:accessor note-age)
-  (glyph #:init-keyword #:glyph #:accessor note-glyph))
+  (age   #:init-value 0          #:accessor note-age)
+  (glyph #:init-keyword #:glyph  #:accessor note-glyph))
 
 (define %note-lifetime 30)
 
@@ -130,13 +132,16 @@
    (+ beak-x (inexact->exact (round (* 4 (sin (* (note-age n) 0.45))))))
    (- beak-y (note-age n))))
 
-(define-class <tweet> (<app>)
-  (frame    #:init-value 0  #:accessor tweet-frame)
-  (notes    #:init-value '() #:accessor tweet-notes)
-  (input    #:init-form (make-textinput #:prompt "♪ " #:placeholder "type to sing"
-                                        #:width 40)
-            #:accessor tweet-input)
-  (spin     #:init-form (make-spinner) #:accessor tweet-spin))
+(define-class <tweet> ()
+  (frame #:init-value 0   #:accessor tweet-frame)
+  (notes #:init-value '() #:accessor tweet-notes)
+  (input #:init-form (make-textinput #:prompt "♪ "
+                                     #:placeholder "type to sing"
+                                     #:width 40
+                                     #:focused? #t)
+         #:accessor tweet-input)
+  (spin  #:init-form (make-spinner)
+         #:accessor tweet-spin))
 
 (define app-theme
   (theme (palette dark
@@ -157,7 +162,7 @@
             (+ top  %beak-row))))
 
 (define (spawn-note! m ch)
-  (when (and (char? ch) (length (tweet-notes m)))
+  (when (char? ch)
     (set! (tweet-notes m)
           (cons (make <note> #:glyph (string ch))
                 (tweet-notes m)))))
@@ -165,31 +170,24 @@
 (define-method (update (m <tweet>) (msg <tick>) sz)
   (set! (tweet-frame m) (+ (tweet-frame m) 1))
   (set! (tweet-notes m) (advance-notes! (tweet-notes m)))
-  (spinner-tick! (tweet-spin m))
+  (update (tweet-spin m) msg sz)
   (values m #f))
 
-;; (define-method (update (m <tweet>) (msg <key>) sz)
-;;   (react (tweet-input m) msg)
-;;   (let ((ch (key-sym msg)))
-;;     (cond
-;;      ((eq? ch 'enter)  (textinput-set-value! (tweet-input m) ""))
-;;      ((char? ch)       (spawn-note! m ch))))
-;;   (values m #f))
 (define-method (update (m <tweet>) (msg <key>) sz)
-  (react (tweet-input m) msg)
+  (update (tweet-input m) msg sz)
   (let ((ch (key-sym msg)))
     (cond
-     ((eq? ch 'enter)  (textinput-set-value! (tweet-input m) ""))
-     ((eq? ch #\!)     (error "deliberate test exception"))
-     ((eq? ch #\.)     (log! m 'user 'info  "info: hello from a key"))
-     ((eq? ch #\,)     (log! m 'user 'warn  "warn: something's off"))
-     ((eq? ch #\;)     (values m (clear-log)))
-     ((char? ch)       (spawn-note! m ch))))
+     ((eq? ch 'enter)
+      (set! (textinput-value (tweet-input m)) "")
+      (set! (textinput-cursor (tweet-input m)) 0))
+     ((char? ch) (spawn-note! m ch))))
   (values m #f))
 
+(define-method (update (m <tweet>) msg sz)
+  (values m #f))
 
 (define (status-bar m cols)
-  (hbox (spinner-view (tweet-spin m))
+  (hbox (view (tweet-spin m) #f)
         (txt "  tweeting..." #:fg 'accent #:bold)
         (spacer #:w (max 0 (- cols 26)))
         (txt (format #f "frame ~4d" (tweet-frame m)) #:fg 'muted)))
@@ -199,29 +197,27 @@
          (rows   (size-height sz))
          (sprite (sprite-node-for (tweet-frame m)))
          (top    (max 0 (- rows %sprite-h 6)))
-         (app-view
+         (body
           (vbox
            (status-bar m cols)
            (spacer 1)
            (spacer top)
            (align sprite 'center #:width cols)
            (spacer 1)
-           (align (textinput-view (tweet-input m)) 'center #:width cols)
+           (align (view (tweet-input m) sz) 'center #:width cols)
            (spacer 1)
            (align (txt "esc: quit" #:fg 'hint #:italic) 'center #:width cols))))
     (receive (bx by) (beak-pos sz)
-      (apply overlay app-view
+      (apply overlay body
              (map (lambda (n)
                     (receive (nx ny) (note-pos n bx by)
                       (pin nx ny (txt (note-glyph n) #:fg 'note #:bold))))
                   (tweet-notes m))))))
 
 (define (main)
-  (run-app
-   (make <tweet>
-         #:title   "canary tweet"
-         #:theme   app-theme
-         #:keymap  (keymap (bind 'escape 'quit)))))
+  (run-app (make <tweet>)
+           #:title  "canary tweet"
+           #:theme  app-theme
+           #:keymap (keymap (bind 'escape 'quit))))
 
 (main)
-

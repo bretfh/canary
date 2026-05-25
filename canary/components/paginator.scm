@@ -1,11 +1,12 @@
 (define-module (canary components paginator)
-  #:use-module (canary node)
+  #:use-module (canary view)
   #:use-module (canary layout)
   #:use-module (canary protocol)
   #:use-module (canary key)
   #:use-module (ice-9 match)
+  #:use-module (oop goops)
   #:use-module (srfi srfi-1)
-  #:export (<paginator-state>
+  #:export (<paginator>
             paginator?
             make-paginator
             paginator-type
@@ -18,30 +19,24 @@
             paginator-on-last-page?
             paginator-get-slice-bounds))
 
-(define-node paginator
-  #:state ((type 'arabic)
-           (page 0)
-           (per-page 10)
-           (total-pages 1)
-           (active-dot "•")
-           (inactive-dot "○")
-           (arabic-format "~d/~d"))
-  #:subscribes (key?)
-  #:view
-  (lambda (p)
-    (case (paginator-type p)
-      ((dots) (paginator-dots-view p))
-      (else   (paginator-arabic-view p))))
-  #:react
-  (lambda (p msg)
-    (let ((k (key-sym msg)))
-      (match k
-        ((or 'right 'page-down)         (paginator-next-page! p))
-        ((or 'left  'page-up)           (paginator-prev-page! p))
-        ((? (lambda (c) (and (char? c) (char=? c #\l)))) (paginator-next-page! p))
-        ((? (lambda (c) (and (char? c) (char=? c #\h)))) (paginator-prev-page! p))
-        (_ #f))
-      #f)))
+(define-class <paginator> ()
+  (type          #:init-keyword #:type          #:init-value 'arabic
+                 #:accessor paginator-type)
+  (page          #:init-keyword #:page          #:init-value 0
+                 #:accessor paginator-page)
+  (per-page      #:init-keyword #:per-page      #:init-value 10
+                 #:accessor paginator-per-page)
+  (total-pages   #:init-keyword #:total-pages   #:init-value 1
+                 #:accessor paginator-total-pages)
+  (active-dot    #:init-keyword #:active-dot    #:init-value "•"
+                 #:accessor paginator-active-dot)
+  (inactive-dot  #:init-keyword #:inactive-dot  #:init-value "○"
+                 #:accessor paginator-inactive-dot)
+  (arabic-format #:init-keyword #:arabic-format #:init-value "~d/~d"
+                 #:accessor paginator-arabic-format))
+
+(define (paginator? x) (is-a? x <paginator>))
+(define (make-paginator . args) (apply make <paginator> args))
 
 (define (paginator-prev-page! p)
   (when (> (paginator-page p) 0)
@@ -67,16 +62,29 @@
         (values start end))))
 
 (define (paginator-dots-view p)
-  (let ((total   (paginator-total-pages p))
-        (current (paginator-page p)))
-    (apply hbox
-           (map (lambda (i)
-                  (if (= i current)
-                      (txt "•" #:fg 'accent)
-                      (txt "○" #:fg 'muted)))
-                (iota total)))))
+  (apply hbox
+         (map (lambda (i)
+                (if (= i (paginator-page p))
+                    (txt (paginator-active-dot p) #:fg 'accent)
+                    (txt (paginator-inactive-dot p) #:fg 'muted)))
+              (iota (paginator-total-pages p)))))
 
 (define (paginator-arabic-view p)
-  (let ((current (+ 1 (paginator-page p)))
-        (total   (paginator-total-pages p)))
-    (txt (format #f "~d/~d" current total) #:fg 'muted)))
+  (txt (format #f "~d/~d" (+ 1 (paginator-page p)) (paginator-total-pages p))
+       #:fg 'muted))
+
+(define-method (view (p <paginator>) sz)
+  (case (paginator-type p)
+    ((dots) (paginator-dots-view p))
+    (else   (paginator-arabic-view p))))
+
+(define-method (update (p <paginator>) msg sz)
+  (when (key? msg)
+    (let ((k (key-sym msg)))
+      (match k
+        ((or 'right 'page-down) (paginator-next-page! p))
+        ((or 'left  'page-up)   (paginator-prev-page! p))
+        ((? (lambda (c) (and (char? c) (char=? c #\l)))) (paginator-next-page! p))
+        ((? (lambda (c) (and (char? c) (char=? c #\h)))) (paginator-prev-page! p))
+        (_ #f))))
+  (values p #f))
