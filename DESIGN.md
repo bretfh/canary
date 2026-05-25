@@ -83,22 +83,112 @@ nothing.
 
 ### Composition
 
-`view` returns a tree containing other nodes — layout records or
-GOOPS instances — and the engine handles the rest.
+`view` returns a tree of nodes — layout records and GOOPS instances
+mixed freely. **Embed widgets by instance reference, never by
+expanding them via `(view child sz)` in your own view.** The renderer
+calls `view` on a GOOPS instance for you; the cascade walks the tree
+and dispatches `update` on every instance it finds. There is no
+container that "doesn't support widgets": every layout primitive that
+takes a child also takes a GOOPS child.
 
 ```scheme
 (define-class <chat> ()
-  (lines #:init-value '()                #:accessor chat-lines)
-  (input #:init-form (make-textinput)    #:accessor chat-input))
+  (lines #:init-value '()             #:accessor chat-lines)
+  (input #:init-form (make-textinput) #:accessor chat-input))
 
 (define-method (view (c <chat>) sz)
   (vbox (apply vbox (map (lambda (l) (txt l)) (chat-lines c)))
-        (view (chat-input c) sz)))
+        (chat-input c)))                ; ← the <textinput>, not (view it sz)
 ```
 
-The cascade visits both `<chat>` and the embedded `<textinput>` on
-every msg. Each `update` decides what to do or returns `(values self
-#f)` to ignore.
+Nest as deep as you want:
+
+```scheme
+(vbox
+ (boxed (make-dired #:path "/foo") #:title "left")
+ (hbox  (align (make-spinner) 'center #:width 20)
+        (pad   (make-button #:label "ok" #:action 'save) #:left 2)
+        (width (chat-input app) 40)))
+```
+
+The cascade reaches every embedded widget regardless of depth or
+container kind. Each widget's `update` mutates state in place and
+returns `(values self cmd-or-#f)`. Widgets that don't care about a
+given msg fall through the default catch-all and return
+`(values self #f)`.
+
+#### Anti-pattern
+
+```scheme
+;; DON'T: cascade can't see the textinput through expanded layout records.
+(vbox (view (chat-input c) sz))
+```
+
+Use `(chat-input c)`. The engine expands it for rendering and visits
+it during cascade.
+
+### Focus
+
+Key and mouse msgs are routed to the **focus chain** — a path of
+GOOPS instances from root to the currently focused widget — not
+broadcast to every widget. This stops two `<textinput>`s in the same
+tree from both consuming a typed character.
+
+Default focus is the root widget. Move focus with the `focus` cmd:
+
+```scheme
+(define-method (update (c <chat>) (msg <init>) sz)
+  (values c (focus (chat-input c))))    ; ← input gets keys from the first frame
+```
+
+The chain is `root → … → target`, resolved by the engine walking the
+source tree. Keys / mouse msgs are dispatched **leaf-to-root**: the
+deepest focused widget gets the first crack, then each ancestor up
+the chain, so a textinput can insert a char and chat above it can
+still see enter and append a line — both fire in order:
+
+```scheme
+(define-method (update (c <chat>) (msg <key>) sz)
+  (when (eq? (key-sym msg) 'return)
+    (let ((val (textinput-value (chat-input c))))
+      (unless (zero? (string-length val))
+        (set! (chat-lines c) (cons val (chat-lines c)))
+        (set! (textinput-value (chat-input c)) "")
+        (set! (textinput-cursor (chat-input c)) 0))))
+  (values c #f))
+```
+
+No "consumed, stop" sentinel — every node in the chain fires for
+every key/mouse msg. Compose by ordering state mutations across
+update methods.
+
+Non-key/mouse msgs (`<init>`, `<tick>`, `<resize>`, focus/blur,
+keymap-mapped actions like `'save`, `on-click` action symbols, user
+msgs sent via `send`) still **broadcast** through the whole tree —
+that's the right shape for "tick all animations" or "everyone gets
+init" or "any widget can react to 'save."
+
+Subscription lifetime: an `every` or `after` cmd without `#:id`
+installs an anonymous fiber that lives until the engine stops — no
+way to cancel. With `#:id`, the engine maps that id to the fiber.
+Re-issuing the same `(every #:id k …)` is idempotent (a no-op if k
+is already installed). `(cancel k)` stops it.
+
+```scheme
+;; A spinner that ticks only while loading.
+(define-method (update (c <my>) (msg <init>) sz) (values c #f))
+
+(define-method (update (c <my>) (msg <load-start>) sz)
+  (values c (every #:hz 10 #:id 'spinner-tick (lambda () (tick)))))
+
+(define-method (update (c <my>) (msg <load-done>) sz)
+  (values c (cancel 'spinner-tick)))
+```
+
+The id is any `eq?`-comparable Scheme value — a symbol, a widget
+instance, a `(list 'tick widget)` pair for per-instance ids. Returning
+the same `(every #:id … …)` cmd every update is fine and cheap; the
+engine only spawns once.
 
 ## Live coding
 
@@ -155,9 +245,10 @@ not quoted literals.
 | `'quit`                             | exit `run-app`                          |
 | `(batch c1 c2 …)`                   | parallel                                |
 | `(sequence c1 c2 …)`                | sequential, awaits each                 |
-| `(every #:hz N producer)`           | persistent ticker — one fiber           |
-| `(every #:ms N producer)`           | same                                    |
-| `(after #:ms N producer)`           | one-shot timer                          |
+| `(every #:hz N [#:id k] producer)`  | persistent ticker — one fiber; cancel with `(cancel k)` |
+| `(every #:ms N [#:id k] producer)`  | same                                    |
+| `(after #:ms N [#:id k] producer)`  | one-shot timer; cancel with `(cancel k)` before it fires |
+| `(cancel id)`                       | stop a sub installed with that `#:id`   |
 | `(println "string" …)`              | line to scrollback above alt-screen     |
 | `(set-title "name")`                | runtime OS title change                 |
 | `(clear-screen)`                    | force full repaint                      |
@@ -168,6 +259,7 @@ not quoted literals.
 | `(cycle-palette)`                   | next palette in theme's declared order  |
 | `(suspend)`                         | hand tty to shell, resume on SIGCONT    |
 | `(exec "cmd args" #:on-done thunk)` | tear down, run process, restore, msg    |
+| `(focus widget)`                    | route key/mouse msgs to this widget chain |
 | user thunk                          | engine spawns fiber; thunk returns msg  |
 
 ## Click & hover

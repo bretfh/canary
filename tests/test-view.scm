@@ -15,4 +15,8 @@
             (view-size (hbox (txt "ab") (txt "cd") (txt "efg"))))
 (test-equal "spacer size" '(0 . 3) (view-size (spacer 3)))
 
+(test-equal "flex is transparent for view-size"
+            '(2 . 1)
+            (view-size (flex (txt "ab"))))
+
 (test-end "view")

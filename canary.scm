@@ -27,7 +27,7 @@
 
    <key> key key? key-sym key-mods key=? key->string
 
-   view update init
+   view update
 
    <theme> theme theme?
    theme-active theme-active-name theme-resolve theme-set! theme-cycle!
@@ -37,7 +37,7 @@
    <keymap> keymap keymap? bind keymap-step keymap-reset
 
    txt vbox hbox spacer join pad margin align width height fill
-   place-cursor pin overlay static image on-click on-hover
+   place-cursor pin overlay static image on-click on-hover flex
 
    <border> border? border-normal border-rounded border-thick
    border-double border-ascii boxed
@@ -54,5 +54,6 @@
    every every? after after?
    set-title cursor alt-screen mouse-mode clear-screen
    println suspend exec set-palette cycle-palette clear-log
+   focus cancel
 
    view-size view-node?))

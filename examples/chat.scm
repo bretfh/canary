@@ -32,25 +32,20 @@
                                        (txt line)))
                                (reverse ls))))))
      (spacer 1)
-     (view (chat-input c) sz))))
+     (chat-input c))))
+
+(define-method (update (c <chat>) (msg <init>) sz)
+  (values c (focus (chat-input c))))
 
 (define-method (update (c <chat>) (msg <key>) sz)
   (let ((k (key-sym msg)))
-    (cond
-     ((or (eq? k 'return) (eqv? k #\newline) (eqv? k #\return))
+    (when (or (eq? k 'return) (eqv? k #\newline) (eqv? k #\return))
       (let ((val (textinput-value (chat-input c))))
         (unless (zero? (string-length val))
           (set! (chat-lines c) (cons val (chat-lines c)))
           (set! (textinput-value (chat-input c)) "")
-          (set! (textinput-cursor (chat-input c)) 0)))
-      (values c #f))
-     (else
-      (update (chat-input c) msg sz)
-      (values c #f)))))
-
-(define-method (update (c <chat>) msg sz)
-  (update (chat-input c) msg sz)
-  (values c #f))
+          (set! (textinput-cursor (chat-input c)) 0))))
+    (values c #f)))
 
 (run-app (make <chat>)
          #:title  "chat"

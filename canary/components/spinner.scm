@@ -6,6 +6,7 @@
   #:export (<spinner>
             spinner?
             make-spinner
+            spinner-stop!
             spinner-frame-idx
             spinner-face
             spinner-hz
@@ -43,8 +44,15 @@
 (define-method (update (s <spinner>) msg sz)
   (cond
    ((init? msg)
-    (values s (every #:hz (spinner-hz s) (lambda () (tick)))))
+    (values s (every #:hz (spinner-hz s)
+                     #:id  (list 'spinner-tick s)
+                     (lambda () (tick)))))
    ((tick? msg)
     (set! (spinner-frame-idx s) (+ 1 (spinner-frame-idx s)))
     (values s #f))
    (else (values s #f))))
+
+(define (spinner-stop! s)
+  "Cancel a spinner's installed ticker. Use when removing a spinner
+from the tree to free its fiber."
+  (cancel (list 'spinner-tick s)))

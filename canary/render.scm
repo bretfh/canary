@@ -96,6 +96,8 @@
            (hot?      (rect-contains? rect mx my))
            (effective (if hot? ((hover-node-styler node) child) child)))
       (view->cmds effective rect mx my)))
+   ((flex-node? node)
+    (view->cmds (flex-node-body node) rect mx my))
    ((is-a? node <object>)
     (view->cmds (memoized-view node (size (rect-w rect) (rect-h rect)))
                 rect mx my))
@@ -114,45 +116,166 @@
                        face))
       '()))
 
+;; Major-axis size of one box item before flex distribution. GOOPS
+;; items materialize via memoized-view at a probe size; layout items
+;; report their intrinsic size directly.
+(define (probe-major item probe-w probe-h axis)
+  ;; axis 'v → return height; 'h → return width
+  (cond
+   ((flex-node? item)
+    (probe-major (flex-node-body item) probe-w probe-h axis))
+   (else
+    (let ((s (cond
+              ((is-a? item <object>)
+               (view-size (memoized-view item (size probe-w probe-h))))
+              (else (view-size item)))))
+      (if (eq? axis 'v) (cdr s) (car s))))))
+
+(define (flex-info item)
+  (cond
+   ((flex-node? item) (cons (flex-node-grow item) (flex-node-shrink item)))
+   (else (cons 0 0))))
+
+;; Walk the items list once. Return three parallel lists:
+;;  - intrinsic majors (cells)
+;;  - grow shares
+;;  - shrink shares
+;; Plus totals.
+(define (measure-box items rect axis)
+  (let lp ((cs items) (majors '()) (grows '()) (shrinks '())
+           (sum-major 0) (sum-grow 0) (sum-shrink 0))
+    (cond
+     ((null? cs)
+      (values (reverse majors) (reverse grows) (reverse shrinks)
+              sum-major sum-grow sum-shrink))
+     (else
+      (let* ((it (car cs))
+             (m  (if (eq? axis 'v)
+                     (probe-major it (rect-w rect) (rect-h rect) 'v)
+                     (probe-major it (rect-w rect) (rect-h rect) 'h)))
+             (fi (flex-info it))
+             (g  (car fi))
+             (s  (cdr fi)))
+        (lp (cdr cs) (cons m majors) (cons g grows) (cons s shrinks)
+            (+ sum-major m) (+ sum-grow g) (+ sum-shrink s)))))))
+
+;; Distribute SURPLUS (≥0) across the items by their grow shares.
+;; Remainder cells from integer rounding go to the last flex item so
+;; the box exactly fills. Returns a list of bonuses parallel to GROWS.
+(define (distribute-bonuses majors grows surplus sum-grow)
+  (cond
+   ((or (zero? surplus) (zero? sum-grow))
+    (map (lambda (_) 0) grows))
+   (else
+    (let* ((bonuses
+            (map (lambda (g)
+                   (if (zero? g) 0
+                       (inexact->exact (floor (* surplus (/ g sum-grow))))))
+                 grows))
+           (used  (apply + bonuses))
+           (left  (- surplus used))
+           ;; tack the rounding remainder onto the last flex item
+           (reversed
+            (let loop ((bs (reverse bonuses)) (gs (reverse grows))
+                       (remaining left) (acc '()))
+              (cond
+               ((null? bs) acc)
+               ((and (positive? remaining) (positive? (car gs)))
+                (append (reverse (cdr bs))
+                        (cons (+ (car bs) remaining) acc)))
+               (else (loop (cdr bs) (cdr gs) remaining (cons (car bs) acc)))))))
+      reversed))))
+
+;; Distribute DEFICIT (≥0) across the items by their shrink shares.
+;; Items can't shrink below 0. Same rounding strategy as bonuses.
+(define (distribute-cuts majors shrinks deficit sum-shrink)
+  (cond
+   ((or (zero? deficit) (zero? sum-shrink))
+    (map (lambda (_) 0) shrinks))
+   (else
+    (let loop ((ms majors) (ss shrinks) (acc '()) (sum sum-shrink) (left deficit))
+      (cond
+       ((null? ms) (reverse acc))
+       (else
+        (let* ((m (car ms)) (s (car ss))
+               (raw (if (zero? sum) 0
+                        (inexact->exact (floor (* left (/ s sum))))))
+               (cut (min m raw)))
+           (loop (cdr ms) (cdr ss) (cons cut acc)
+                 (- sum s) (- left cut)))))))))
+
+(define (assigned-majors majors grows shrinks total-major available sum-grow sum-shrink)
+  (cond
+   ((< total-major available)
+    (let ((bonuses (distribute-bonuses majors grows
+                                       (- available total-major) sum-grow)))
+      (map + majors bonuses)))
+   ((> total-major available)
+    (let ((cuts (distribute-cuts majors shrinks
+                                 (- total-major available) sum-shrink)))
+      (map - majors cuts)))
+   (else majors)))
+
+;; Minor-axis size of one item. Mirrors probe-major's GOOPS handling
+;; so a tall GOOPS item in an hbox reports its natural width.
+(define (probe-minor item probe-w probe-h axis)
+  (cond
+   ((flex-node? item)
+    (probe-minor (flex-node-body item) probe-w probe-h axis))
+   (else
+    (let ((s (cond
+              ((is-a? item <object>)
+               (view-size (memoized-view item (size probe-w probe-h))))
+              (else (view-size item)))))
+      (if (eq? axis 'v) (car s) (cdr s))))))
+
 (define (render-vbox node rect mx my)
   (let ((face (vbox-node-face node))
-        (children (vbox-node-children node)))
-    (append
-     (bg-fill-cmds face rect)
-     (let loop ((cs children) (row (rect-row rect)) (remaining (rect-h rect)) (acc '()))
-       (cond
-        ((or (null? cs) (<= remaining 0)) (reverse acc))
-        (else
-         (let* ((child (car cs))
-                (s  (if (is-a? child <object>)
-                        (view-size (memoized-view child (size (rect-w rect) remaining)))
-                        (view-size child)))
-                (cw (min (car s) (rect-w rect)))
-                (ch (min (cdr s) remaining))
-                (sub (make-rect (rect-col rect) row cw ch))
-                (cmds (view->cmds child sub mx my)))
-           (loop (cdr cs) (+ row ch) (- remaining ch)
-                 (append (reverse cmds) acc)))))))))
+        (items (vbox-node-children node)))
+    (call-with-values (lambda () (measure-box items rect 'v))
+      (lambda (majors grows shrinks total-h sum-grow sum-shrink)
+        (let ((assigned (assigned-majors majors grows shrinks total-h
+                                         (rect-h rect) sum-grow sum-shrink)))
+          (append
+           (bg-fill-cmds face rect)
+           (let loop ((cs items) (hs assigned)
+                      (row (rect-row rect)) (remaining (rect-h rect))
+                      (acc '()))
+             (cond
+              ((or (null? cs) (<= remaining 0)) (reverse acc))
+              (else
+               (let* ((it (car cs))
+                      (ch (max 0 (min (car hs) remaining)))
+                      (cw (min (probe-minor it (rect-w rect) ch 'v)
+                               (rect-w rect)))
+                      (sub (make-rect (rect-col rect) row cw ch))
+                      (cmds (view->cmds it sub mx my)))
+                 (loop (cdr cs) (cdr hs) (+ row ch) (- remaining ch)
+                       (append (reverse cmds) acc))))))))))))
 
 (define (render-hbox node rect mx my)
   (let ((face (hbox-node-face node))
-        (children (hbox-node-children node)))
-    (append
-     (bg-fill-cmds face rect)
-     (let loop ((cs children) (col (rect-col rect)) (remaining (rect-w rect)) (acc '()))
-       (cond
-        ((or (null? cs) (<= remaining 0)) (reverse acc))
-        (else
-         (let* ((child (car cs))
-                (s  (if (is-a? child <object>)
-                        (view-size (memoized-view child (size remaining (rect-h rect))))
-                        (view-size child)))
-                (cw (min (car s) remaining))
-                (ch (min (cdr s) (rect-h rect)))
-                (sub (make-rect col (rect-row rect) cw ch))
-                (cmds (view->cmds child sub mx my)))
-           (loop (cdr cs) (+ col cw) (- remaining cw)
-                 (append (reverse cmds) acc)))))))))
+        (items (hbox-node-children node)))
+    (call-with-values (lambda () (measure-box items rect 'h))
+      (lambda (majors grows shrinks total-w sum-grow sum-shrink)
+        (let ((assigned (assigned-majors majors grows shrinks total-w
+                                         (rect-w rect) sum-grow sum-shrink)))
+          (append
+           (bg-fill-cmds face rect)
+           (let loop ((cs items) (ws assigned)
+                      (col (rect-col rect)) (remaining (rect-w rect))
+                      (acc '()))
+             (cond
+              ((or (null? cs) (<= remaining 0)) (reverse acc))
+              (else
+               (let* ((it (car cs))
+                      (cw (max 0 (min (car ws) remaining)))
+                      (ch (min (probe-minor it cw (rect-h rect) 'h)
+                               (rect-h rect)))
+                      (sub (make-rect col (rect-row rect) cw ch))
+                      (cmds (view->cmds it sub mx my)))
+                 (loop (cdr cs) (cdr ws) (+ col cw) (- remaining cw)
+                       (append (reverse cmds) acc))))))))))))
 
 (define (splice-title top-mid title)
   (cond

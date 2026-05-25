@@ -12,7 +12,9 @@
                                             every every? after after?
                                             set-title cursor alt-screen mouse-mode
                                             println suspend exec set-palette cycle-palette
-                                            clear-log resumed))
+                                            clear-log resumed
+                                            focus focus? focus-target
+                                            cancel cancel? cancel-id))
   #:use-module (canary input)
   #:use-module (canary backend)
   #:use-module (canary backend-ansi)
@@ -181,6 +183,7 @@
    ((static-node? node)  (walk-nodes (static-node-child node) sz proc))
    ((click-node? node)   (walk-nodes (click-node-child node) sz proc))
    ((hover-node? node)   (walk-nodes (hover-node-child node) sz proc))
+   ((flex-node? node)    (walk-nodes (flex-node-body node) sz proc))
    ((overlay-node? node)
     (walk-nodes (overlay-node-base node) sz proc)
     (for-each (lambda (p) (walk-nodes (placement-child p) sz proc))
@@ -238,29 +241,117 @@
       (set-engine-mouse-y! eng ny)
       #t))))
 
+(define (dispatch-update! eng node msg sz cmds-cell)
+  "Call (update node msg sz). Collect any cmd into CMDS-CELL (a 1-cons
+list used as a mutable accumulator). Errors are logged, not raised."
+  (catch #t
+    (lambda ()
+      (call-with-values (lambda () (update node msg sz))
+        (lambda vs
+          (let ((cmd (cond ((null? vs) #f)
+                           ((null? (cdr vs)) #f)
+                           (else (cadr vs)))))
+            (when cmd (set-car! cmds-cell (cons cmd (car cmds-cell)))))))
+      (invalidate-size! node)
+      (invalidate-cached-view! node))
+    (lambda (key . args)
+      (engine-log! eng 'update 'error (format #f "~a ~a" key args)))))
+
+(define (cmds->batched cmds)
+  (cond
+   ((null? cmds)       #f)
+   ((null? (cdr cmds)) (car cmds))
+   (else               (cons 'batch (reverse cmds)))))
+
 (define (cascade! eng msg)
-  (let ((cmds '())
+  (let ((cmds-cell (list '()))
         (sz (backend-size (engine-backend eng))))
     (walk-nodes
      (engine-root eng)
      sz
-     (lambda (node)
-       (catch #t
-         (lambda ()
-           (call-with-values (lambda () (update node msg sz))
-             (lambda vs
-               (let ((cmd (cond ((null? vs) #f)
-                                ((null? (cdr vs)) #f)
-                                (else (cadr vs)))))
-                 (when cmd (set! cmds (cons cmd cmds))))))
-           (invalidate-size! node)
-           (invalidate-cached-view! node))
-         (lambda (key . args)
-           (engine-log! eng 'update 'error (format #f "~a ~a" key args))))))
+     (lambda (node) (dispatch-update! eng node msg sz cmds-cell)))
+    (cmds->batched (car cmds-cell))))
+
+(define (find-focus-path root sz target)
+  "Walk the source tree from ROOT looking for the GOOPS instance TARGET.
+Return (root-most-goops … target) — the path of GOOPS instances from
+the outermost ancestor down to TARGET inclusive — or #f if TARGET is
+not reachable. Layout records aren't in the path; only GOOPS nodes."
+  (define (try-list cs path)
+    (cond ((null? cs) #f)
+          (else (or (walk (car cs) path) (try-list (cdr cs) path)))))
+  (define (walk node path)
     (cond
-     ((null? cmds)        #f)
-     ((null? (cdr cmds))  (car cmds))
-     (else                (cons 'batch (reverse cmds))))))
+     ((not node) #f)
+     ((string? node) #f)
+     ((vbox-node? node)    (try-list (vbox-node-children node) path))
+     ((hbox-node? node)    (try-list (hbox-node-children node) path))
+     ((boxed-node? node)   (walk (boxed-node-child node) path))
+     ((pad-node? node)     (walk (pad-node-child node) path))
+     ((margin-node? node)  (walk (margin-node-child node) path))
+     ((align-node? node)   (walk (align-node-child node) path))
+     ((width-node? node)   (walk (width-node-child node) path))
+     ((height-node? node)  (walk (height-node-child node) path))
+     ((static-node? node)  (walk (static-node-child node) path))
+     ((click-node? node)   (walk (click-node-child node) path))
+     ((hover-node? node)   (walk (hover-node-child node) path))
+     ((flex-node? node)    (walk (flex-node-body node) path))
+     ((overlay-node? node)
+      (or (walk (overlay-node-base node) path)
+          (try-list (map placement-child (overlay-node-overlays node)) path)))
+     ((is-a? node <object>)
+      (let ((new-path (cons node path)))
+        (cond
+         ((eq? node target) (reverse new-path))
+         (else (walk (memoized-view node sz) new-path)))))
+     (else #f)))
+  (walk root '()))
+
+(define (route-to-focus! eng msg)
+  "Dispatch MSG to the focus chain leaf-to-root. If the chain is empty,
+the root is the focus. Each node in the chain gets a call to update;
+cmds returned are collected and batched. Stale chain entries (widgets
+no longer in the tree) still receive the msg — they just produce no
+visible effect — until the next (focus …) cmd refreshes the chain."
+  (let ((cmds-cell (list '()))
+        (sz (backend-size (engine-backend eng)))
+        (chain (engine-focus-chain eng)))
+    (let ((targets (cond
+                    ((null? chain) (list (engine-root eng)))
+                    (else (reverse chain)))))
+      (for-each
+       (lambda (node) (dispatch-update! eng node msg sz cmds-cell))
+       targets))
+    (cmds->batched (car cmds-cell))))
+
+;; A sub-cell is a 1-element mutable box used by sub fibers to check if
+;; they've been canceled. The cancel mechanism is cooperative: the
+;; fiber's loop reads (car cell) after each iteration / before sending,
+;; and exits if #t. Canceling sets it to #t and removes the id from
+;; the engine's subs hash.
+
+(define (make-sub-cell) (list #f))
+(define (sub-cell-stop! c) (set-car! c #t))
+(define (sub-cell-stopped? c) (car c))
+
+(define (install-sub! eng id kind fiber-body)
+  "Install a sub identified by ID. KIND is 'every / 'after — used to
+disambiguate in the subs hash (the cell value stores both for
+debugging). FIBER-BODY is a thunk that takes the stop cell and runs
+the producer loop. If ID is non-#f and already mapped, this is a
+no-op — re-issuing the same sub from an update is idempotent."
+  (cond
+   ((and id (hash-ref (engine-subs eng) id)) #f)
+   (else
+    (let ((cell (make-sub-cell)))
+      (when id (hash-set! (engine-subs eng) id cell))
+      (spawn-fiber (lambda () (fiber-body cell)))))))
+
+(define (cancel-sub! eng id)
+  (let ((cell (hash-ref (engine-subs eng) id)))
+    (when cell
+      (sub-cell-stop! cell)
+      (hash-remove! (engine-subs eng) id))))
 
 (define (apply-filter eng msg)
   (let ((f (engine-filter eng)))
@@ -330,6 +421,10 @@
          (force-output o)))
       (('set-palette name)
        (when (theme-set! (engine-theme eng) name) (mark-dirty!)))
+      (('focus widget)
+       (let* ((sz   (backend-size (engine-backend eng)))
+              (path (find-focus-path (engine-root eng) sz widget)))
+         (set-engine-focus-chain! eng (or path '()))))
       (('exec command on-done)
        (backend-shutdown (engine-backend eng))
        (let ((status (system command)))
@@ -350,28 +445,33 @@
                               (when msg (send eng msg)))))
                         cmds))
             (lambda (key . args) (cmd-error! eng key args 'sequence))))))
-      (('every period producer)
-       (spawn-fiber
-        (lambda ()
+      (('every period producer id)
+       (install-sub!
+        eng id 'every
+        (lambda (cell)
           (let loop ()
-            (when (engine-running? eng)
+            (when (and (engine-running? eng) (not (sub-cell-stopped? cell)))
               (fiber-sleep period)
-              (catch #t
-                (lambda ()
-                  (let ((msg (producer)))
-                    (when msg (send eng msg))))
-                (lambda (key . args) (cmd-error! eng key args 'every)))
-              (loop))))))
-      (('after delay producer)
-       (spawn-fiber
-        (lambda ()
+              (when (and (engine-running? eng) (not (sub-cell-stopped? cell)))
+                (catch #t
+                  (lambda ()
+                    (let ((msg (producer)))
+                      (when msg (send eng msg))))
+                  (lambda (key . args) (cmd-error! eng key args 'every)))
+                (loop)))))))
+      (('after delay producer id)
+       (install-sub!
+        eng id 'after
+        (lambda (cell)
           (fiber-sleep delay)
-          (when (engine-running? eng)
+          (when (and (engine-running? eng) (not (sub-cell-stopped? cell)))
             (catch #t
               (lambda ()
                 (let ((msg (producer)))
                   (when msg (send eng msg))))
-              (lambda (key . args) (cmd-error! eng key args 'after)))))))
+              (lambda (key . args) (cmd-error! eng key args 'after))))
+          (when id (hash-remove! (engine-subs eng) id)))))
+      (('cancel id) (cancel-sub! eng id))
       ((? procedure?)
        (spawn-fiber
         (lambda ()
@@ -383,7 +483,13 @@
       (_ #f))))
 
 (define (process-one eng msg)
-  "Returns #t if anything reacted/should re-render, #f otherwise."
+  "Returns #t if anything reacted/should re-render, #f otherwise.
+
+Routing policy:
+- raw key/mouse msgs            → route-to-focus! (focus chain only)
+- keymap-mapped action symbols  → cascade!        (broadcast — they're app intent, not keystrokes)
+- on-click action symbols       → cascade!        (same reason)
+- everything else (<init>, <tick>, <resize>, user msgs) → cascade!"
   (cond
    ((eq? msg 'quit) (stop-engine! eng) #t)
    ((mouse-left-press? msg)
@@ -411,19 +517,19 @@
                      (run-cmd! eng cmd)
                      #t))
            (else (let* ((m (apply-filter eng msg))
-                        (cmd (and m (cascade! eng m))))
+                        (cmd (and m (route-to-focus! eng m))))
                    (run-cmd! eng cmd)
                    #t))))))))
    ((and (mouse? msg) (eq? (mouse-action msg) 'motion))
     ;; Motion always updates the tracked cursor (for hover restyle). If
-    ;; a button is held (low 2 bits != 3 = "no button"), also cascade so
-    ;; drag-to-X tools (paint, lasso-select, …) get the stream. Naked
-    ;; hover-only motion stops at the position update.
+    ;; a button is held (low 2 bits != 3 = "no button"), also route to
+    ;; focus so drag-to-X tools get the stream. Naked hover-only motion
+    ;; stops at the position update.
     (let ((moved? (note-mouse-pos! eng msg))
           (drag?  (not (= 3 (logand (mouse-button msg) 3)))))
       (when drag?
         (let* ((m   (apply-filter eng msg))
-               (cmd (and m (cascade! eng m))))
+               (cmd (and m (route-to-focus! eng m))))
           (run-cmd! eng cmd)))
       (or moved? drag?)))
    ((or (key? msg) (mouse? msg))
@@ -438,7 +544,7 @@
                  (run-cmd! eng cmd)
                  #t))
        (else (let* ((m (apply-filter eng msg))
-                    (cmd (and m (cascade! eng m))))
+                    (cmd (and m (route-to-focus! eng m))))
                (run-cmd! eng cmd)
                #t)))))
    (else

@@ -20,6 +20,7 @@
             image
             on-click
             on-hover
+            flex
             parse-style-args))
 
 (define %empty-text (make-text-node "" 'default '()))
@@ -160,3 +161,15 @@ mouse cursor is inside the child's rect. STYLER is a unary procedure
 (lambda (child) → view-node) — return whatever view should replace the
 child on hover. For a static substitute, use (lambda (_) replacement)."
   (make-hover-node child styler))
+
+(define* (flex body #:key (grow 1) (shrink 0))
+  "Tag BODY as flexible inside a vbox or hbox. After the box sums its
+items' intrinsic sizes, surplus along the major axis is shared by
+GROW; deficit by SHRINK. Defaults: grow=1, shrink=0 → 'take any
+extra; don't shrink past intrinsic'. Outside a vbox/hbox the wrapper
+is transparent and BODY renders at its intrinsic size."
+  (unless (and (number? grow)   (>= grow 0))
+    (error "flex: GROW must be a non-negative number" grow))
+  (unless (and (number? shrink) (>= shrink 0))
+    (error "flex: SHRINK must be a non-negative number" shrink))
+  (make-flex-node body grow shrink))

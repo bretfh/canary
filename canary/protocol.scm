@@ -31,7 +31,9 @@
             exec         exec?         exec-command exec-on-done
             set-palette  set-palette?  set-palette-name
             cycle-palette cycle-palette?
-            clear-log    clear-log?))
+            clear-log    clear-log?
+            focus        focus?        focus-target
+            cancel       cancel?       cancel-id))
 
 (define-class <size> ()
   (width  #:init-keyword #:width  #:accessor size-width)
@@ -85,34 +87,36 @@
 (define (sequence? c) (and (pair? c) (eq? (car c) 'sequence)))
 
 (define (every . args)
-  (let loop ((args args) (period #f))
+  (let loop ((args args) (period #f) (id #f))
     (cond
      ((null? args)       (error "every: pass producer thunk last"))
      ((null? (cdr args))
       (unless period    (error "every: pass #:hz, #:seconds, or #:ms"))
-      (list 'every period (car args)))
+      (list 'every period (car args) id))
      (else
       (let ((k (car args)) (v (cadr args)))
         (case k
-          ((#:hz)      (loop (cddr args) (/ 1 v)))
-          ((#:seconds) (loop (cddr args) v))
-          ((#:ms)      (loop (cddr args) (/ v 1000)))
+          ((#:hz)      (loop (cddr args) (/ 1 v) id))
+          ((#:seconds) (loop (cddr args) v id))
+          ((#:ms)      (loop (cddr args) (/ v 1000) id))
+          ((#:id)      (loop (cddr args) period v))
           (else        (error "every: unknown keyword" k))))))))
 (define (every? c) (and (pair? c) (eq? (car c) 'every)))
 
 (define (after . args)
-  (let loop ((args args) (delay #f))
+  (let loop ((args args) (delay #f) (id #f))
     (cond
      ((null? args)      (error "after: pass producer thunk last"))
      ((null? (cdr args))
       (unless delay    (error "after: pass #:ms, #:seconds, or #:hz"))
-      (list 'after delay (car args)))
+      (list 'after delay (car args) id))
      (else
       (let ((k (car args)) (v (cadr args)))
         (case k
-          ((#:ms)      (loop (cddr args) (/ v 1000)))
-          ((#:seconds) (loop (cddr args) v))
-          ((#:hz)      (loop (cddr args) (/ 1 v)))
+          ((#:ms)      (loop (cddr args) (/ v 1000) id))
+          ((#:seconds) (loop (cddr args) v id))
+          ((#:hz)      (loop (cddr args) (/ 1 v) id))
+          ((#:id)      (loop (cddr args) delay v))
           (else        (error "after: unknown keyword" k))))))))
 (define (after? c) (and (pair? c) (eq? (car c) 'after)))
 
@@ -157,3 +161,11 @@
 
 (define (clear-log)          'clear-log-cmd)
 (define (clear-log? c)       (eq? c 'clear-log-cmd))
+
+(define (focus w)            (list 'focus w))
+(define (focus? c)           (and (pair? c) (eq? (car c) 'focus)))
+(define (focus-target c)     (cadr c))
+
+(define (cancel id)          (list 'cancel id))
+(define (cancel? c)          (and (pair? c) (eq? (car c) 'cancel)))
+(define (cancel-id c)        (cadr c))

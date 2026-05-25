@@ -24,7 +24,9 @@
             engine-log-entries set-engine-log-entries!
             engine-log-cap     set-engine-log-cap!
             engine-show-log?   set-engine-show-log?!
-            engine-log-height-frac set-engine-log-height-frac!))
+            engine-log-height-frac set-engine-log-height-frac!
+            engine-focus-chain set-engine-focus-chain!
+            engine-subs))
 
 ;; The engine record. Shared by (canary engine) which runs the loop
 ;; and (canary cmd) which dispatches side-effect commands. No <app>
@@ -35,7 +37,8 @@
   (%make-engine backend theme keymap title mouse-mode cursor alt-screen?
                 filter root running? msg-queue queue-mutex msg-bell
                 stop-ch click-regions mouse-x mouse-y
-                log-entries log-cap show-log? log-height-frac)
+                log-entries log-cap show-log? log-height-frac
+                focus-chain subs)
   engine?
   (backend     engine-backend         set-engine-backend!)
   (theme       engine-theme           set-engine-theme!)
@@ -57,7 +60,9 @@
   (log-entries engine-log-entries     set-engine-log-entries!)
   (log-cap     engine-log-cap         set-engine-log-cap!)
   (show-log?   engine-show-log?       set-engine-show-log?!)
-  (log-height-frac engine-log-height-frac set-engine-log-height-frac!))
+  (log-height-frac engine-log-height-frac set-engine-log-height-frac!)
+  (focus-chain engine-focus-chain     set-engine-focus-chain!)
+  (subs        engine-subs))
 
 (define* (make-engine #:key backend theme keymap title (mouse-mode 'off)
                       (cursor 'hidden) (alt-screen? #t) filter root
@@ -65,4 +70,5 @@
                       (log-cap 200) (show-log? #t) (log-height-frac 1/5))
   (%make-engine backend theme keymap title mouse-mode cursor alt-screen?
                 filter root #t '() (make-mutex) msg-bell
-                stop-ch '() -1 -1 '() log-cap show-log? log-height-frac))
+                stop-ch '() -1 -1 '() log-cap show-log? log-height-frac
+                '() (make-hash-table)))

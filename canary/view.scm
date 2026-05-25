@@ -156,7 +156,14 @@
             hover-node?
             make-hover-node
             hover-node-child
-            hover-node-styler))
+            hover-node-styler
+
+            <flex-node>
+            flex-node?
+            make-flex-node
+            flex-node-body
+            flex-node-grow
+            flex-node-shrink))
 
 (define-record-type <rect>
   (make-rect col row w h)
@@ -371,6 +378,22 @@ swap glyphs, wrap with overlay, return a static replacement node."
            styler))
   (%hover-node child styler #f))
 
+;; A flex node opts its body into a vbox/hbox's leftover-space
+;; distribution. GROW shares any surplus along the box's major axis;
+;; SHRINK shares any deficit. Both default non-negative. Outside a
+;; vbox/hbox the wrapper is transparent: view-size returns the body's
+;; intrinsic size.
+(define-record-type <flex-node>
+  (%flex-node body grow shrink cache)
+  flex-node?
+  (body   flex-node-body)
+  (grow   flex-node-grow)
+  (shrink flex-node-shrink)
+  (cache  flex-node-cache set-flex-node-cache!))
+
+(define (make-flex-node body grow shrink)
+  (%flex-node body grow shrink #f))
+
 (define-generic view)
 (define-generic update)
 
@@ -404,6 +427,7 @@ swap glyphs, wrap with overlay, return a static replacement node."
       (width-node? x) (height-node? x)
       (cursor-node? x) (overlay-node? x) (static-node? x)
       (image-node? x) (click-node? x) (hover-node? x)
+      (flex-node? x)
       (is-a? x <object>)
       (string? x) (not x)))
 
@@ -488,6 +512,9 @@ swap glyphs, wrap with overlay, return a static replacement node."
    ((hover-node? node)
     (memo hover-node-cache set-hover-node-cache! node
           (view-size (hover-node-child node))))
+   ((flex-node? node)
+    (memo flex-node-cache set-flex-node-cache! node
+          (view-size (flex-node-body node))))
    ((is-a? node <object>)
     (cons 0 0))
    (else (cons 0 0))))
@@ -513,4 +540,5 @@ swap glyphs, wrap with overlay, return a static replacement node."
     (set-static-node-cached-rect! node #f)
     (set-static-node-cached-cmds! node #f))
    ((click-node? node)   (set-click-node-cache!   node #f))
-   ((hover-node? node)   (set-hover-node-cache!   node #f))))
+   ((hover-node? node)   (set-hover-node-cache!   node #f))
+   ((flex-node? node)    (set-flex-node-cache!    node #f))))
