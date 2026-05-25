@@ -197,23 +197,33 @@
 ;;; ── input + dispatch ───────────────────────────────────────────────
 
 (define (input-loop eng)
-  (let ((wait (wait-until-port-readable-operation (current-input-port))))
+  ;; Wait on EITHER input OR the engine's stop channel. Without the
+  ;; stop channel here, this fiber blocks forever on the input port
+  ;; after stop-engine! has been called (the only thing that would
+  ;; wake it is more bytes arriving on the port — which won't happen
+  ;; once the session is torn down). One zombie input-loop per ended
+  ;; session is a slow-motion fiber leak that eventually starves the
+  ;; scheduler.
+  (let ((wait-input (wait-until-port-readable-operation (current-input-port)))
+        (wait-stop  (wait-until-port-readable-operation
+                     (car (engine-stop-ch eng)))))
     (let loop ((last-mouse-time 0))
       (when (engine-running? eng)
-        (perform-operation wait)
-        (let drain ((last-mouse-time last-mouse-time))
-          (let ((msg (read-key-msg))
-                (now (get-internal-real-time)))
-            (cond
-             ((not msg) (loop last-mouse-time))
-             ((not (mouse? msg)) (send eng msg) (drain last-mouse-time))
-             (else
-              (let ((elapsed-ms (quotient (* (- now last-mouse-time) 1000)
-                                          internal-time-units-per-second)))
-                (cond
-                 ((or (= last-mouse-time 0) (> elapsed-ms 16))
-                  (send eng msg) (drain now))
-                 (else (drain last-mouse-time))))))))))))
+        (perform-operation (choice-operation wait-input wait-stop))
+        (when (engine-running? eng)
+          (let drain ((last-mouse-time last-mouse-time))
+            (let ((msg (read-key-msg))
+                  (now (get-internal-real-time)))
+              (cond
+               ((not msg) (loop last-mouse-time))
+               ((not (mouse? msg)) (send eng msg) (drain last-mouse-time))
+               (else
+                (let ((elapsed-ms (quotient (* (- now last-mouse-time) 1000)
+                                            internal-time-units-per-second)))
+                  (cond
+                   ((or (= last-mouse-time 0) (> elapsed-ms 16))
+                    (send eng msg) (drain now))
+                   (else (drain last-mouse-time)))))))))))))
 
 (define (find-click-region regions x y)
   (let lp ((rs (reverse regions)))

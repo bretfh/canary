@@ -61,13 +61,16 @@
      "Elm-shaped TUI library for Guile.  An app is a GOOPS class with two
 generics: @code{view} returns a tree of nodes from state and a size; @code{update}
 mutates state and returns a cmd.  Startup cmds, key handling, ticks and resizes
-are all msgs dispatched through @code{update}.  Layout primitives (vbox, hbox,
-boxed, pad, align, width, height, overlay, pin, on-click, on-hover) are pure
-records.  A pluggable backend translates draw cmds to bytes; the ANSI backend
-includes a cell-diff renderer, kitty graphics, symbolic palette-resolved faces
-and a multi-chord keymap.  Re-evaluating a @code{define-method} or
-@code{define-class} updates the running process without restart.  Built on
-guile-fibers.")
+are all msgs dispatched through @code{update}; widgets compose by embed-by-
+reference and the engine routes key/mouse msgs through a focus chain.  Layout
+primitives (vbox, hbox, boxed, pad, align, width, height, flex, wrap, overlay,
+pin, on-click, on-hover) are pure records.  Bundled widgets: button, panel,
+textinput, spinner, progress, paginator, viewport.  A pluggable backend
+translates draw cmds to bytes; the ANSI backend includes a cell-diff renderer,
+kitty graphics, symbolic palette-resolved faces and a multi-chord keymap.
+Subscriptions installed via (every #:id k ...) are cancellable.  Re-evaluating
+a @code{define-method} or @code{define-class} updates the running process
+without restart.  Built on guile-fibers.")
     (home-page "https://github.com/bretfhorne/guile-canary")
     (license l:gpl3+)))
 
