@@ -20,6 +20,10 @@
             image
             on-click
             on-hover
+            link
+            prompt-zone
+            input-zone
+            output-zone
             flex
             wrap
             parse-style-args))
@@ -243,6 +247,26 @@ Each action is any value the app's update knows how to match
     (make-click-node action-or-body body-or-unset right))
    (else
     (make-click-node left action-or-body right))))
+
+(define (link uri body)
+  "Wrap BODY as an OSC 8 hyperlink to URI.  Cells rendered for BODY
+carry URI as their hyperlink so capable host terminals
+(kitty, foot, wezterm, vte-based) render them as clickable links."
+  (make-link-node uri body))
+
+(define (prompt-zone body)
+  "Tag BODY's cells as a shell prompt (OSC 133 ; A).  Capable host
+terminals use this to mark per-command anchors for navigation and
+selection."
+  (make-semantic-node 'prompt body))
+
+(define (input-zone body)
+  "Tag BODY's cells as command-line input (OSC 133 ; B)."
+  (make-semantic-node 'input body))
+
+(define (output-zone body)
+  "Tag BODY's cells as command output (OSC 133 ; C)."
+  (make-semantic-node 'output body))
 
 (define (on-hover body styler)
   "Wrap BODY so the engine renders STYLER's output instead while the

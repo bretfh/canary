@@ -155,6 +155,18 @@
             click-node-right-action
             click-node-body
 
+            <link-node>
+            link-node?
+            make-link-node
+            link-node-uri
+            link-node-body
+
+            <semantic-node>
+            semantic-node?
+            make-semantic-node
+            semantic-node-kind
+            semantic-node-body
+
             <hover-node>
             hover-node?
             make-hover-node
@@ -425,6 +437,34 @@ when the rendered rect receives a left-button press; the optional
 RIGHT-ACTION handles right-button presses."
   (%click-node action right-action body #f))
 
+(define-record-type <link-node>
+  (%link-node uri body cache)
+  link-node?
+  (uri   link-node-uri)
+  (body  link-node-body)
+  (cache link-node-cache set-link-node-cache!))
+
+(define (make-link-node uri body)
+  "Return a fresh <link-node> wrapping BODY as a clickable OSC 8
+hyperlink to URI.  Capable host terminals render BODY's cells with
+an underline that opens URI on click; others ignore the URI and
+render BODY unchanged."
+  (%link-node uri body #f))
+
+(define-record-type <semantic-node>
+  (%semantic-node kind body cache)
+  semantic-node?
+  (kind  semantic-node-kind)
+  (body  semantic-node-body)
+  (cache semantic-node-cache set-semantic-node-cache!))
+
+(define (make-semantic-node kind body)
+  "Return a fresh <semantic-node> tagging BODY's cells with KIND
+(one of 'prompt / 'input / 'output / 'unknown).  Host terminals
+that consume OSC 133 use these tags for shell-integration features
+like per-command navigation and 'copy command output'."
+  (%semantic-node kind body #f))
+
 (define-record-type <hover-node>
   (%hover-node body styler cache)
   hover-node?
@@ -516,7 +556,8 @@ container record, a widget (user-defined widgets), a string
       (pad-node? x) (margin-node? x) (align-node? x)
       (width-node? x) (height-node? x)
       (cursor-node? x) (overlay-node? x) (static-node? x)
-      (image-node? x) (click-node? x) (hover-node? x)
+      (image-node? x) (click-node? x) (link-node? x) (semantic-node? x)
+      (hover-node? x)
       (flex-node? x)
       (wrap-node? x)
       (is-a? x <object>)
@@ -608,6 +649,12 @@ known size return zero or a string-width fallback."
    ((click-node? node)
     (memo click-node-cache set-click-node-cache! node
           (view-size (click-node-body node))))
+   ((link-node? node)
+    (memo link-node-cache set-link-node-cache! node
+          (view-size (link-node-body node))))
+   ((semantic-node? node)
+    (memo semantic-node-cache set-semantic-node-cache! node
+          (view-size (semantic-node-body node))))
    ((hover-node? node)
     (memo hover-node-cache set-hover-node-cache! node
           (view-size (hover-node-body node))))
@@ -645,5 +692,7 @@ vbox body).  Static nodes also lose their cached cmds and rect."
     (set-static-node-cached-rect! node #f)
     (set-static-node-cached-cmds! node #f))
    ((click-node? node)   (set-click-node-cache!   node #f))
+   ((link-node? node)    (set-link-node-cache!    node #f))
+   ((semantic-node? node)(set-semantic-node-cache! node #f))
    ((hover-node? node)   (set-hover-node-cache!   node #f))
    ((flex-node? node)    (set-flex-node-cache!    node #f))))
