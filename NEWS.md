@@ -7,6 +7,24 @@ Changes are listed newest-first.  Format follows
 
 ### Added
 
+- **Typed action and op records + `update` dispatch on `<term>`.**
+  Two new modules:
+  - `(canary term action)` exposes `<action>` / `<action-csi>` —
+    the raw, syntactic form of each parsed control sequence.
+  - `(canary term dispatch)` defines `<op>` / `<op-set-mode>` /
+    `<op-reset-mode>` and routes them to `<term>` through canary's
+    existing `update` GOOPS generic.  Specialise `update` at the
+    REPL to intercept emulator decisions:
+
+    ```
+    (define-method (update t (op <op-set-mode>))
+      (engine-log! "mode ~a set" (op-mode-number op))
+      (next-method))
+    ```
+
+  CSI h/l in the parser now flows through this layer; behaviour is
+  unchanged for end users.
+
 - **Stateful UTF-8 byte decoder** (`(canary term utf8)`).  A new
   `<utf8-decoder>` record holds partial codepoint state across calls,
   so byte streams chunked by a `read` (PTY, file, socket) can be

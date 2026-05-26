@@ -4,6 +4,8 @@
   #:use-module (canary term sgr)
   #:use-module (canary term write)
   #:use-module (canary term utf8)
+  #:use-module (canary term action)
+  #:use-module (canary term dispatch)
   #:use-module (rnrs bytevectors)
   #:export (term-process-output!
             term-process-bytes!))
@@ -307,8 +309,12 @@ modes, scroll region, save/restore cursor, device queries."
           (term-write! term (make-string n last)))))
      ((char=? ch #\c) (dispatch-device-attrs term (or0 p1) fmt))
      ((char=? ch #\d) (term-cursor-vertical-abs! term (or1 p1)))
-     ((char=? ch #\h) (dispatch-set-modes term params fmt #t))
-     ((char=? ch #\l) (dispatch-set-modes term params fmt #f))
+     ((char=? ch #\h)
+      (dispatch-action! term (action-csi #:fmt fmt #:params params
+                                         #:final #\h)))
+     ((char=? ch #\l)
+      (dispatch-action! term (action-csi #:fmt fmt #:params params
+                                         #:final #\l)))
      ((char=? ch #\m)
       (unless fmt (process-sgr! term params)))
      ((char=? ch #\n) (dispatch-device-status term (or0 p1)))
@@ -356,47 +362,6 @@ mapped to the blink/steady block/underline/bar variants)."
   (when (and (>= style 0) (<= style 6))
     (set-term-cursor-style! term (vector-ref *cursor-styles* style))))
 
-(define (dispatch-set-modes term params fmt set?)
-  "Apply CSI h/l mode-set/reset for each parameter in PARAMS.
-FMT distinguishes ANSI modes (#f, e.g. insert mode 4) from DEC
-private modes (#\\?, e.g. cursor visibility, alt-screen, bracketed
-paste).  SET? is #t for h (set), #f for l (reset)."
-  (for-each
-   (lambda (p)
-     (when p
-       (cond
-        ((not fmt)
-         (case p
-           ((4) (set-term-insert! term set?))))
-        ((eqv? fmt #\?)
-         (case p
-           ((1) (set-term-keypad! term set?))
-           ((7) (set-term-auto-margin! term set?))
-           ((12)
-            (cond
-             (set?
-              (case (term-cursor-style term)
-                ((block) (set-term-cursor-style! term 'blinking-block))
-                ((underline) (set-term-cursor-style! term 'blinking-underline))
-                ((bar) (set-term-cursor-style! term 'blinking-bar))))
-             (else
-              (case (term-cursor-style term)
-                ((blinking-block) (set-term-cursor-style! term 'block))
-                ((blinking-underline) (set-term-cursor-style! term 'underline))
-                ((blinking-bar) (set-term-cursor-style! term 'bar))))))
-           ((25) (set-term-cursor-visible! term set?))
-           ((1047)
-            (if set? (term-enter-alt-screen! term)
-                     (term-exit-alt-screen! term)))
-           ((1048)
-            (if set? (term-save-cursor! term)
-                     (term-restore-cursor! term)))
-           ((1049)
-            (cond
-             (set? (term-save-cursor! term) (term-enter-alt-screen! term))
-             (else (term-exit-alt-screen! term) (term-restore-cursor! term))))
-           ((2004) (set-term-bracketed-paste! term set?)))))))
-   params))
 
 (define (dispatch-osc term s)
   "Dispatch an OSC payload S (already stripped of introducer and
