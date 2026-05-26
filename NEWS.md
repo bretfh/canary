@@ -5,6 +5,16 @@ Changes are listed newest-first.  Format follows
 
 ## 0.2.0 — unreleased
 
+### Added
+
+- **Stateful UTF-8 byte decoder** (`(canary term utf8)`).  A new
+  `<utf8-decoder>` record holds partial codepoint state across calls,
+  so byte streams chunked by a `read` (PTY, file, socket) can be
+  decoded correctly even when a multi-byte codepoint straddles a
+  chunk boundary.  Pair with the new `term-process-bytes!` entry
+  point on the parser to feed raw bytevectors directly into a
+  `<term>`.
+
 ### Fixed
 
 - **Pending-wrap (LCF) at the right margin.**  The terminal emulator

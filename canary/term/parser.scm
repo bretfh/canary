@@ -3,7 +3,10 @@
   #:use-module (canary term ops)
   #:use-module (canary term sgr)
   #:use-module (canary term write)
-  #:export (term-process-output!))
+  #:use-module (canary term utf8)
+  #:use-module (rnrs bytevectors)
+  #:export (term-process-output!
+            term-process-bytes!))
 
 (define (control-byte? ch)
   "Return #t if CH is a C0 control byte (0-31) or DEL (127)."
@@ -429,3 +432,12 @@ terminator) by its leading numeric code: 0/2 set the window title,
        ((= i len) #f)
        ((char=? (string-ref s i) ch) i)
        (else (loop (+ i 1)))))))
+
+(define* (term-process-bytes! term decoder bv #:optional (start 0) (end #f))
+  "Decode bytes [START, END) of bytevector BV through DECODER, a
+<utf8-decoder>, and feed the resulting characters through TERM's
+parser.  DECODER carries partial multi-byte codepoint state across
+calls; supply the same DECODER for each chunk of one byte stream.
+Returns unspecified."
+  (let ((chunk (utf8-decode-bytes! decoder bv start end)))
+    (term-process-output! term chunk)))
