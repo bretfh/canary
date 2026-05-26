@@ -5,8 +5,8 @@
 
 (use-modules (canary) (oop goops))
 
-(define-class <counter> ()
-  (n #:init-keyword #:n #:init-value 0 #:accessor counter-n))
+(define-class <counter> (<focusable>)
+  (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
 
 (define-method (view (c <counter>))
   (vbox (txt "  press + or - (q to quit)" #:fg 'muted)
@@ -17,12 +17,15 @@
 
 (define-method (update (c <counter>) (msg <key>))
   (let ((k (key-sym msg)))
-    (cond
-     ((or (eqv? k #\+) (eqv? k #\k))
-      (set! (counter-n c) (+ 1 (counter-n c))))
-     ((or (eqv? k #\-) (eqv? k #\j))
-      (set! (counter-n c) (- (counter-n c) 1)))
-     ((eqv? k #\r) (set! (counter-n c) 0)))))
+    (cons
+     (cond
+      ((or (eqv? k #\+) (eqv? k #\k))
+       (update-slots c #:n (+ 1 (counter-n c))))
+      ((or (eqv? k #\-) (eqv? k #\j))
+       (update-slots c #:n (- (counter-n c) 1)))
+      ((eqv? k #\r) (update-slots c #:n 0))
+      (else c))
+     #f)))
 
 (run-app (make <counter>)
          #:title  "counter"

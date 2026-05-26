@@ -34,30 +34,33 @@
 
 (define-class <bot-tick> ())
 
-(define-class <chat> ()
+(define-class <chat> (<focusable>)
   (history  #:init-form (viewport #:step 1 #:from 'bottom)
-            #:accessor chat-history)
+            #:getter chat-history)
   (input    #:init-form (textinput #:prompt "> "
                                    #:placeholder "say something"
                                    #:width 60
                                    #:focused? #t)
-            #:accessor chat-input)
-  (focus-on #:init-value 'input  #:accessor chat-focus-on))
+            #:getter chat-input)
+  (focus-on #:init-value 'input  #:getter chat-focus-on))
 
-(define (chat-append-line! c face name text)
+(define (chat-append-line c face name text)
+  "Return C with a new line appended to its history.  FACE styles
+the speaker's name, NAME is the speaker, TEXT is the message body."
   (let* ((line (hbox (txt (string-append name ": ") #:fg face #:bold)
                      (txt text)))
          (vp   (chat-history c)))
-    (set! (viewport-items vp)
-          (append (viewport-items vp) (list line)))))
+    (update-slots c
+      #:history (update-slots vp
+                  #:items (append (viewport-items vp) (list line))))))
 
-(define (post-user-msg! c text)
-  (chat-append-line! c 'accent "you" text))
+(define (post-user-msg c text)
+  (chat-append-line c 'accent "you" text))
 
-(define (post-bot-msg! c)
-  (chat-append-line! c 'note
-                     (random-element %bot-names)
-                     (random-element %bot-quips)))
+(define (post-bot-msg c)
+  (chat-append-line c 'note
+                    (random-element %bot-names)
+                    (random-element %bot-quips)))
 
 (define (focus-cmd-for c)
   (case (chat-focus-on c)
@@ -86,11 +89,13 @@
 
 (define-method (update (c <chat>) (msg <init>))
   ;; Greet, install the bot, focus the input.
-  (chat-append-line! c 'muted "system" "welcome — type and press enter")
-  (batch (focus (chat-input c))
-         (every #:seconds 4
-                #:id 'bot-stream
-                (lambda () (make <bot-tick>)))))
+  (let ((greeted (chat-append-line c 'muted "system"
+                                   "welcome — type and press enter")))
+    (cons greeted
+          (batch (focus (chat-input greeted))
+                 (every #:seconds 4
+                        #:id 'bot-stream
+                        (lambda () (make <bot-tick>)))))))
 
 (define (enter-key? k)
   (or (eq? k 'enter) (eq? k 'return)
@@ -99,24 +104,35 @@
 (define-method (update (c <chat>) (msg <key>))
   (let ((k (key-sym msg)))
     (cond
-     ((eq? k 'escape) 'quit)
+     ((eq? k 'escape) (cons c 'quit))
      ((eq? k 'tab)
-      (set! (chat-focus-on c)
-            (case (chat-focus-on c)
-              ((input)   'history)
-              ((history) 'input)
-              (else      'input)))
-      (set! (textinput-focused? (chat-input c)) (eq? (chat-focus-on c) 'input))
-      (focus-cmd-for c))
+      (let* ((next (case (chat-focus-on c)
+                     ((input)   'history)
+                     ((history) 'input)
+                     (else      'input)))
+             (new-input (update-slots (chat-input c)
+                          #:focused? (eq? next 'input)))
+             (new-c (update-slots c #:focus-on next #:input new-input)))
+        (cons new-c
+              (case next
+                ((input)   (focus (chat-input new-c)))
+                ((history) (focus (chat-history new-c)))
+                (else      #f)))))
      ((and (eq? (chat-focus-on c) 'input) (enter-key? k))
       (let ((val (textinput-value (chat-input c))))
-        (unless (zero? (string-length val))
-          (post-user-msg! c val)
-          (set! (textinput-value (chat-input c)) "")
-          (set! (textinput-cursor (chat-input c)) 0)))))))
+        (cond
+         ((zero? (string-length val)) (cons c #f))
+         (else
+          (let* ((posted (post-user-msg c val)))
+            (cons (update-slots posted
+                    #:input (update-slots (chat-input posted)
+                              #:value ""
+                              #:cursor 0))
+                  #f))))))
+     (else (cons c #f)))))
 
 (define-method (update (c <chat>) (msg <bot-tick>))
-  (post-bot-msg! c))
+  (cons (post-bot-msg c) #f))
 
 (run-app (make <chat>)
          #:title  "chat"

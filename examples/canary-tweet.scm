@@ -115,33 +115,35 @@
 (define (sprite-node-for frame)
   (vector-ref %sprite-nodes (modulo (quotient frame 3) 4)))
 
-(define-class <note> ()
-  (age   #:init-value 0          #:accessor note-age)
-  (glyph #:init-keyword #:glyph  #:accessor note-glyph))
+(define-class <note> (<focusable>)
+  (age   #:init-value 0          #:getter note-age)
+  (glyph #:init-keyword #:glyph  #:getter note-glyph))
 
 (define %note-lifetime 30)
 
-(define (advance-notes! notes)
-  (filter (lambda (n)
-            (set! (note-age n) (+ (note-age n) 1))
-            (< (note-age n) %note-lifetime))
-          notes))
+(define (advance-notes notes)
+  "Return a fresh list of notes one tick older, with notes past their
+lifetime filtered out."
+  (filter-map (lambda (n)
+                (let ((aged (update-slots n #:age (+ (note-age n) 1))))
+                  (and (< (note-age aged) %note-lifetime) aged)))
+              notes))
 
 (define (note-pos n beak-x beak-y)
   (values
    (+ beak-x (inexact->exact (round (* 4 (sin (* (note-age n) 0.45))))))
    (- beak-y (note-age n))))
 
-(define-class <tweet> ()
-  (frame #:init-value 0   #:accessor tweet-frame)
-  (notes #:init-value '() #:accessor tweet-notes)
+(define-class <tweet> (<focusable>)
+  (frame #:init-value 0   #:getter tweet-frame)
+  (notes #:init-value '() #:getter tweet-notes)
   (input #:init-form (textinput #:prompt "♪ "
                                 #:placeholder "type to sing"
                                 #:width 40
                                 #:focused? #t)
-         #:accessor tweet-input)
+         #:getter tweet-input)
   (spin  #:init-form (spinner)
-         #:accessor tweet-spin))
+         #:getter tweet-spin))
 
 (define app-theme
   (theme (palette dark
@@ -154,8 +156,8 @@
 ;; chain so the user's keys go there. The spinner installs its own
 ;; ticker via its <init> method when the cascade reaches it.
 (define-method (update (m <tweet>) (msg <init>))
-  (batch (every #:hz 12 (lambda () (tick)))
-         (focus (tweet-input m))))
+  (cons m (batch (every #:hz 12 (lambda () (tick)))
+                 (focus (tweet-input m)))))
 
 (define (beak-pos sz)
   (let* ((cols (size-width  sz))
@@ -165,27 +167,36 @@
     (values (+ left (* 2 %beak-col))
             (+ top  %beak-row))))
 
-(define (spawn-note! m ch)
-  (when (char? ch)
-    (set! (tweet-notes m)
-          (cons (make <note> #:glyph (string ch))
-                (tweet-notes m)))))
+(define (spawn-note m ch)
+  "Return M with a new <note> for character CH prepended to its
+notes list.  Non-char CH leaves M unchanged."
+  (cond
+   ((char? ch)
+    (update-slots m
+      #:notes (cons (make <note> #:glyph (string ch))
+                    (tweet-notes m))))
+   (else m)))
 
 (define-method (update (m <tweet>) (msg <tick>))
-  (set! (tweet-frame m) (+ (tweet-frame m) 1))
-  (set! (tweet-notes m) (advance-notes! (tweet-notes m))))
+  (cons (update-slots m
+          #:frame (+ (tweet-frame m) 1)
+          #:notes (advance-notes (tweet-notes m)))
+        #f))
 
 (define-method (update (m <tweet>) (msg <key>))
   ;; The textinput is embedded in our view tree and focused at <init>,
-  ;; so the engine routes keys to it through the focus chain -- no
-  ;; manual forward needed. We get the key too (we're on the chain as
-  ;; the root) and use it to spawn a floating note or clear on enter.
+  ;; so the engine routes keys to it through the focus chain.  We get
+  ;; the key too (the root sits on the chain).  Spawn a floating note
+  ;; on a printable char; clear the input's buffer on enter.
   (let ((ch (key-sym msg)))
-    (cond
-     ((eq? ch 'enter)
-      (set! (textinput-value (tweet-input m)) "")
-      (set! (textinput-cursor (tweet-input m)) 0))
-     ((char? ch) (spawn-note! m ch)))))
+    (cons
+     (cond
+      ((eq? ch 'enter)
+       (update-slots m
+         #:input (update-slots (tweet-input m) #:value "" #:cursor 0)))
+      ((char? ch) (spawn-note m ch))
+      (else m))
+     #f)))
 
 (define (status-bar m cols)
   (hbox (tweet-spin m)            ; cascade renders + reaches it for <init>

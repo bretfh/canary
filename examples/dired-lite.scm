@@ -58,11 +58,11 @@
     (lambda (key . args)
       (string-append "(can't preview: " (symbol->string key) ")"))))
 
-(define-class <dired> ()
-  (path    #:init-keyword #:path    #:init-value "/" #:accessor dired-path)
-  (entries #:init-value '()                          #:accessor dired-entries)
-  (cursor  #:init-value 0                            #:accessor dired-cursor)
-  (preview #:init-value ""                           #:accessor dired-preview))
+(define-class <dired> (<focusable>)
+  (path    #:init-keyword #:path    #:init-value "/" #:getter dired-path)
+  (entries #:init-value '()                          #:getter dired-entries)
+  (cursor  #:init-value 0                            #:getter dired-cursor)
+  (preview #:init-value ""                           #:getter dired-preview))
 
 (define (dired-current-entry d)
   (let ((es (dired-entries d)))
@@ -75,16 +75,20 @@
              (parent-dir (dired-path d))
              (string-append (dired-path d) "/" entry)))))
 
-(define (refresh-preview! d)
+(define (refresh-preview d)
+  "Return D with its preview slot set to a freshly-loaded preview of
+the cell under the cursor."
   (let ((p (dired-current-fullpath d)))
-    (set! (dired-preview d)
-          (if p (read-preview p) ""))))
+    (update-slots d #:preview (if p (read-preview p) ""))))
 
-(define (cd! d path)
-  (set! (dired-path d) path)
-  (set! (dired-entries d) (safe-read-dir path))
-  (set! (dired-cursor d) 0)
-  (refresh-preview! d))
+(define (cd d path)
+  "Return D with PATH as the new working directory: entries reloaded,
+cursor at the top, preview regenerated."
+  (refresh-preview
+   (update-slots d
+     #:path    path
+     #:entries (safe-read-dir path)
+     #:cursor  0)))
 
 (define (entry-line d i e)
   (let* ((sel?  (= i (dired-cursor d)))
@@ -116,25 +120,29 @@
           (flex right #:grow 2))))
 
 (define-method (update (d <dired>) (msg <init>))
-  (cd! d (dired-path d)))
+  (cons (cd d (dired-path d)) #f))
 
 (define-method (update (d <dired>) (msg <key>))
   (let ((k (key-sym msg)))
-    (cond
-     ((or (eqv? k #\j) (eq? k 'down))
-      (set! (dired-cursor d)
-            (min (max 0 (- (length (dired-entries d)) 1))
-                 (+ 1 (dired-cursor d))))
-      (refresh-preview! d))
-     ((or (eqv? k #\k) (eq? k 'up))
-      (set! (dired-cursor d) (max 0 (- (dired-cursor d) 1)))
-      (refresh-preview! d))
-     ((or (eq? k 'return) (eqv? k #\return))
-      (let ((p (dired-current-fullpath d)))
-        (when (and p (file-is-directory? p))
-          (cd! d p))))
-     ((or (eqv? k #\u) (eq? k 'left))
-      (cd! d (parent-dir (dired-path d)))))))
+    (cons
+     (cond
+      ((or (eqv? k #\j) (eq? k 'down))
+       (refresh-preview
+        (update-slots d
+          #:cursor (min (max 0 (- (length (dired-entries d)) 1))
+                        (+ 1 (dired-cursor d))))))
+      ((or (eqv? k #\k) (eq? k 'up))
+       (refresh-preview
+        (update-slots d #:cursor (max 0 (- (dired-cursor d) 1)))))
+      ((or (eq? k 'return) (eqv? k #\return))
+       (let ((p (dired-current-fullpath d)))
+         (cond
+          ((and p (file-is-directory? p)) (cd d p))
+          (else d))))
+      ((or (eqv? k #\u) (eq? k 'left))
+       (cd d (parent-dir (dired-path d))))
+      (else d))
+     #f)))
 
 (run-app (make <dired> #:path (or (getenv "HOME") "/"))
          #:title  "dired-lite"
