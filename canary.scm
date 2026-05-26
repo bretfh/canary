@@ -11,9 +11,11 @@
   #:use-module (canary view)
   #:use-module (canary render)
   #:use-module (canary borders)
+  #:use-module (canary widget)
 
   #:re-export
-  (run-app start-engine! send
+  (<focusable> widget-id update-slots
+   run-app start-engine! send
    <log-entry> log-entry? log-entry-time log-entry-source
    log-entry-level log-entry-text engine-log!
 

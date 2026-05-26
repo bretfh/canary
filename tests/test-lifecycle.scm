@@ -5,6 +5,7 @@
              (fibers channels)
              (canary engine)
              (canary engine-types)
+             (canary widget)
              (canary backend-ansi)
              (canary protocol)
              (canary view)
@@ -13,7 +14,7 @@
 
 (test-begin "lifecycle")
 
-(define-class <tape> ()
+(define-class <tape> (<focusable>)
   (msgs #:init-value '() #:accessor tape-msgs))
 
 (define-method (view (t <tape>)) (txt "x"))
@@ -72,8 +73,8 @@
     ;; install-sub! reads current-update-widget; cascading <mount>
     ;; through dispatch-update! sets that for us, so do the same here
     ;; by faking a sub directly in engine-subs and engine-widget-subs.
-    (hash-set!  (engine-subs eng)        sub-id (list #f))
-    (hashq-set! (engine-widget-subs eng) drop   (list sub-id))
+    (hash-set! (engine-subs eng)        sub-id            (list #f))
+    (hash-set! (engine-widget-subs eng) (widget-id drop)  (list sub-id))
     (test-assert "sub is installed" (hash-ref (engine-subs eng) sub-id))
     ;; Remove the widget — unmount should cancel.
     (set-engine-root! eng (txt "empty"))
@@ -81,6 +82,6 @@
     (test-assert "sub auto-cancelled on unmount"
                  (not (hash-ref (engine-subs eng) sub-id)))
     (test-assert "widget-subs entry removed"
-                 (not (hashq-ref (engine-widget-subs eng) drop)))))
+                 (not (hash-ref (engine-widget-subs eng) (widget-id drop))))))
 
 (test-end "lifecycle")

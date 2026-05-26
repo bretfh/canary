@@ -1,5 +1,6 @@
 (define-module (canary engine)
   #:use-module (canary engine-types)
+  #:use-module (canary widget)
   #:use-module (canary terminal)
   #:use-module ((canary protocol) #:select (<size> size size? size-width size-height
                                             <mouse> mouse mouse? mouse-x mouse-y
@@ -321,24 +322,77 @@ authors don't have to write a trailing #f."
       (and (pair? x) (symbol? (car x)))
       (memq x '(quit clear-screen cycle-palette clear-log suspend))))
 
-(define (dispatch-update! eng node msg cmds-cell)
-  "Call (update node msg).  Authors mutate state in place; a cmd
-returned (as a tagged list / known symbol / procedure) is collected
-into CMDS-CELL.  Anything else the body evaluates to is treated as
-no cmd, so a method that just does `(set! ...)` and stops is fine.
-Errors are logged, not raised.  Binds `%current-update-widget` so
-install-sub! can tag any subscriptions installed during this call
-with their owning widget."
+(define (cascade-value eng val msg cmds)
+  "Dispatch MSG into VAL if VAL is a node, into each item if VAL is a
+list of nodes, otherwise leave VAL alone.  Returns (cons new-val
+cmds-with-any-collected-appended).  CMDS is the running list of cmds
+the caller is accumulating; we cons new ones onto its front."
+  (cond
+   ((is-a? val <object>)
+    (match (dispatch-update! eng val msg)
+      ((new-val . new-cmd)
+       (cons new-val (if new-cmd (cons new-cmd cmds) cmds)))))
+   ((pair? val)
+    (let loop ((rest val) (acc '()) (cmds cmds) (changed? #f))
+      (cond
+       ((pair? rest)
+        (match (cascade-value eng (car rest) msg cmds)
+          ((new-item . new-cmds)
+           (loop (cdr rest)
+                 (cons new-item acc)
+                 new-cmds
+                 (or changed? (not (eq? new-item (car rest))))))))
+       (else
+        (cons (if changed? (reverse acc) val) cmds)))))
+   (else (cons val cmds))))
+
+(define (cascade-into-slots eng node msg)
+  "For each of NODE's slots that holds a node (directly or inside a
+list), dispatch MSG into the contained node first and substitute the
+returned value back into NODE.  Returns (cons rebuilt-node
+list-of-child-cmds)."
+  (let loop ((slots (class-slots (class-of node)))
+             (overrides '())
+             (cmds '()))
+    (match slots
+      (() (cons (if (null? overrides)
+                    node
+                    (apply update-slots node overrides))
+                (reverse cmds)))
+      ((slot . rest)
+       (let* ((name (slot-definition-name slot))
+              (val  (slot-ref node name)))
+         (match (cascade-value eng val msg cmds)
+           ((new-val . new-cmds)
+            (cond
+             ((eq? new-val val)
+              (loop rest overrides new-cmds))
+             (else
+              (loop rest
+                    (cons* new-val (symbol->keyword name) overrides)
+                    new-cmds))))))))))
+
+(define (dispatch-update! eng node msg)
+  "Dispatch MSG to NODE: first cascade into any sub-nodes held in
+NODE's slots, then call update on NODE with those sub-nodes already
+updated.  Returns (cons new-node cmd-or-#f).  Errors are caught and
+logged; on error, returns NODE unchanged."
   (catch #t
     (lambda ()
-      (parameterize ((%current-update-widget node))
-        (let ((cmd (update node msg)))
-          (when (cmd-shape? cmd)
-            (set-car! cmds-cell (cons cmd (car cmds-cell))))))
-      (invalidate-size! node)
-      (invalidate-cached-view! node))
+      (match (cascade-into-slots eng node msg)
+        ((threaded . child-cmds)
+         (parameterize ((%current-update-widget threaded))
+           (let ((result (update threaded msg)))
+             (match (if (pair? result) result (cons threaded #f))
+               ((new-node . own-cmd)
+                (invalidate-size! new-node)
+                (invalidate-cached-view! new-node)
+                (cons new-node
+                      (cmds->batched
+                       (if own-cmd (cons own-cmd child-cmds) child-cmds))))))))))
     (lambda (key . args)
-      (engine-log! eng 'update 'error (format #f "~a ~a" key args)))))
+      (engine-log! eng 'update 'error (format #f "~a ~a" key args))
+      (cons node #f))))
 
 (define (cmds->batched cmds)
   "Collapse CMDS into a single cmd value for the engine to run.
@@ -349,63 +403,244 @@ so cmds run in collection order."
    ((null? (cdr cmds)) (car cmds))
    (else               (cons 'batch (reverse cmds)))))
 
-(define (cascade! eng msg)
-  "Broadcast MSG to every widget in ENG's tree (depth-first),
-collecting their returned cmds.  Returns a single cmd (or #f) per
-cmds->batched.  Used for app-level msgs that should reach all
-widgets, not just the focused one."
-  (let ((cmds-cell (list '()))
-        (sz (backend-size (engine-backend eng))))
-    (walk-nodes
-     (engine-root eng)
-     sz
-     (lambda (node) (dispatch-update! eng node msg cmds-cell)))
-    (cmds->batched (car cmds-cell))))
+(define (walk-tree node visit)
+  "Walk NODE recursively, calling (visit n) for each node encountered
+that's a stateful instance (a GOOPS object).  Layout records and
+lists are traversed transparently — their containers are not visited,
+but anything inside them is."
+  (let walk ((current node))
+    (cond
+     ((not current) #f)
+     ((string? current) #f)
+     ((is-a? current <object>)
+      (visit current)
+      (for-each
+       (lambda (slot)
+         (walk (slot-ref current (slot-definition-name slot))))
+       (class-slots (class-of current))))
+     ((vbox-node? current)    (for-each walk (vbox-node-items current)))
+     ((hbox-node? current)    (for-each walk (hbox-node-items current)))
+     ((boxed-node? current)   (walk (boxed-node-body current)))
+     ((pad-node? current)     (walk (pad-node-body current)))
+     ((margin-node? current)  (walk (margin-node-body current)))
+     ((align-node? current)   (walk (align-node-body current)))
+     ((width-node? current)   (walk (width-node-body current)))
+     ((height-node? current)  (walk (height-node-body current)))
+     ((static-node? current)  (walk (static-node-body current)))
+     ((click-node? current)   (walk (click-node-body current)))
+     ((hover-node? current)   (walk (hover-node-body current)))
+     ((link-node? current)    (walk (link-node-body current)))
+     ((semantic-node? current) (walk (semantic-node-body current)))
+     ((flex-node? current)    (walk (flex-node-body current)))
+     ((overlay-node? current)
+      (walk (overlay-node-base current))
+      (for-each (lambda (p) (walk (placement-body p)))
+                (overlay-node-overlays current)))
+     ((pair? current)
+      (walk (car current))
+      (walk (cdr current)))
+     (else #f))))
 
-(define (unmount-widget! eng w cmds-cell)
-  "Dispatch <unmount> to W and cancel every sub it installed."
-  (dispatch-update! eng w (unmount) cmds-cell)
-  (let ((ids (hashq-ref (engine-widget-subs eng) w '())))
-    (for-each (lambda (id) (cancel-sub! eng id)) ids)))
+(define (build-id-map node)
+  "Walk NODE recursively and return a hash table mapping each
+focusable node's id to the node itself.  Used after the root has
+been swapped so id-keyed bookkeeping (focus chain, live set, widget
+subs) can resolve to current instances."
+  (let ((tbl (make-hash-table)))
+    (walk-tree node
+               (lambda (n)
+                 (when (is-a? n <focusable>)
+                   (hash-set! tbl (widget-id n) n))))
+    tbl))
+
+(define (cascade! eng msg)
+  "Broadcast MSG depth-first through every node held in slots reachable
+from the engine root.  Swaps the root to the rebuilt tree and returns
+the batched cmd."
+  (match (dispatch-update! eng (engine-root eng) msg)
+    ((new-root . cmd)
+     (set-engine-root! eng new-root)
+     cmd)))
+
+(define (plain-update eng node msg)
+  "Call update on NODE without cascading into its sub-nodes.  Returns
+(cons new-node cmd-or-#f).  Errors are logged; on error the input
+node is returned unchanged."
+  (catch #t
+    (lambda ()
+      (parameterize ((%current-update-widget node))
+        (let ((result (update node msg)))
+          (if (pair? result) result (cons node #f)))))
+    (lambda (key . args)
+      (engine-log! eng 'update 'error (format #f "~a ~a" key args))
+      (cons node #f))))
+
+(define (search-each items id eng msg)
+  "Walk each item in ITEMS searching for a focusable node with id ID;
+rebuild the list if any item changed.  Returns (cons items-or-rebuilt
+cmd-or-#f)."
+  (let loop ((rest items) (acc '()) (changed? #f) (found-cmd #f))
+    (cond
+     ((pair? rest)
+      (match (search-and-replace (car rest) id eng msg)
+        ((new-item . new-cmd)
+         (loop (cdr rest)
+               (cons new-item acc)
+               (or changed? (not (eq? new-item (car rest))))
+               (or found-cmd new-cmd)))))
+     (else
+      (cons (if changed? (reverse acc) items) found-cmd)))))
+
+(define (search-and-replace val id eng msg)
+  "Recursively search VAL for a focusable node with widget-id ID; on
+finding it, dispatch MSG on it and substitute the result back.
+Returns (cons new-val cmd-or-#f).  Layout records are traversed
+transparently — dispatch reaches widgets inside them but the layout
+record itself is not rebuilt (it's transient anyway)."
+  (cond
+   ((not val) (cons val #f))
+   ((string? val) (cons val #f))
+   ((is-a? val <object>)
+    (cond
+     ((and (is-a? val <focusable>) (eq? (widget-id val) id))
+      (plain-update eng val msg))
+     (else
+      (let loop ((slots (class-slots (class-of val)))
+                 (overrides '())
+                 (found-cmd #f))
+        (match slots
+          (() (cons (if (null? overrides)
+                        val
+                        (apply update-slots val overrides))
+                    found-cmd))
+          ((slot . rest)
+           (let* ((name (slot-definition-name slot))
+                  (sv   (slot-ref val name)))
+             (match (search-and-replace sv id eng msg)
+               ((new-sv . new-cmd)
+                (cond
+                 ((eq? new-sv sv) (loop rest overrides found-cmd))
+                 (else (loop rest
+                             (cons* new-sv (symbol->keyword name) overrides)
+                             (or found-cmd new-cmd)))))))))))))
+   ((vbox-node? val)
+    (match (search-each (vbox-node-items val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((hbox-node? val)
+    (match (search-each (hbox-node-items val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((boxed-node? val)
+    (match (search-and-replace (boxed-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((pad-node? val)
+    (match (search-and-replace (pad-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((margin-node? val)
+    (match (search-and-replace (margin-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((align-node? val)
+    (match (search-and-replace (align-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((width-node? val)
+    (match (search-and-replace (width-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((height-node? val)
+    (match (search-and-replace (height-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((static-node? val)
+    (match (search-and-replace (static-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((click-node? val)
+    (match (search-and-replace (click-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((hover-node? val)
+    (match (search-and-replace (hover-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((link-node? val)
+    (match (search-and-replace (link-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((semantic-node? val)
+    (match (search-and-replace (semantic-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((flex-node? val)
+    (match (search-and-replace (flex-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
+   ((overlay-node? val)
+    (match (search-and-replace (overlay-node-base val) id eng msg)
+      ((_ . cmd1)
+       (match (search-each (map placement-body (overlay-node-overlays val))
+                           id eng msg)
+         ((_ . cmd2)
+          (cons val (or cmd1 cmd2)))))))
+   ((pair? val)
+    (search-each val id eng msg))
+   (else (cons val #f))))
+
+(define (update-by-id eng root id msg)
+  "Find the node with widget-id ID inside ROOT and dispatch MSG on it,
+threading the result back through the tree.  When ID isn't present
+the tree is returned unchanged.  Returns (cons new-root cmd-or-#f)."
+  (search-and-replace root id eng msg))
+
+(define (unmount-widget! eng id)
+  "Dispatch <unmount> to the node with widget-id ID and cancel every
+sub the node installed.  The departing node is read from the live
+set (it's already gone from the current tree), so no threading is
+needed."
+  (let* ((live (engine-live-widgets eng))
+         (node (hash-ref live id))
+         (cmd  (and node (cdr (plain-update eng node (unmount))))))
+    (let ((sub-ids (hash-ref (engine-widget-subs eng) id '())))
+      (for-each (lambda (sid) (cancel-sub! eng sid)) sub-ids)
+      (hash-remove! (engine-widget-subs eng) id))
+    cmd))
 
 (define (refresh-live-widgets! eng)
-  "Diff ENG's current tree against the previous frame's live set.
-Dispatch <mount> to widgets that just appeared and <unmount> to
-widgets that just departed; auto-cancel any subs the departing
-widgets owned.  Cmds returned by mount/unmount handlers are batched
-and run."
-  (let* ((seen (walk-nodes (engine-root eng)
-                           (backend-size (engine-backend eng))
-                           (lambda (_) #f)))
-         (live (engine-live-widgets eng))
-         (mounted   '())
-         (unmounted '()))
+  "Diff the current root's id set against the prior frame's live set.
+Dispatch <mount> to ids that just appeared and <unmount> to ids that
+just departed; auto-cancel any subs the departing nodes owned.  Any
+cmds returned by mount/unmount handlers are run."
+  (let* ((seen-map (build-id-map (engine-root eng)))
+         (live     (engine-live-widgets eng))
+         (mounted-ids   '())
+         (unmounted-ids '())
+         (cmds '()))
     (hash-for-each
-     (lambda (w _) (unless (hashq-ref live w) (set! mounted (cons w mounted))))
-     seen)
+     (lambda (id _) (unless (hash-ref live id)
+                      (set! mounted-ids (cons id mounted-ids))))
+     seen-map)
     (hash-for-each
-     (lambda (w _) (unless (hashq-ref seen w) (set! unmounted (cons w unmounted))))
+     (lambda (id _) (unless (hash-ref seen-map id)
+                      (set! unmounted-ids (cons id unmounted-ids))))
      live)
-    (when (or (pair? mounted) (pair? unmounted))
-      (let ((cmds-cell (list '())))
-        (for-each
-         (lambda (w) (dispatch-update! eng w (mount) cmds-cell))
-         mounted)
-        (for-each (lambda (w) (unmount-widget! eng w cmds-cell)) unmounted)
-        (let ((cmd (cmds->batched (car cmds-cell))))
-          (when cmd (run-cmd! eng cmd)))))
-    (set-engine-live-widgets! eng seen)))
+    (for-each
+     (lambda (id)
+       (match (update-by-id eng (engine-root eng) id (mount))
+         ((new-root . cmd)
+          (set-engine-root! eng new-root)
+          (when cmd (set! cmds (cons cmd cmds))))))
+     mounted-ids)
+    (for-each
+     (lambda (id)
+       (let ((cmd (unmount-widget! eng id)))
+         (when cmd (set! cmds (cons cmd cmds)))))
+     unmounted-ids)
+    (let ((batched (cmds->batched cmds)))
+      (when batched (run-cmd! eng batched)))
+    (set-engine-live-widgets! eng (build-id-map (engine-root eng)))))
 
 (define (unmount-all! eng)
-  "Cascade <unmount> to every widget in ENG's live set and cancel
-their subs.  Called on engine shutdown so subscription fibers stop
-cleanly instead of being left to leak."
-  (let ((cmds-cell (list '()))
-        (live      (engine-live-widgets eng)))
-    (hash-for-each (lambda (w _) (unmount-widget! eng w cmds-cell)) live)
+  "Dispatch <unmount> to every node in the engine's live set on
+shutdown so subscription fibers stop cleanly instead of leaking."
+  (let ((cmds '()))
+    (hash-for-each
+     (lambda (id _)
+       (let ((cmd (unmount-widget! eng id)))
+         (when cmd (set! cmds (cons cmd cmds)))))
+     (engine-live-widgets eng))
     (set-engine-live-widgets! eng (make-hash-table))
-    (let ((cmd (cmds->batched (car cmds-cell))))
-      (when cmd (run-cmd! eng cmd)))))
+    (let ((batched (cmds->batched cmds)))
+      (when batched (run-cmd! eng batched)))))
 
 (define (find-focus-path root sz target)
   "Walk the source tree from ROOT looking for the widget TARGET.
@@ -444,21 +679,32 @@ not reachable. Layout records aren't in the path; only widget nodes."
   (walk root '()))
 
 (define (route-to-focus! eng msg)
-  "Dispatch MSG to the focus chain leaf-to-root. If the chain is empty,
-the root is the focus. Each node in the chain gets a call to update;
-cmds returned are collected and batched. Stale chain entries (widgets
-no longer in the tree) still receive the msg — they just produce no
-visible effect — until the next (focus …) cmd refreshes the chain."
-  (let ((cmds-cell (list '()))
-        (sz (backend-size (engine-backend eng)))
-        (chain (engine-focus-chain eng)))
-    (let ((targets (cond
-                    ((null? chain) (list (engine-root eng)))
-                    (else (reverse chain)))))
+  "Dispatch MSG to the focus chain leaf-to-root.  Each id in the chain
+resolves to the current node by id-map lookup; the node receives MSG
+and the new node is threaded back into the root; subsequent ids see
+the updated tree.  Stale ids (the node has departed since the chain
+was set) are silently skipped.  Empty chain falls back to a full
+broadcast from the root."
+  (let* ((id-map (build-id-map (engine-root eng)))
+         (chain  (engine-focus-chain eng))
+         (cmds   '()))
+    (cond
+     ((null? chain)
+      (match (dispatch-update! eng (engine-root eng) msg)
+        ((new-root . cmd)
+         (set-engine-root! eng new-root)
+         cmd)))
+     (else
       (for-each
-       (lambda (node) (dispatch-update! eng node msg cmds-cell))
-       targets))
-    (cmds->batched (car cmds-cell))))
+       (lambda (id)
+         (when (hash-ref id-map id)
+           (match (update-by-id eng (engine-root eng) id msg)
+             ((new-root . cmd)
+              (set-engine-root! eng new-root)
+              (set! id-map (build-id-map new-root))
+              (when cmd (set! cmds (cons cmd cmds)))))))
+       (reverse chain))
+      (cmds->batched cmds)))))
 
 (define (make-sub-cell)
   "Return a fresh sub-cell: a 1-cons mutable cancel flag, initially
@@ -478,40 +724,42 @@ poll."
 (define %current-update-widget (make-parameter #f))
 
 (define (install-sub! eng id kind fiber-body)
-  "Install a sub identified by ID. KIND is 'every / 'after — used to
-disambiguate in the subs hash (the cell value stores both for
-debugging). FIBER-BODY is a thunk that takes the stop cell and runs
-the producer loop. If ID is non-#f and already mapped, this is a
-no-op — re-issuing the same sub from an update is idempotent.  When
-called from inside a widget's update, the sub is also tagged with
-that widget so unmounting auto-cancels it."
+  "Install a sub identified by ID.  KIND is 'every / 'after.
+FIBER-BODY is a thunk that takes the stop cell and runs the producer.
+If ID is non-#f and already mapped, this is a no-op so re-issuing
+the same sub from an update is idempotent.  When called from inside
+a node's update, the sub is tagged with that node's widget-id so
+unmount can auto-cancel it."
   (cond
    ((and id (hash-ref (engine-subs eng) id)) #f)
    (else
-    (let ((cell  (make-sub-cell))
-          (owner (%current-update-widget)))
+    (let* ((cell        (make-sub-cell))
+           (owner       (%current-update-widget))
+           (owner-id    (and owner
+                             (is-a? owner <focusable>)
+                             (widget-id owner))))
       (when id (hash-set! (engine-subs eng) id cell))
-      (when (and owner id)
-        (let ((existing (hashq-ref (engine-widget-subs eng) owner '())))
+      (when (and owner-id id)
+        (let ((existing (hash-ref (engine-widget-subs eng) owner-id '())))
           (unless (member id existing)
-            (hashq-set! (engine-widget-subs eng) owner (cons id existing)))))
+            (hash-set! (engine-widget-subs eng) owner-id (cons id existing)))))
       (spawn-fiber (lambda () (fiber-body cell)))))))
 
 (define (cancel-sub! eng id)
   "Cancel the sub on ENG tagged ID.  Stops its fiber, removes the
-entry from the subs hash, and detaches it from its owning widget's
+entry from the subs hash, and detaches it from its owning node's
 sub list if any.  No-op if ID isn't installed."
   (let ((cell (hash-ref (engine-subs eng) id)))
     (when cell
       (sub-cell-stop! cell)
       (hash-remove! (engine-subs eng) id)
       (hash-for-each
-       (lambda (w ids)
+       (lambda (owner-id ids)
          (when (member id ids)
            (let ((rest (filter (lambda (i) (not (equal? i id))) ids)))
              (if (null? rest)
-                 (hashq-remove! (engine-widget-subs eng) w)
-                 (hashq-set!    (engine-widget-subs eng) w rest)))))
+                 (hash-remove! (engine-widget-subs eng) owner-id)
+                 (hash-set!    (engine-widget-subs eng) owner-id rest)))))
        (engine-widget-subs eng)))))
 
 (define (apply-filter eng msg)
@@ -593,8 +841,13 @@ cancel, plus all screen and app cmds.  Unknown cmds are dropped."
        (when (theme-set! (engine-theme eng) name) (mark-dirty!)))
       (('focus widget)
        (let* ((sz   (backend-size (engine-backend eng)))
-              (path (find-focus-path (engine-root eng) sz widget)))
-         (set-engine-focus-chain! eng (or path '()))))
+              (path (find-focus-path (engine-root eng) sz widget))
+              (ids  (cond
+                     ((not path) '())
+                     (else (map widget-id
+                                (filter (lambda (n) (is-a? n <focusable>))
+                                        path))))))
+         (set-engine-focus-chain! eng ids)))
       (('exec command on-done)
        (backend-shutdown (engine-backend eng))
        (let ((status (system command)))
