@@ -1,5 +1,6 @@
 (define-module (canary term dispatch)
   #:use-module (oop goops)
+  #:use-module (srfi srfi-1)
   #:use-module (canary view)
   #:use-module (canary term types)
   #:use-module (canary term ops)
@@ -79,51 +80,51 @@ DEC private modes (CSI ? Pm l), #f for ANSI modes (CSI Pm l)."
 ;;; Side effects on <term> for the mode ops.
 ;;;
 
+(define (cursor-style-blink-on style)
+  (case style
+    ((block)     'blinking-block)
+    ((underline) 'blinking-underline)
+    ((bar)       'blinking-bar)
+    (else        style)))
+
+(define (cursor-style-blink-off style)
+  (case style
+    ((blinking-block)     'block)
+    ((blinking-underline) 'underline)
+    ((blinking-bar)       'bar)
+    (else                 style)))
+
 (define (mode-side-effect! term number private? value)
   "Trigger side effects for modes whose semantics go beyond a flag:
-alt-screen composite modes, cursor-blink mapping into cursor-style,
-etc.  Returns #t if NUMBER had a side effect (and the flag has
-already been applied), #f if the caller still needs to set the flag."
-  (cond
-   ((not private?) #f)
-   (else
-    (case number
-      ((12)
-       (cond
-        (value
-         (case (term-cursor-style term)
-           ((block)     (set-term-cursor-style! term 'blinking-block))
-           ((underline) (set-term-cursor-style! term 'blinking-underline))
-           ((bar)       (set-term-cursor-style! term 'blinking-bar))))
-        (else
-         (case (term-cursor-style term)
-           ((blinking-block)     (set-term-cursor-style! term 'block))
-           ((blinking-underline) (set-term-cursor-style! term 'underline))
-           ((blinking-bar)       (set-term-cursor-style! term 'bar)))))
-       #f)
-      ((1047) (if value
-                  (term-enter-alt-screen! term)
-                  (term-exit-alt-screen! term))
-              #f)
-      ((1048) (if value
-                  (term-save-cursor! term)
-                  (term-restore-cursor! term))
-              #f)
-      ((1049) (cond
-               (value (term-save-cursor! term)
-                      (term-enter-alt-screen! term))
-               (else  (term-exit-alt-screen! term)
-                      (term-restore-cursor! term)))
-              #f)
-      (else #f)))))
+alt-screen composite modes, cursor-blink mapping into cursor-style.
+A no-op for everything else."
+  (and private?
+       (case number
+         ((12)
+          (set-term-cursor-style! term
+                                  ((if value
+                                       cursor-style-blink-on
+                                       cursor-style-blink-off)
+                                   (term-cursor-style term))))
+         ((1047)
+          ((if value term-enter-alt-screen! term-exit-alt-screen!) term))
+         ((1048)
+          ((if value term-save-cursor! term-restore-cursor!) term))
+         ((1049)
+          (cond
+           (value (term-save-cursor! term)
+                  (term-enter-alt-screen! term))
+           (else  (term-exit-alt-screen! term)
+                  (term-restore-cursor! term))))
+         (else #f))))
 
 (define (apply-mode! term number private? value)
   "Update TERM's mode flag for (PRIVATE?, NUMBER) to VALUE and trigger
 any associated side effect (alt-screen swap, cursor blink, etc.)."
   (mode-side-effect! term number private? value)
-  (let ((def (mode-def-by-key (if private? 'dec-private 'ansi) number)))
-    (when def
-      (mode-set! (term-modes term) (mode-def-name def) value))))
+  (and=> (mode-def-by-key (if private? 'dec-private 'ansi) number)
+         (lambda (def)
+           (mode-set! (term-modes term) (mode-def-name def) value))))
 
 (define-method (update term (op <op-set-mode>))
   "Set the mode named by OP on TERM.  Returns (values TERM #f)."
@@ -141,36 +142,25 @@ any associated side effect (alt-screen swap, cursor blink, etc.)."
 ;;;
 
 (define (csi->mode-ops action set?)
-  "Return the list of <op-set-mode> (when SET? is #t) or <op-reset-mode>
-(when SET? is #f) records implied by the CSI ACTION's params and
-private-format byte.  CSI h / l can carry multiple mode numbers in one
-sequence; emit one op per number."
+  "Return the <op-set-mode> (when SET? is #t) or <op-reset-mode>
+records implied by the CSI ACTION's params and private-format byte.
+CSI h / l can carry multiple mode numbers in one sequence; emit one
+op per number, dropping #f entries from the parser's param list."
   (let ((private? (eqv? (action-csi-fmt action) #\?))
         (make-op (if set? op-set-mode op-reset-mode)))
-    (let loop ((ps (action-csi-params action))
-               (acc '()))
-      (cond
-       ((null? ps) (reverse acc))
-       (else
-        (let ((p (car ps)))
-          (loop (cdr ps)
-                (if p (cons (make-op p private?) acc) acc))))))))
+    (filter-map (lambda (p) (and p (make-op p private?)))
+                (action-csi-params action))))
+
+(define (mode-final? fmt final)
+  (and (memv final '(#\h #\l))
+       (or (not fmt) (char=? fmt #\?))))
 
 (define (dispatch-action! term action)
-  "Translate ACTION (a <action-csi> for now) into one or more op
-records and deliver each to TERM through the `update` generic.
-Returns unspecified."
-  (let ((final (and (is-a? action <action-csi>) (action-csi-final action))))
-    (when final
-      (let ((fmt (action-csi-fmt action)))
-        (cond
-         ;; CSI h: set mode(s).  ANSI when fmt is #f; DEC-private when '?'.
-         ((and (char=? final #\h)
-               (or (not fmt) (char=? fmt #\?)))
-          (for-each (lambda (op) (update term op))
-                    (csi->mode-ops action #t)))
-         ;; CSI l: reset mode(s).
-         ((and (char=? final #\l)
-               (or (not fmt) (char=? fmt #\?)))
-          (for-each (lambda (op) (update term op))
-                    (csi->mode-ops action #f))))))))
+  "Translate ACTION into one or more op records and deliver each to
+TERM through the `update` generic.  Returns unspecified."
+  (and (is-a? action <action-csi>)
+       (let ((final (action-csi-final action))
+             (fmt   (action-csi-fmt action)))
+         (when (mode-final? fmt final)
+           (for-each (lambda (op) (update term op))
+                     (csi->mode-ops action (char=? final #\h)))))))
