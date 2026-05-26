@@ -101,13 +101,12 @@ specialised on the `<init>` msg:
   (load-cmd c))                      ; return the cmd; mutate slots in place
 ```
 
-Layout primitives (`flex`, `align`, `wrap`, `width`, `height`,
-`boxed`, `pad`, ...) carry size-dependent behaviour through to render
-time. Author code composes the tree; the renderer interprets it in
-whatever rect it's given.
+Layout primitives like `flex`, `align`, and `wrap` don't have a
+fixed size — they reflow against the rect they're handed at render
+time, so the same tree adapts when the terminal resizes.
 
-For size-dependent work (animation, viewport sizing), capture
-`<resize>` into a slot:
+For widgets that need to *read* the terminal size (animation budgets,
+viewport sizing), capture `<resize>` into a slot:
 
 ```scheme
 (define-class <my-app> ()
@@ -121,11 +120,13 @@ For size-dependent work (animation, viewport sizing), capture
   #f)
 ```
 
-Layout records (`txt`, `vbox`, `hbox`, `boxed`, `pad`, `align`,
-`width`, `height`, `overlay`, `pin`, `on-click`, `on-hover`, `flex`,
-`wrap`) are pure data values composed into a tree. The renderer walks
-them by type-check. When it reaches a widget, it calls `(view widget)`
-to expand.
+Layout records — `txt`, `vbox`, `hbox`, `boxed`, `pad`, `margin`,
+`align`, `width`, `height`, `fill`, `spacer`, `overlay`, `pin`,
+`static`, `on-click`, `on-hover`, `link`, `prompt-zone`,
+`input-zone`, `output-zone`, `flex`, `wrap`, `image` — are pure
+data values composed into a tree. The renderer walks them by type
+check; when it reaches a widget, it calls `(view widget)` to
+expand.
 
 The engine:
 
@@ -134,8 +135,7 @@ The engine:
 - renders `(view root)`, populates click regions, draws cell diffs
 - on each msg, walks the rendered tree and calls `(update node msg)`
   on every widget found
-- collects cmds from each update's second return value, batches them,
-  runs them
+- collects each update's returned cmd, batches them, runs them
 - spawns fibers for cmds that need them (`every`, `after`, user thunks)
 
 `run-app` takes any widget plus config kwargs.
@@ -199,8 +199,12 @@ order:
         (set! (textinput-cursor (chat-input c)) 0)))))
 ```
 
-Every widget in the focus chain fires for every key/mouse msg.
-Compose by ordering state mutations across update methods.
+Every widget in the focus chain fires for every key/mouse msg, in
+leaf-to-root order.  Because the leaf fires first, an ancestor sees
+the child's already-updated state when its own `update` runs.  The
+chat above can read `textinput-value` on Enter and get exactly what
+the user typed — the textinput already handled the keystrokes that
+built that buffer.
 
 Non-key/mouse msgs (`<init>`, `<tick>`, `<resize>`, `<paste>`,
 `<mount>`, `<unmount>`, focus/blur, keymap-mapped actions like
@@ -440,13 +444,11 @@ Containers:
 `pad` and `margin` are distinct: `pad` adds space *inside* a
 boxed/styled region, `margin` adds space *outside*.
 
-`link` and the zone wrappers tag the cells emitted from their body
-with hyperlink-uri or semantic-content metadata.  The diff-to-ansi
-emitter wraps runs of matching cells in OSC 8 / OSC 133 sequences so
-the host terminal renders clickable links and shell-integration
-anchors (per-command navigation, "copy output only", per-command
-timing) on the subset of terminals that honour the protocols.
-Terminals that ignore them render the body unchanged.
+`link` and the `*-zone` wrappers tag their body's cells with
+metadata the diff emitter forwards as OSC 8 or OSC 133.  Modern
+host terminals make `link` cells clickable and use zone tags for
+shell-integration features.  Older hosts strip the escape sequences
+and render the body unchanged.
 
 ### Align
 
