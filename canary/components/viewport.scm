@@ -12,6 +12,7 @@
             viewport-offset
             viewport-step
             viewport-from
+            viewport-height
             viewport-scroll-up!
             viewport-scroll-down!
             viewport-scroll-to-start!
@@ -21,7 +22,8 @@
   (items  #:init-keyword #:items  #:init-value '()   #:accessor viewport-items)
   (offset #:init-keyword #:offset #:init-value 0     #:accessor viewport-offset)
   (step   #:init-keyword #:step   #:init-value 1     #:accessor viewport-step)
-  (from   #:init-keyword #:from   #:init-value 'top  #:accessor viewport-from))
+  (from   #:init-keyword #:from   #:init-value 'top  #:accessor viewport-from)
+  (height #:init-keyword #:height #:init-value #f    #:accessor viewport-height))
 
 (define (viewport? x) (is-a? x <viewport>))
 
@@ -61,20 +63,26 @@
 
 (define-method (view (v <viewport>))
   (let* ((items (viewport-items v))
-         (n (length items))
-         (off (viewport-offset v)))
+         (n     (length items))
+         (off   (viewport-offset v))
+         (h     (viewport-height v)))
     (case (viewport-from v)
       ((bottom)
-       (let ((keep (max 0 (- n off))))
+       (let* ((keep   (max 0 (- n off)))
+              (window (if h (min keep h) keep))
+              (start  (max 0 (- keep window))))
          (cond
-          ((zero? keep) (txt ""))
-          (else (apply vbox (list-head items keep))))))
+          ((zero? window) (txt ""))
+          (else (apply vbox (list-head (list-tail items start) window))))))
       (else
-       (let ((off* (max 0 (min off (max 0 (- n 1))))))
+       (let* ((off*   (max 0 (min off (max 0 (- n 1)))))
+              (avail  (max 0 (- n off*)))
+              (window (if h (min avail h) avail)))
          (cond
-          ((zero? n)   (txt ""))
-          ((>= off* n) (txt ""))
-          (else (apply vbox (list-tail items off*)))))))))
+          ((zero? n)      (txt ""))
+          ((>= off* n)    (txt ""))
+          ((zero? window) (txt ""))
+          (else (apply vbox (list-head (list-tail items off*) window)))))))))
 
 (define-method (update (v <viewport>) (msg <key>))
   (let ((k (key-sym msg)))

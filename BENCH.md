@@ -43,6 +43,24 @@ microbench-gated decision).  Recommended rule of thumb: re-run this
 baseline against a generic-dispatched print path and reject if cost
 exceeds ~10% on a full repaint.
 
+## Slice 2 — `<viewport>` windowing via `#:height` kwarg
+
+100k-item list, ten `txt` items per view, measured over 50-5000 iters:
+
+| config                                  | per view  |
+|-----------------------------------------|-----------|
+| offset 50000, no height (legacy)        | ~7120 µs  |
+| offset 50000, `#:height 30`             | ~137 µs   |
+| offset 0,     `#:height 30`             | ~102 µs   |
+
+`#:height` cuts mid-list cost ~52× and top-of-list cost ~70×.  The
+residual at offset 50000 is the `(list-tail items 50000)` walk —
+linear in offset, not in list length.  True O(visible) needs vector
+storage; deferred until someone needs a 10M-item list.
+
+At 137 µs per view, a viewport-heavy app spends 0.8% of a 16 ms frame
+budget on the viewport.  Headroom for 60 fps is intact.
+
 ## How to reproduce
 
 The bench scripts are inline one-liners — they're not committed as
