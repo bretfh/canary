@@ -3,6 +3,7 @@
   #:use-module (canary layout)
   #:use-module (canary protocol)
   #:use-module (canary key)
+  #:use-module (canary widget)
   #:use-module (ice-9 match)
   #:use-module (oop goops)
   #:use-module (srfi srfi-1)
@@ -13,27 +14,27 @@
             paginator-page
             paginator-per-page
             paginator-total-pages
-            paginator-prev-page!
-            paginator-next-page!
+            paginator-prev-page
+            paginator-next-page
             paginator-on-first-page?
             paginator-on-last-page?
             paginator-get-slice-bounds))
 
-(define-class <paginator> ()
+(define-class <paginator> (<focusable>)
   (type          #:init-keyword #:type          #:init-value 'arabic
-                 #:accessor paginator-type)
+                 #:getter paginator-type)
   (page          #:init-keyword #:page          #:init-value 0
-                 #:accessor paginator-page)
+                 #:getter paginator-page)
   (per-page      #:init-keyword #:per-page      #:init-value 10
-                 #:accessor paginator-per-page)
+                 #:getter paginator-per-page)
   (total-pages   #:init-keyword #:total-pages   #:init-value 1
-                 #:accessor paginator-total-pages)
+                 #:getter paginator-total-pages)
   (active-dot    #:init-keyword #:active-dot    #:init-value "•"
-                 #:accessor paginator-active-dot)
+                 #:getter paginator-active-dot)
   (inactive-dot  #:init-keyword #:inactive-dot  #:init-value "○"
-                 #:accessor paginator-inactive-dot)
+                 #:getter paginator-inactive-dot)
   (arabic-format #:init-keyword #:arabic-format #:init-value "~d/~d"
-                 #:accessor paginator-arabic-format))
+                 #:getter paginator-arabic-format))
 
 (define (paginator? x)
   "Return #t if X is a <paginator>."
@@ -45,17 +46,18 @@
 #:inactive-dot, #:arabic-format keyword arguments."
   (apply make <paginator> args))
 
-(define (paginator-prev-page! p)
-  "Decrement P's page index, clamping at 0.  Returns P."
-  (when (> (paginator-page p) 0)
-    (set! (paginator-page p) (- (paginator-page p) 1)))
-  p)
+(define (paginator-prev-page p)
+  "Return P with its page index decremented, clamped at 0."
+  (cond
+   ((zero? (paginator-page p)) p)
+   (else (update-slots p #:page (- (paginator-page p) 1)))))
 
-(define (paginator-next-page! p)
-  "Increment P's page index, clamping at total-pages - 1.  Returns P."
-  (when (< (paginator-page p) (- (paginator-total-pages p) 1))
-    (set! (paginator-page p) (+ (paginator-page p) 1)))
-  p)
+(define (paginator-next-page p)
+  "Return P with its page index incremented, clamped at total-pages -
+1."
+  (cond
+   ((>= (paginator-page p) (- (paginator-total-pages p) 1)) p)
+   (else (update-slots p #:page (+ (paginator-page p) 1)))))
 
 (define (paginator-on-first-page? p)
   "Return #t if P is positioned on the first page."
@@ -101,10 +103,12 @@ dot in accent face and the rest in muted."
 
 (define-method (update (p <paginator>) (msg <key>))
   "Right / page-down / `l` advances the page; left / page-up / `h`
-retreats.  Other keys ignored.  Mutates P in place."
-  (match (key-sym msg)
-    ((or 'right 'page-down) (paginator-next-page! p))
-    ((or 'left  'page-up)   (paginator-prev-page! p))
-    ((? (lambda (c) (and (char? c) (char=? c #\l)))) (paginator-next-page! p))
-    ((? (lambda (c) (and (char? c) (char=? c #\h)))) (paginator-prev-page! p))
-    (_ #f)))
+retreats.  Other keys leave P unchanged."
+  (cons
+   (match (key-sym msg)
+     ((or 'right 'page-down) (paginator-next-page p))
+     ((or 'left  'page-up)   (paginator-prev-page p))
+     ((? (lambda (c) (and (char? c) (char=? c #\l)))) (paginator-next-page p))
+     ((? (lambda (c) (and (char? c) (char=? c #\h)))) (paginator-prev-page p))
+     (_ p))
+   #f))

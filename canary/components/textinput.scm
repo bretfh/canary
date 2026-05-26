@@ -3,6 +3,7 @@
   #:use-module (canary layout)
   #:use-module (canary protocol)
   #:use-module (canary key)
+  #:use-module (canary widget)
   #:use-module (ice-9 match)
   #:use-module (oop goops)
   #:export (<textinput>
@@ -16,21 +17,21 @@
             textinput-char-limit
             textinput-focused?))
 
-(define-class <textinput> ()
+(define-class <textinput> (<focusable>)
   (value       #:init-keyword #:value       #:init-value ""
-               #:accessor textinput-value)
+               #:getter textinput-value)
   (cursor      #:init-keyword #:cursor      #:init-value 0
-               #:accessor textinput-cursor)
+               #:getter textinput-cursor)
   (placeholder #:init-keyword #:placeholder #:init-value ""
-               #:accessor textinput-placeholder)
+               #:getter textinput-placeholder)
   (prompt      #:init-keyword #:prompt      #:init-value "> "
-               #:accessor textinput-prompt)
+               #:getter textinput-prompt)
   (width       #:init-keyword #:width       #:init-value 20
-               #:accessor textinput-width)
+               #:getter textinput-width)
   (char-limit  #:init-keyword #:char-limit  #:init-value 0
-               #:accessor textinput-char-limit)
+               #:getter textinput-char-limit)
   (focused?    #:init-keyword #:focused?    #:init-value #f
-               #:accessor textinput-focused?))
+               #:getter textinput-focused?))
 
 (define (textinput? x)
   "Return #t if X is a <textinput>."
@@ -78,43 +79,52 @@ exceeds width."
             (hbox (txt prompt) (txt visible))))))))
 
 (define-method (update (ti <textinput>) (msg <mouse>))
-  "Mouse press repositions the cursor.  Other mouse actions ignored."
-  (when (eq? (mouse-action msg) 'press)
+  "Mouse press repositions the cursor.  Other mouse actions are
+ignored."
+  (cond
+   ((eq? (mouse-action msg) 'press)
     (let* ((pl  (string-length (textinput-prompt ti)))
            (rel (max 0 (- (mouse-x msg) pl)))
            (new (min rel (string-length (textinput-value ti)))))
-      (set! (textinput-cursor ti) new))))
+      (cons (update-slots ti #:cursor new) #f)))
+   (else (cons ti #f))))
 
 (define-method (update (ti <textinput>) (msg <key>))
   "Keys handled: backspace, delete, left, right, home, end, and
-self-inserting chars (subject to char-limit when non-zero).  Mutates
-TI in place."
+self-inserting chars (subject to char-limit when non-zero)."
   (let ((k     (key-sym msg))
         (val   (textinput-value ti))
         (cur   (textinput-cursor ti))
         (limit (textinput-char-limit ti)))
-    (match k
-      ('backspace
-       (when (> cur 0)
-         (set! (textinput-value ti)
-               (string-append (substring val 0 (- cur 1))
-                              (substring val cur)))
-         (set! (textinput-cursor ti) (- cur 1))))
-      ('delete
-       (when (< cur (string-length val))
-         (set! (textinput-value ti)
-               (string-append (substring val 0 cur)
-                              (substring val (+ cur 1))))))
-      ('left  (when (> cur 0) (set! (textinput-cursor ti) (- cur 1))))
-      ('right (when (< cur (string-length val))
-                (set! (textinput-cursor ti) (+ cur 1))))
-      ('home  (set! (textinput-cursor ti) 0))
-      ('end   (set! (textinput-cursor ti) (string-length val)))
-      (_
-       (when (and (char? k)
-                  (or (zero? limit) (< (string-length val) limit)))
-         (set! (textinput-value ti)
-               (string-append (substring val 0 cur)
-                              (string k)
-                              (substring val cur)))
-         (set! (textinput-cursor ti) (+ cur 1)))))))
+    (cons
+     (match k
+       ('backspace
+        (cond
+         ((zero? cur) ti)
+         (else (update-slots ti
+                 #:value  (string-append (substring val 0 (- cur 1))
+                                         (substring val cur))
+                 #:cursor (- cur 1)))))
+       ('delete
+        (cond
+         ((>= cur (string-length val)) ti)
+         (else (update-slots ti
+                 #:value (string-append (substring val 0 cur)
+                                        (substring val (+ cur 1)))))))
+       ('left  (cond ((zero? cur) ti)
+                     (else (update-slots ti #:cursor (- cur 1)))))
+       ('right (cond ((>= cur (string-length val)) ti)
+                     (else (update-slots ti #:cursor (+ cur 1)))))
+       ('home  (update-slots ti #:cursor 0))
+       ('end   (update-slots ti #:cursor (string-length val)))
+       (_
+        (cond
+         ((and (char? k)
+               (or (zero? limit) (< (string-length val) limit)))
+          (update-slots ti
+            #:value  (string-append (substring val 0 cur)
+                                    (string k)
+                                    (substring val cur))
+            #:cursor (+ cur 1)))
+         (else ti))))
+     #f)))

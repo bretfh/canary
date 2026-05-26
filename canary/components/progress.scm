@@ -1,6 +1,7 @@
 (define-module (canary components progress)
   #:use-module (canary view)
   #:use-module (canary layout)
+  #:use-module (canary widget)
   #:use-module (oop goops)
   #:export (<progress>
             progress?
@@ -13,19 +14,19 @@
             progress-empty-face
             progress-percent))
 
-(define-class <progress> ()
+(define-class <progress> (<focusable>)
   (current       #:init-keyword #:current       #:init-value 0
-                 #:accessor progress-current)
+                 #:getter progress-current)
   (total         #:init-keyword #:total         #:init-value 100
-                 #:accessor progress-total)
+                 #:getter progress-total)
   (width         #:init-keyword #:width         #:init-value 40
-                 #:accessor progress-width)
+                 #:getter progress-width)
   (show-percent? #:init-keyword #:show-percent? #:init-value #t
-                 #:accessor progress-show-percent?)
+                 #:getter progress-show-percent?)
   (filled-face   #:init-keyword #:filled-face   #:init-value 'success
-                 #:accessor progress-filled-face)
+                 #:getter progress-filled-face)
   (empty-face    #:init-keyword #:empty-face    #:init-value 'dim
-                 #:accessor progress-empty-face))
+                 #:getter progress-empty-face))
 
 (define (progress? x)
   "Return #t if X is a <progress>."

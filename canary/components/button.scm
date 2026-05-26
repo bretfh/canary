@@ -2,6 +2,7 @@
   #:use-module (canary view)
   #:use-module (canary layout)
   #:use-module (canary borders)
+  #:use-module (canary widget)
   #:use-module (oop goops)
   #:export (<button>
             button?
@@ -13,19 +14,19 @@
             button-focused?
             button-border))
 
-(define-class <button> ()
+(define-class <button> (<focusable>)
   (label        #:init-keyword #:label        #:init-value ""
-                #:accessor button-label)
+                #:getter button-label)
   (action       #:init-keyword #:action       #:init-value #f
-                #:accessor button-action)
+                #:getter button-action)
   (face         #:init-keyword #:face         #:init-value 'muted
-                #:accessor button-face)
+                #:getter button-face)
   (focused-face #:init-keyword #:focused-face #:init-value 'accent
-                #:accessor button-focused-face)
+                #:getter button-focused-face)
   (focused?     #:init-keyword #:focused?     #:init-value #f
-                #:accessor button-focused?)
+                #:getter button-focused?)
   (border       #:init-keyword #:border       #:init-value border-rounded
-                #:accessor button-border))
+                #:getter button-border))
 
 (define (button? x)
   "Return #t if X is a <button>."
