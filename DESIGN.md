@@ -8,8 +8,11 @@ The unit is a **node**. `vbox`, `txt`, `boxed` are nodes. A spinner is
 a node. A file browser is a node. Your whole app is a node. Nodes nest
 in other nodes; the engine walks one tree.
 
-Stateful nodes mutate themselves in place, returning cmds when they
-want the engine to do something: start a timer, swap palettes, quit.
+Stateful nodes return their next state paired with an optional cmd.
+A node's `update` produces `(cons next-self cmd-or-#f)`; the engine
+threads the next-self back into the tree and swaps the root between
+dispatches.  Use `update-slots` to build the next state with a few
+slot overrides; the rest carry over unchanged.
 
 Color is by name. `#:fg 'accent` reads from the active palette;
 `(cycle-palette)` flips palettes and every reference recolors at once.
@@ -65,16 +68,18 @@ The sections below cover each piece.
 ```scheme
 (use-modules (canary) (oop goops))
 
-(define-class <counter> ()
-  (n #:init-keyword #:n #:init-value 0 #:accessor counter-n))
+(define-class <counter> (<focusable>)
+  (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
 
 (define-method (view (c <counter>))
   (txt (number->string (counter-n c))))
 
 (define-method (update (c <counter>) (msg <key>))
-  (case (key-sym msg)
-    ((#\+) (set! (counter-n c) (+ 1 (counter-n c))))
-    ((#\-) (set! (counter-n c) (- (counter-n c) 1)))))
+  (cons (case (key-sym msg)
+          ((#\+) (update-slots c #:n (+ 1 (counter-n c))))
+          ((#\-) (update-slots c #:n (- (counter-n c) 1)))
+          (else  c))
+        #f))
 
 (run-app (make <counter>)
          #:title  "counter"
@@ -90,15 +95,20 @@ Two generics drive every node:
 
 ```
 view   : (lambda (self)     -> node)
-update : (lambda (self msg) -> cmd-or-#f)   ; optional; mutate self in place
+update : (lambda (self msg) -> (cons next-self cmd-or-#f))   ; optional
 ```
+
+Stateful nodes inherit from `<focusable>` so they carry an
+auto-generated identity slot the engine keys focus, mount/unmount,
+and per-widget subs by.  Read slots with their `#:getter`
+accessors; build the next state with `update-slots`.
 
 Specialise them on your class. Startup logic is just `update`
 specialised on the `<init>` msg:
 
 ```scheme
 (define-method (update (c <my-app>) (msg <init>))
-  (load-cmd c))                      ; return the cmd; mutate slots in place
+  (cons c (load-cmd c)))             ; same (next, cmd) pair as every update
 ```
 
 Layout primitives like `flex`, `align`, and `wrap` don't have a
@@ -109,15 +119,16 @@ For widgets that need to *read* the terminal size (animation budgets,
 viewport sizing), capture `<resize>` into a slot:
 
 ```scheme
-(define-class <my-app> ()
-  (cols #:init-value 80 #:accessor my-cols)
-  (rows #:init-value 24 #:accessor my-rows)
+(define-class <my-app> (<focusable>)
+  (cols #:init-value 80 #:getter my-cols)
+  (rows #:init-value 24 #:getter my-rows)
   ...)
 
 (define-method (update (a <my-app>) (msg <resize>))
-  (set! (my-cols a) (resize-width msg))
-  (set! (my-rows a) (resize-height msg))
-  #f)
+  (cons (update-slots a
+          #:cols (resize-width msg)
+          #:rows (resize-height msg))
+        #f))
 ```
 
 Layout records — `txt`, `vbox`, `hbox`, `boxed`, `pad`, `margin`,
@@ -149,9 +160,9 @@ it finds. Every layout primitive accepts widgets and layout records
 interchangeably.
 
 ```scheme
-(define-class <chat> ()
-  (lines #:init-value '()             #:accessor chat-lines)
-  (input #:init-form (textinput) #:accessor chat-input))
+(define-class <chat> (<focusable>)
+  (lines #:init-value '()             #:getter chat-lines)
+  (input #:init-form (textinput) #:getter chat-input))
 
 (define-method (view (c <chat>))
   (vbox (apply vbox (map (lambda (l) (txt l)) (chat-lines c)))
@@ -169,9 +180,11 @@ Nest as deep as you want:
 ```
 
 The cascade reaches every embedded widget regardless of depth or
-container kind. Each widget's `update` mutates state in place and
-returns a cmd-or-#f. Widgets that don't care about a given msg fall
-through the default catch-all and return `#f`.
+container kind.  Each widget's `update` returns `(cons next-self
+cmd-or-#f)`; the engine threads `next-self` back into the parent
+slot so the next render sees the new state.  Widgets that don't
+care about a given msg fall through the default catch-all and
+return `(cons self #f)`.
 
 ### Focus
 
@@ -191,12 +204,18 @@ order:
 
 ```scheme
 (define-method (update (c <chat>) (msg <key>))
-  (when (eq? (key-sym msg) 'return)
+  (cond
+   ((eq? (key-sym msg) 'return)
     (let ((val (textinput-value (chat-input c))))
-      (unless (zero? (string-length val))
-        (set! (chat-lines c) (cons val (chat-lines c)))
-        (set! (textinput-value (chat-input c)) "")
-        (set! (textinput-cursor (chat-input c)) 0)))))
+      (cond
+       ((zero? (string-length val)) (cons c #f))
+       (else
+        (cons (update-slots c
+                #:lines (cons val (chat-lines c))
+                #:input (update-slots (chat-input c)
+                          #:value "" #:cursor 0))
+              #f)))))
+   (else (cons c #f))))
 ```
 
 Every widget in the focus chain fires for every key/mouse msg, in
@@ -246,7 +265,9 @@ app and re-evaluate any form:
 - Re-evaluating a `(define-class ...)` form runs Guile's class-
   redefinition protocol; existing widgets migrate to the new slot
   layout.
-- `(set! (counter-n c) 99)` from the REPL mutates state directly.
+- Edit a `view` or `update` method, save, re-evaluate the form
+  from a Geiser-aware editor.  Method redefinition replaces the
+  prior body against the running image; the next render uses it.
 - Re-evaluating a theme swaps palettes or restyles.
 
 `make repl` runs `guile -L . --listen=37147`, opening a TCP REPL on
@@ -542,8 +563,10 @@ user-facing constructor. Applies to engine plumbing (`(engine
 
 ## Anti-patterns
 
-- **Don't** wrap your return value in `(values ...)`. Mutate slots in
-  place; return just the cmd, or `#f`.
+- **Don't** mutate slots with `set!` from inside `update`.  Build the
+  next state with `update-slots` and return it paired with the cmd.
+- **Don't** wrap the pair in `(values ...)`.  The return is one
+  ordinary pair: `(cons next-self cmd-or-#f)`.
 - **Don't** quote cmd literals: write `(set-title "x")`, not
   `'(set-title "x")`.
 - **Don't** put style flags in a list: write `#:bold #:italic`, not

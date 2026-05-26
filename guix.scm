@@ -19,7 +19,7 @@
 (define-public guile-canary
   (package
     (name "guile-canary")
-    (version "0.2.0")
+    (version "1.0.0")
     (source %canary-source)
     (build-system gnu-build-system)
     (arguments
@@ -59,10 +59,10 @@
     (synopsis "Live-reloadable TUI library for Guile")
     (description
      "Elm-shaped TUI library for Guile.  An app is a GOOPS class with two
-generics: @code{view} returns a tree of nodes from state and a size; @code{update}
-mutates state and returns a cmd.  Startup cmds, key handling, ticks and resizes
-are all msgs dispatched through @code{update}; widgets compose by embed-by-
-reference and the engine routes key/mouse msgs through a focus chain.  Layout
+generics: @code{view} returns a tree of nodes from state; @code{update} returns
+the next state paired with an optional cmd.  Startup cmds, key handling, ticks
+and resizes are all msgs dispatched through @code{update}; widgets compose by
+embed-by-reference and the engine routes key/mouse msgs through a focus chain.  Layout
 primitives (vbox, hbox, boxed, pad, align, width, height, flex, wrap, overlay,
 pin, on-click, on-hover) are pure records.  Bundled widgets: button, panel,
 textinput, spinner, progress, paginator, viewport.  A pluggable backend

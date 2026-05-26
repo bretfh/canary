@@ -3,6 +3,64 @@
 Changes are listed newest-first.  Format follows
 [Keep a Changelog](https://keepachangelog.com).
 
+## 1.0.0 — unreleased
+
+### Changed (breaking)
+
+- **Stateful nodes return their next state.**  `update` is now a
+  pure function on a widget: `(update self msg) -> (cons next-self
+  cmd-or-#f)`.  The engine threads the returned `next-self` back into
+  the parent's slot and atomically swaps the root between dispatches.
+  Slot writes from inside `update` are gone; build the next state
+  with `update-slots` and return it paired with the cmd.
+
+  Mechanical migration per stateful node:
+
+  ```
+  ;; before
+  (define-class <counter> ()
+    (n #:init-value 0 #:accessor counter-n))
+
+  (define-method (update (c <counter>) (msg <key>))
+    (case (key-sym msg)
+      ((#\+) (set! (counter-n c) (+ 1 (counter-n c))))
+      ((#\-) (set! (counter-n c) (- (counter-n c) 1))))
+    #f)
+
+  ;; after
+  (define-class <counter> (<focusable>)
+    (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
+
+  (define-method (update (c <counter>) (msg <key>))
+    (cons (case (key-sym msg)
+            ((#\+) (update-slots c #:n (+ 1 (counter-n c))))
+            ((#\-) (update-slots c #:n (- (counter-n c) 1)))
+            (else  c))
+          #f))
+  ```
+
+  Three edits per node: `#:accessor` becomes `#:getter`, every `set!`
+  becomes `(update-slots self #:slot val …)`, and the return is a
+  pair `(cons next-self cmd-or-#f)` instead of a bare cmd.
+
+### Added
+
+- **`<focusable>` mixin and `update-slots` helper** in `(canary
+  widget)`, re-exported from `(canary)`.  Inherit from `<focusable>`
+  to give a widget an auto-generated identity slot the engine keys
+  focus, mount/unmount, and per-widget subscriptions by — identity
+  survives across value-typed updates.  `update-slots` returns a
+  fresh instance with the listed slot overrides applied; everything
+  else is copied from the source.
+
+- **Engine cascade threads widgets through the tree.**  Each msg
+  dispatch walks the rendered view depth-first, calls `update` on
+  every widget it finds, and rebuilds the parent so its slot holds
+  the returned `next-self`.  Two slots that referenced the same
+  widget instance no longer share mutable state; the engine
+  preserves widget identity across the cascade via the `<focusable>`
+  id.
+
 ## 0.2.0 — unreleased
 
 ### Added
