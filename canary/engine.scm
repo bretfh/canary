@@ -173,11 +173,15 @@ height is engine-log-height-frac of total rows, minimum 4."
 
 ;;; ── render-frame ───────────────────────────────────────────────────
 
+(define %debug-stderr (fdes->outport 100))
+
 (define (render-frame eng)
   "Render one frame of ENG: compose user tree with log overlay,
 flatten to draw cmds (preceded by a clear), split out clickable
 regions for hit-testing, and hand the rest to the backend.  Errors
 are logged, never raised."
+  (format %debug-stderr "RENDER-FRAME called~%")
+  (force-output %debug-stderr)
   (catch #t
     (lambda ()
       (let* ((sz   (backend-size (engine-backend eng)))
@@ -663,6 +667,8 @@ re-emits after quiescence."
   (and (pair? msg) (eq? (car msg) 'resize-flushed) (resize? (cdr msg))))
 
 (define (process-one eng msg)
+  (format %debug-stderr "PROCESS-ONE: ~s~%" msg)
+  (force-output %debug-stderr)
   "Returns #t if anything reacted/should re-render, #f otherwise.
 
 Routing policy:
