@@ -99,16 +99,12 @@ dot in accent face and the rest in muted."
     ((dots) (paginator-dots-view p))
     (else   (paginator-arabic-view p))))
 
-(define-method (update (p <paginator>) msg)
-  "React to MSG for <paginator> P.  Right / page-down / `l` advances
-the page; left / page-up / `h` retreats.  Other input is ignored.
-Returns two values: P (mutated in place) and #f (no cmd)."
-  (when (key? msg)
-    (let ((k (key-sym msg)))
-      (match k
-        ((or 'right 'page-down) (paginator-next-page! p))
-        ((or 'left  'page-up)   (paginator-prev-page! p))
-        ((? (lambda (c) (and (char? c) (char=? c #\l)))) (paginator-next-page! p))
-        ((? (lambda (c) (and (char? c) (char=? c #\h)))) (paginator-prev-page! p))
-        (_ #f))))
-  (values p #f))
+(define-method (update (p <paginator>) (msg <key>))
+  "Right / page-down / `l` advances the page; left / page-up / `h`
+retreats.  Other keys ignored.  Mutates P in place."
+  (match (key-sym msg)
+    ((or 'right 'page-down) (paginator-next-page! p))
+    ((or 'left  'page-up)   (paginator-prev-page! p))
+    ((? (lambda (c) (and (char? c) (char=? c #\l)))) (paginator-next-page! p))
+    ((? (lambda (c) (and (char? c) (char=? c #\h)))) (paginator-prev-page! p))
+    (_ #f)))

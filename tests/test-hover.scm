@@ -43,7 +43,8 @@
     (text-of (render wrapped 10 1 #:mouse-x 1 #:mouse-y 0))))
 
 ;; Click-region emission survives hover wrapping
-(let* ((tree (on-click 'fire (on-hover (txt "btn") (lambda (_) (txt "BTN")))))
+(let* ((tree (on-click (on-hover (txt "btn") (lambda (_) (txt "BTN")))
+                       #:action 'fire))
        (cmds (render tree 10 1 #:mouse-x 100 #:mouse-y 100))
        (click (find clickable-cmd? cmds)))
   (test-assert "click-region emitted even when not hovered"

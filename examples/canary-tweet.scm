@@ -154,8 +154,8 @@
 ;; chain so the user's keys go there. The spinner installs its own
 ;; ticker via its <init> method when the cascade reaches it.
 (define-method (update (m <tweet>) (msg <init>))
-  (values m (batch (every #:hz 12 (lambda () (tick)))
-                   (focus (tweet-input m)))))
+  (batch (every #:hz 12 (lambda () (tick)))
+         (focus (tweet-input m))))
 
 (define (beak-pos sz)
   (let* ((cols (size-width  sz))
@@ -173,12 +173,11 @@
 
 (define-method (update (m <tweet>) (msg <tick>))
   (set! (tweet-frame m) (+ (tweet-frame m) 1))
-  (set! (tweet-notes m) (advance-notes! (tweet-notes m)))
-  (values m #f))
+  (set! (tweet-notes m) (advance-notes! (tweet-notes m))))
 
 (define-method (update (m <tweet>) (msg <key>))
   ;; The textinput is embedded in our view tree and focused at <init>,
-  ;; so the engine routes keys to it through the focus chain — no
+  ;; so the engine routes keys to it through the focus chain -- no
   ;; manual forward needed. We get the key too (we're on the chain as
   ;; the root) and use it to spawn a floating note or clear on enter.
   (let ((ch (key-sym msg)))
@@ -186,11 +185,7 @@
      ((eq? ch 'enter)
       (set! (textinput-value (tweet-input m)) "")
       (set! (textinput-cursor (tweet-input m)) 0))
-     ((char? ch) (spawn-note! m ch))))
-  (values m #f))
-
-(define-method (update (m <tweet>) msg)
-  (values m #f))
+     ((char? ch) (spawn-note! m ch)))))
 
 (define (status-bar m cols)
   (hbox (tweet-spin m)            ; cascade renders + reaches it for <init>
@@ -208,11 +203,11 @@
            (status-bar m cols)
            (spacer 1)
            (spacer top)
-           (align sprite 'center #:width cols)
+           (align sprite #:h 'center #:width cols)
            (spacer 1)
-           (align (tweet-input m) 'center #:width cols)
+           (align (tweet-input m) #:h 'center #:width cols)
            (spacer 1)
-           (align (txt "esc: quit" #:fg 'hint #:italic) 'center #:width cols))))
+           (align (txt "esc: quit" #:fg 'hint #:italic) #:h 'center #:width cols))))
     (receive (bx by) (beak-pos sz)
       (apply overlay body
              (map (lambda (n)

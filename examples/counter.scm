@@ -13,7 +13,7 @@
         (spacer 1)
         (align (txt (number->string (counter-n c))
                     #:fg 'accent #:bold)
-               'center #:width 40)))
+               #:h 'center #:width 40)))
 
 (define-method (update (c <counter>) (msg <key>))
   (let ((k (key-sym msg)))
@@ -22,10 +22,7 @@
       (set! (counter-n c) (+ 1 (counter-n c))))
      ((or (eqv? k #\-) (eqv? k #\j))
       (set! (counter-n c) (- (counter-n c) 1)))
-     ((eqv? k #\r) (set! (counter-n c) 0))))
-  (values c #f))
-
-(define-method (update (c <counter>) msg) (values c #f))
+     ((eqv? k #\r) (set! (counter-n c) 0)))))
 
 (run-app (make <counter>)
          #:title  "counter"

@@ -29,8 +29,8 @@
 ;;; The parser produces raw <action> records (in (canary term action));
 ;;; this module turns them into typed semantic <op-*> records and
 ;;; delivers each op to a <term> through canary's existing `update`
-;;; generic.  The contract on every method is `(values term cmd-or-#f)`,
-;;; the same shape that drives canary widgets.
+;;; generic.  Each method mutates the term in place and returns a
+;;; cmd-or-#f, the same shape that drives canary widgets.
 ;;;
 ;;; To intercept any emulator decision, specialise update at the REPL:
 ;;;
@@ -127,14 +127,14 @@ any associated side effect (alt-screen swap, cursor blink, etc.)."
            (mode-set! (term-modes term) (mode-def-name def) value))))
 
 (define-method (update term (op <op-set-mode>))
-  "Set the mode named by OP on TERM.  Returns (values TERM #f)."
+  "Set the mode named by OP on TERM."
   (apply-mode! term (op-mode-number op) (op-mode-private? op) #t)
-  (values term #f))
+  #f)
 
 (define-method (update term (op <op-reset-mode>))
-  "Reset the mode named by OP on TERM.  Returns (values TERM #f)."
+  "Reset the mode named by OP on TERM."
   (apply-mode! term (op-mode-number op) (op-mode-private? op) #f)
-  (values term #f))
+  #f)
 
 
 ;;;

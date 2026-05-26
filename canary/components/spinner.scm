@@ -48,17 +48,13 @@ drawn in the spinner's face."
     (txt (list-ref fr (modulo (spinner-frame-idx s) (length fr)))
          #:fg (spinner-face s))))
 
-(define-method (update (s <spinner>) msg)
-  "React to MSG for <spinner> S.  On <mount>, install a periodic
-ticker tagged with S; the engine auto-cancels it on <unmount>.  On
-each <tick>, advance the frame index.  Returns two values: the
-updated spinner and an optional cmd."
-  (cond
-   ((mount? msg)
-    (values s (every #:hz (spinner-hz s)
-                     #:id  (list 'spinner-tick s)
-                     (lambda () (tick)))))
-   ((tick? msg)
-    (set! (spinner-frame-idx s) (+ 1 (spinner-frame-idx s)))
-    (values s #f))
-   (else (values s #f))))
+(define-method (update (s <spinner>) (msg <mount>))
+  "On mount, install a periodic ticker tagged with S; the engine
+auto-cancels it on <unmount>."
+  (every #:hz (spinner-hz s)
+         #:id  (list 'spinner-tick s)
+         (lambda () (tick))))
+
+(define-method (update (s <spinner>) (msg <tick>))
+  "Advance the frame index."
+  (set! (spinner-frame-idx s) (+ 1 (spinner-frame-idx s))))

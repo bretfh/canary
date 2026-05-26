@@ -33,12 +33,9 @@
 (test-group "update can be called directly with an op record"
   (let ((t (fresh)))
     (t:mode-set! (t:term-modes t) 'cursor-visible #f)
-    (call-with-values
-     (lambda () (update t (t:op-set-mode 25 #t)))
-     (lambda (returned-term cmd)
-       (test-eq "returns the same term" t returned-term)
-       (test-assert "no cmd produced for plain mode set" (not cmd))
-       (test-assert "cursor-visible is now set" (cv? t))))))
+    (let ((cmd (update t (t:op-set-mode 25 #t))))
+      (test-assert "no cmd produced for plain mode set" (not cmd))
+      (test-assert "cursor-visible is now set" (cv? t)))))
 
 (test-group "op records preserve mode number and private? for inspection"
   (let ((op (t:op-set-mode 1049 #t)))

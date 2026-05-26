@@ -90,5 +90,4 @@
      ((or (eq? k 'up)   (eqv? k #\k)) (viewport-scroll-up!   v))
      ((or (eq? k 'down) (eqv? k #\j)) (viewport-scroll-down! v))
      ((eq? k 'home) (viewport-scroll-to-start! v))
-     ((eq? k 'end)  (viewport-scroll-to-end!   v))))
-  (values v #f))
+     ((eq? k 'end)  (viewport-scroll-to-end!   v)))))

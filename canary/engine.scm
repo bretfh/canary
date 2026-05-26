@@ -312,20 +312,29 @@ whether the next frame needs a re-render (e.g. for hover restyle)."
       (set-engine-mouse-y! eng ny)
       #t))))
 
+(define (cmd-shape? x)
+  "Return #t if X looks like a cmd the engine can run: a tagged list,
+a known bare symbol, or a procedure (user thunk).  Used to filter
+out unspecified / accidental non-cmd returns from update methods so
+authors don't have to write a trailing #f."
+  (or (procedure? x)
+      (and (pair? x) (symbol? (car x)))
+      (memq x '(quit clear-screen cycle-palette clear-log suspend))))
+
 (define (dispatch-update! eng node msg cmds-cell)
-  "Call (update node msg). Collect any cmd into CMDS-CELL (a 1-cons
-list used as a mutable accumulator). Errors are logged, not raised.
-Binds `%current-update-widget` so install-sub! can tag any
-subscriptions installed during this call with their owning widget."
+  "Call (update node msg).  Authors mutate state in place; a cmd
+returned (as a tagged list / known symbol / procedure) is collected
+into CMDS-CELL.  Anything else the body evaluates to is treated as
+no cmd, so a method that just does `(set! ...)` and stops is fine.
+Errors are logged, not raised.  Binds `%current-update-widget` so
+install-sub! can tag any subscriptions installed during this call
+with their owning widget."
   (catch #t
     (lambda ()
       (parameterize ((%current-update-widget node))
-        (call-with-values (lambda () (update node msg))
-          (lambda vs
-            (let ((cmd (cond ((null? vs) #f)
-                             ((null? (cdr vs)) #f)
-                             (else (cadr vs)))))
-              (when cmd (set-car! cmds-cell (cons cmd (car cmds-cell))))))))
+        (let ((cmd (update node msg)))
+          (when (cmd-shape? cmd)
+            (set-car! cmds-cell (cons cmd (car cmds-cell))))))
       (invalidate-size! node)
       (invalidate-cached-view! node))
     (lambda (key . args)

@@ -73,11 +73,8 @@ The sections below cover each piece.
 
 (define-method (update (c <counter>) (msg <key>))
   (case (key-sym msg)
-    ((#\+) (set! (counter-n c) (+ 1 (counter-n c))) (values c #f))
-    ((#\-) (set! (counter-n c) (- (counter-n c) 1)) (values c #f))
-    (else  (values c #f))))
-
-(define-method (update (c <counter>) msg) (values c #f))
+    ((#\+) (set! (counter-n c) (+ 1 (counter-n c))))
+    ((#\-) (set! (counter-n c) (- (counter-n c) 1)))))
 
 (run-app (make <counter>)
          #:title  "counter"
@@ -93,7 +90,7 @@ Two generics drive every node:
 
 ```
 view   : (lambda (self)     -> node)
-update : (lambda (self msg) -> (values self cmd-or-#f))   ; optional
+update : (lambda (self msg) -> cmd-or-#f)   ; optional; mutate self in place
 ```
 
 Specialise them on your class. Startup logic is just `update`
@@ -101,7 +98,7 @@ specialised on the `<init>` msg:
 
 ```scheme
 (define-method (update (c <my-app>) (msg <init>))
-  (values c (load-cmd c)))           ; same (model, cmd) shape as every update
+  (load-cmd c))                      ; return the cmd; mutate slots in place
 ```
 
 Layout primitives (`flex`, `align`, `wrap`, `width`, `height`,
@@ -121,7 +118,7 @@ For size-dependent work (animation, viewport sizing), capture
 (define-method (update (a <my-app>) (msg <resize>))
   (set! (my-cols a) (resize-width msg))
   (set! (my-rows a) (resize-height msg))
-  (values a #f))
+  #f)
 ```
 
 Layout records (`txt`, `vbox`, `hbox`, `boxed`, `pad`, `align`,
@@ -166,16 +163,15 @@ Nest as deep as you want:
 ```scheme
 (vbox
  (boxed (dired #:path "/foo") #:title "left")
- (hbox  (align (spinner) 'center #:width 20)
+ (hbox  (align (spinner) #:h 'center #:width 20)
         (pad   (button #:label "ok" #:action 'save) #:left 2)
         (width (chat-input app) 40)))
 ```
 
 The cascade reaches every embedded widget regardless of depth or
 container kind. Each widget's `update` mutates state in place and
-returns `(values self cmd-or-#f)`. Widgets that don't care about a
-given msg fall through the default catch-all and return
-`(values self #f)`.
+returns a cmd-or-#f. Widgets that don't care about a given msg fall
+through the default catch-all and return `#f`.
 
 ### Focus
 
@@ -185,7 +181,7 @@ widget. Move focus with the `focus` cmd:
 
 ```scheme
 (define-method (update (c <chat>) (msg <init>))
-  (values c (focus (chat-input c))))    ; <- input gets keys from the first frame
+  (focus (chat-input c)))               ; <- input gets keys from the first frame
 ```
 
 Keys and mouse msgs dispatch **leaf-to-root**: the focused widget
@@ -200,8 +196,7 @@ order:
       (unless (zero? (string-length val))
         (set! (chat-lines c) (cons val (chat-lines c)))
         (set! (textinput-value (chat-input c)) "")
-        (set! (textinput-cursor (chat-input c)) 0))))
-  (values c #f))
+        (set! (textinput-cursor (chat-input c)) 0)))))
 ```
 
 Every widget in the focus chain fires for every key/mouse msg.
@@ -221,10 +216,11 @@ when it leaves. `<init>` fires once per app at startup.
 
 ```scheme
 (define-method (update (s <spinner>) (msg <mount>))
-  (values s (every #:hz 10 #:id (list 'spinner-tick s) (lambda () (tick)))))
+  (every #:hz 10 #:id (list 'spinner-tick s) (lambda () (tick))))
 
-(define-method (update (s <spinner>) (msg <unmount>))
-  (values s #f))
+;; no <unmount> method needed -- the global catch-all returns
+;; nothing, and the engine auto-cancels the sub because it was
+;; installed while this widget was the current dispatch target.
 ```
 
 `every` and `after` cmds installed during a widget's `update` are
@@ -273,12 +269,15 @@ Engine-emitted records matched in `update`.
 | symbol     | keymap action; `on-click` action; user msg    |
 | list       | any user-defined shape via `(send eng ...)`     |
 
-Multi-method dispatch on the msg class is the natural shape:
+Multi-method dispatch on the msg class is the natural shape.  One
+method per msg class you care about; everything else falls through to
+the global catch-all in `(canary view)`, so you don't write a per-
+class catch-all.
 
 ```scheme
 (define-method (update (c <my>) (msg <tick>)) ...)
 (define-method (update (c <my>) (msg <key>))  ...)
-(define-method (update (c <my>) msg) (values c #f))   ; catch-all
+;; no per-class catch-all; non-matching msgs are silently no-op
 ```
 
 ## Cmds
@@ -312,19 +311,19 @@ not quoted literals.
 ## Click & hover
 
 ```scheme
-(on-click action body)
+(on-click body #:action act #:right right-act)
 (on-hover body styler-proc)
 ```
 
 `on-click` wraps any body so a left-press inside its rendered area
-dispatches `action` as a msg. `on-hover` swaps `body` for
-`(styler-proc body)` whenever the cursor is inside the area; purely
-visual.
+dispatches `#:action` as a msg, and a right-press dispatches
+`#:right` (optional). `on-hover` swaps `body` for `(styler-proc body)`
+whenever the cursor is inside the area; purely visual.
 
 ```scheme
-(on-click 'save
-          (on-hover (txt " save " #:fg 'muted)
-                    (lambda (_) (txt " save " #:fg 'accent #:bold))))
+(on-click (on-hover (txt " save " #:fg 'muted)
+                    (lambda (_) (txt " save " #:fg 'accent #:bold)))
+          #:action 'save)
 ```
 
 ## Keys and keymap
@@ -428,7 +427,7 @@ Containers:
 (overlay base p1 p2 ...)
 (boxed  body  #:border border-rounded #:fg 'name #:title "name")
 (static body)                            ; cache rendered cmds keyed on rect
-(on-click action body)
+(on-click body #:action a #:right ra)
 (on-hover body styler-proc)
 (link "https://..." body)                ; OSC 8 clickable hyperlink
 (prompt-zone body)                       ; OSC 133 ; A  - shell prompt
@@ -452,17 +451,13 @@ Terminals that ignore them render the body unchanged.
 ### Align
 
 `align` positions a node within the rect it's been given. Modes on
-each axis:
+each axis are kwargs:
 
-- horizontal: `'left` (default), `'center`, `'right`
-- vertical: `'top` (default), `'middle`, `'bottom`
+- `#:h` — `'left` (default), `'center`, `'right`
+- `#:v` — `'top` (default), `'middle`, `'bottom`
 
-Pass either via kwargs (`#:h`, `#:v`) or positionally; the modes
-self-classify, so `(align body 'center)` is horizontal-center,
-`(align body 'middle)` is vertical-middle, `(align body 'center
-'middle)` is centered on both axes. `#:width` / `#:height` pin the
-alignment slot explicitly; otherwise it inherits the rect's full
-dimension on that axis.
+`#:width` / `#:height` pin the alignment slot explicitly; otherwise
+it inherits the rect's full dimension on that axis.
 
 When the node overflows the slot, the anchored edge stays inside
 the rect and the opposite edge clips. `(align body #:v 'bottom)`
@@ -545,8 +540,8 @@ user-facing constructor. Applies to engine plumbing (`(engine
 
 ## Anti-patterns
 
-- **Don't** return new state from `update`. Mutate in place; return
-  `(values self cmd)`.
+- **Don't** wrap your return value in `(values ...)`. Mutate slots in
+  place; return just the cmd, or `#f`.
 - **Don't** quote cmd literals: write `(set-title "x")`, not
   `'(set-title "x")`.
 - **Don't** put style flags in a list: write `#:bold #:italic`, not

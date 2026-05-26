@@ -144,18 +144,11 @@ background shows through."
         (l (if (positive? all) all left)))
     (make-margin-node body t r b l)))
 
-(define* (align body #:optional (h-or-v #f) (v-mode #f)
-                #:key (h #f) (v #f) (width #f) (height #f))
+(define* (align body #:key (h 'left) (v 'top) (width #f) (height #f))
   "Position BODY inside the rect.
 
-Horizontal mode: 'left (default), 'center, 'right.
-Vertical mode:   'top  (default), 'middle, 'bottom.
-
-Either as kwargs — `(align body #:h 'center #:v 'middle)` — or
-positionally — `(align body 'center)` for horizontal, `(align body
-'center 'middle)` for both.  A mode passed positionally is classed
-as horizontal if it's 'left/'center/'right, vertical if it's
-'top/'middle/'bottom.
+#:h — 'left (default), 'center, 'right.
+#:v — 'top  (default), 'middle, 'bottom.
 
 #:width / #:height pin the alignment slot explicitly; otherwise the
 slot inherits the parent rect's full dimension on that axis.
@@ -164,23 +157,9 @@ Overflow rule: when BODY's intrinsic size exceeds the alignment
 slot on an axis, the anchored edge stays inside the slot and the
 opposite edge clips.  E.g. `#:v 'bottom` with overflowing content
 clips from the top — natural for chat-style tail anchoring."
-  (define (classify m)
-    (case m
-      ((left center right) (cons 'h m))
-      ((top middle bottom) (cons 'v m))
-      ((#f) #f)
-      (else (error "align: unknown mode" m))))
-  (let* ((c1 (classify h-or-v))
-         (c2 (classify v-mode))
-         (h-mode (or h
-                     (and c1 (eq? (car c1) 'h) (cdr c1))
-                     (and c2 (eq? (car c2) 'h) (cdr c2))
-                     'left))
-         (v-mode (or v
-                     (and c1 (eq? (car c1) 'v) (cdr c1))
-                     (and c2 (eq? (car c2) 'v) (cdr c2))
-                     'top)))
-    (make-align-node body h-mode v-mode width height)))
+  (case h ((left center right) #t) (else (error "align: bad #:h" h)))
+  (case v ((top middle bottom) #t) (else (error "align: bad #:v" v)))
+  (make-align-node body h v width height))
 
 (define* (width body w #:key (align 'left))
   "Constrain BODY to W cells wide.  #:align controls placement
@@ -229,24 +208,12 @@ terminal lacks graphics support (defaults to a blank spacer)."
   (make-image-node src w h px py src-x src-y src-w src-h
                    (or fallback (make-spacer-node w h))))
 
-(define* (on-click action-or-body #:optional (body-or-unset #f)
-                   #:key (left #f) (right #f))
+(define* (on-click body #:key action right)
   "Wrap BODY so mouse presses inside its rendered rect dispatch as
-msgs through update.
-
-Positional (one action): (on-click ACTION BODY) — left-press
-dispatches ACTION.
-
-Kwarg (left / right):    (on-click BODY #:left LA #:right RA) —
-left-press dispatches LA; right-press dispatches RA. Either may be #f.
-
-Each action is any value the app's update knows how to match
-(symbol, list, key)."
-  (cond
-   (body-or-unset
-    (make-click-node action-or-body body-or-unset right))
-   (else
-    (make-click-node left action-or-body right))))
+msgs through update.  Left-press dispatches #:ACTION; right-press
+dispatches #:RIGHT.  Either may be #f.  Each action is any value the
+app's update knows how to match (symbol, list, key)."
+  (make-click-node action body right))
 
 (define (link uri body)
   "Wrap BODY as an OSC 8 hyperlink to URI.  Cells rendered for BODY

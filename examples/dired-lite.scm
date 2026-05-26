@@ -116,8 +116,7 @@
           (flex right #:grow 2))))
 
 (define-method (update (d <dired>) (msg <init>))
-  (cd! d (dired-path d))
-  (values d #f))
+  (cd! d (dired-path d)))
 
 (define-method (update (d <dired>) (msg <key>))
   (let ((k (key-sym msg)))
@@ -135,8 +134,7 @@
         (when (and p (file-is-directory? p))
           (cd! d p))))
      ((or (eqv? k #\u) (eq? k 'left))
-      (cd! d (parent-dir (dired-path d)))))
-    (values d #f)))
+      (cd! d (parent-dir (dired-path d)))))))
 
 (run-app (make <dired> #:path (or (getenv "HOME") "/"))
          #:title  "dired-lite"

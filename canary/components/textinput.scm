@@ -77,47 +77,44 @@ exceeds width."
                     (txt cell #:reverse) (txt right)))
             (hbox (txt prompt) (txt visible))))))))
 
-(define-method (update (ti <textinput>) msg)
-  "React to MSG for <textinput> TI.  Mouse press repositions the
-cursor.  Keys handled: backspace, delete, left, right, home, end,
-and self-inserting chars (subject to char-limit when non-zero).
-Returns two values: TI (mutated in place) and #f (no cmd)."
-  (cond
-   ((and (mouse? msg) (eq? (mouse-action msg) 'press))
+(define-method (update (ti <textinput>) (msg <mouse>))
+  "Mouse press repositions the cursor.  Other mouse actions ignored."
+  (when (eq? (mouse-action msg) 'press)
     (let* ((pl  (string-length (textinput-prompt ti)))
            (rel (max 0 (- (mouse-x msg) pl)))
            (new (min rel (string-length (textinput-value ti)))))
-      (set! (textinput-cursor ti) new))
-    (values ti #f))
-   ((key? msg)
-    (let ((k     (key-sym msg))
-          (val   (textinput-value ti))
-          (cur   (textinput-cursor ti))
-          (limit (textinput-char-limit ti)))
-      (match k
-        ('backspace
-         (when (> cur 0)
-           (set! (textinput-value ti)
-                 (string-append (substring val 0 (- cur 1))
-                                (substring val cur)))
-           (set! (textinput-cursor ti) (- cur 1))))
-        ('delete
-         (when (< cur (string-length val))
-           (set! (textinput-value ti)
-                 (string-append (substring val 0 cur)
-                                (substring val (+ cur 1))))))
-        ('left  (when (> cur 0) (set! (textinput-cursor ti) (- cur 1))))
-        ('right (when (< cur (string-length val))
-                  (set! (textinput-cursor ti) (+ cur 1))))
-        ('home  (set! (textinput-cursor ti) 0))
-        ('end   (set! (textinput-cursor ti) (string-length val)))
-        (_
-         (when (and (char? k)
-                    (or (zero? limit) (< (string-length val) limit)))
-           (set! (textinput-value ti)
-                 (string-append (substring val 0 cur)
-                                (string k)
-                                (substring val cur)))
-           (set! (textinput-cursor ti) (+ cur 1)))))
-      (values ti #f)))
-   (else (values ti #f))))
+      (set! (textinput-cursor ti) new))))
+
+(define-method (update (ti <textinput>) (msg <key>))
+  "Keys handled: backspace, delete, left, right, home, end, and
+self-inserting chars (subject to char-limit when non-zero).  Mutates
+TI in place."
+  (let ((k     (key-sym msg))
+        (val   (textinput-value ti))
+        (cur   (textinput-cursor ti))
+        (limit (textinput-char-limit ti)))
+    (match k
+      ('backspace
+       (when (> cur 0)
+         (set! (textinput-value ti)
+               (string-append (substring val 0 (- cur 1))
+                              (substring val cur)))
+         (set! (textinput-cursor ti) (- cur 1))))
+      ('delete
+       (when (< cur (string-length val))
+         (set! (textinput-value ti)
+               (string-append (substring val 0 cur)
+                              (substring val (+ cur 1))))))
+      ('left  (when (> cur 0) (set! (textinput-cursor ti) (- cur 1))))
+      ('right (when (< cur (string-length val))
+                (set! (textinput-cursor ti) (+ cur 1))))
+      ('home  (set! (textinput-cursor ti) 0))
+      ('end   (set! (textinput-cursor ti) (string-length val)))
+      (_
+       (when (and (char? k)
+                  (or (zero? limit) (< (string-length val) limit)))
+         (set! (textinput-value ti)
+               (string-append (substring val 0 cur)
+                              (string k)
+                              (substring val cur)))
+         (set! (textinput-cursor ti) (+ cur 1)))))))

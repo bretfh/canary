@@ -1,6 +1,7 @@
 (define-module (canary engine-types)
   #:use-module (srfi srfi-9)
   #:use-module (ice-9 threads)
+  #:use-module (fibers channels)
   #:export (<engine>
             engine
             engine?
@@ -68,7 +69,8 @@
 
 (define* (engine #:key backend theme keymap title (mouse-mode 'off)
                       (cursor 'hidden) (alt-screen? #t) filter root
-                      msg-bell stop-ch resize-channel
+                      msg-bell stop-ch
+                      (resize-channel (make-channel))
                       (log-cap 200) (show-log? #t) (log-height-frac 1/5))
   "Return a fresh <engine> wired up with the supplied collaborators.
 BACKEND, THEME, KEYMAP, ROOT and the message-bell / stop-channel

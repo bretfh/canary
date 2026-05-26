@@ -20,7 +20,7 @@
 
 (define-method (update (t <tape>) msg)
   (set! (tape-msgs t) (cons msg (tape-msgs t)))
-  (values t #f))
+  #f)
 
 (define (received-mount? t)
   (any mount? (tape-msgs t)))

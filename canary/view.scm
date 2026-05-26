@@ -514,10 +514,9 @@ assigned rect's width."
 (define-generic update)
 
 (define-method (update node msg)
-  "Default update method: pass-through, no state change, no cmd.
-Means nodes that don't specialise `update` still participate in the
-cascade without raising no-applicable-method."
-  (values node #f))
+  "Default update method: no cmd, no state change.  Means nodes that
+don't specialise `update` still participate in the cascade without
+raising no-applicable-method.")
 
 (define %view-cache (make-parameter #f))
 

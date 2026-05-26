@@ -18,7 +18,7 @@
 
 (define-method (update (t <tape>) msg)
   (set! (tape-seen t) (cons msg (tape-seen t)))
-  (values t #f))
+  #f)
 
 (let ((t (make <tape>)))
   (update t 'a)
@@ -36,14 +36,13 @@
   (cond
    ((init? msg)
     (set! (ticker-installed? n) #t)
-    (values n 'pretend-cmd))
-   (else (values n #f))))
+    'pretend-cmd)
+   (else #f)))
 
 (let ((n (make <ticker>)))
-  (call-with-values (lambda () (update n (init)))
-    (lambda (n2 cmd)
-      (test-equal  "init returns cmd"   'pretend-cmd cmd)
-      (test-assert "init mutated state" (ticker-installed? n)))))
+  (let ((cmd (update n (init))))
+    (test-equal  "init returns cmd"   'pretend-cmd cmd)
+    (test-assert "init mutated state" (ticker-installed? n))))
 
 (define-class <point> ()
   (x #:init-keyword #:x #:init-value 0 #:accessor point-x)

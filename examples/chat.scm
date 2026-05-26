@@ -32,6 +32,8 @@
 
 (define (random-element xs) (list-ref xs (random (length xs))))
 
+(define-class <bot-tick> ())
+
 (define-class <chat> ()
   (history  #:init-form (viewport #:step 1 #:from 'bottom)
             #:accessor chat-history)
@@ -85,10 +87,10 @@
 (define-method (update (c <chat>) (msg <init>))
   ;; Greet, install the bot, focus the input.
   (chat-append-line! c 'muted "system" "welcome — type and press enter")
-  (values c (batch (focus (chat-input c))
-                   (every #:seconds 4
-                          #:id 'bot-stream
-                          (lambda () `(bot-tick))))))
+  (batch (focus (chat-input c))
+         (every #:seconds 4
+                #:id 'bot-stream
+                (lambda () (make <bot-tick>)))))
 
 (define (enter-key? k)
   (or (eq? k 'enter) (eq? k 'return)
@@ -97,7 +99,7 @@
 (define-method (update (c <chat>) (msg <key>))
   (let ((k (key-sym msg)))
     (cond
-     ((eq? k 'escape) (values c 'quit))
+     ((eq? k 'escape) 'quit)
      ((eq? k 'tab)
       (set! (chat-focus-on c)
             (case (chat-focus-on c)
@@ -105,22 +107,16 @@
               ((history) 'input)
               (else      'input)))
       (set! (textinput-focused? (chat-input c)) (eq? (chat-focus-on c) 'input))
-      (values c (focus-cmd-for c)))
+      (focus-cmd-for c))
      ((and (eq? (chat-focus-on c) 'input) (enter-key? k))
       (let ((val (textinput-value (chat-input c))))
         (unless (zero? (string-length val))
           (post-user-msg! c val)
           (set! (textinput-value (chat-input c)) "")
-          (set! (textinput-cursor (chat-input c)) 0)))
-      (values c #f))
-     (else (values c #f)))))
+          (set! (textinput-cursor (chat-input c)) 0)))))))
 
-(define-method (update (c <chat>) msg)
-  (cond
-   ((and (pair? msg) (eq? (car msg) 'bot-tick))
-    (post-bot-msg! c)
-    (values c #f))
-   (else (values c #f))))
+(define-method (update (c <chat>) (msg <bot-tick>))
+  (post-bot-msg! c))
 
 (run-app (make <chat>)
          #:title  "chat"

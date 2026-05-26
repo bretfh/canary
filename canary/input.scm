@@ -1,6 +1,9 @@
 (define-module (canary input)
   #:use-module (canary protocol)
   #:use-module (ice-9 textual-ports)
+  #:use-module ((fibers operations) #:select (perform-operation choice-operation))
+  #:use-module ((fibers io-wakeup)  #:select (wait-until-port-readable-operation))
+  #:use-module ((fibers timers)     #:select (sleep-operation))
   #:export (read-key-msg
             enable-input-logging
             disable-input-logging))
@@ -57,7 +60,12 @@ other chars into bare keys."
          ((< (char->integer char) 32)
           (let ((k (ctrl-char-to-key char)))
             (%ilog "read-key-msg: control char ~d -> ~a" (char->integer char) k)
-            (key k 'control)))
+            (cond
+             ;; Named keys (Tab, Enter, Backspace) ARE the keys — the
+             ;; control-range ASCII is just how the terminal sends
+             ;; them.  Only real ctrl-letter combos carry 'control.
+             ((symbol? k) (key k))
+             (else        (key k 'control)))))
          (else
           (%ilog "read-key-msg: graphic '~a'" char)
           (key char))))))))
@@ -74,27 +82,32 @@ maps to the corresponding lowercase letter (so C-a = ^A = code 1)."
       ((13) 'enter)
       (else (integer->char (+ code 96))))))
 
+(define %escape-disambiguation-seconds 0.025)
+
 (define (parse-escape-start port)
-  "Dispatch after reading an ESC byte: waits briefly for a follow-up
-byte (terminals may emit ESC sequences in two writes) and either
-parses the sequence or returns the bare 'escape key when no follow
-arrives within the timeout."
-  (let loop ((tries 0))
+  "Dispatch after reading an ESC byte.  Terminals (and any byte-by-
+byte transport like socat over a unix socket) emit escape sequences
+in multiple writes; wait up to ~25 ms for a follow-up byte, yielding
+to other fibers immediately if one arrives.  No follow-up = bare
+Escape keypress."
+  (cond
+   ((char-ready? port)
+    (let ((next (read-char port)))
+      (cond
+       ((eof-object? next) (key 'escape))
+       (else (parse-escape-sequence next port)))))
+   (else
+    (perform-operation
+     (choice-operation
+      (wait-until-port-readable-operation port)
+      (sleep-operation %escape-disambiguation-seconds)))
     (cond
-     ((and (not (char-ready? port)) (< tries 8))
-      (usleep 5000)
-      (loop (+ tries 1)))
-     (else
-      (%ilog "parse-escape-start: waited ~d ticks, ready=~a" tries (char-ready? port))
-      (if (char-ready? port)
-          (let ((next (read-char port)))
-            (%ilog "parse-escape-start: next='~a' code=~d" next (char->integer next))
-            (if next
-                (parse-escape-sequence next port)
-                (key 'escape)))
-          (begin
-            (%ilog "parse-escape-start: lone ESC -> escape")
-            (key 'escape)))))))
+     ((char-ready? port)
+      (let ((next (read-char port)))
+        (cond
+         ((eof-object? next) (key 'escape))
+         (else (parse-escape-sequence next port)))))
+     (else (key 'escape))))))
 
 (define (parse-escape-sequence char port)
   "Dispatch on the byte CHAR following ESC: '[' enters CSI, 'O'

@@ -44,8 +44,8 @@ the configured action fires on press."
   (let* ((focused? (button-focused? b))
          (face     (if focused? (button-focused-face b) (button-face b))))
     (on-click
-     (button-action b)
      (boxed (txt (string-append " " (button-label b) " ")
                  #:fg face #:bold focused?)
             #:border (button-border b)
-            #:fg     face))))
+            #:fg     face)
+     #:action (button-action b))))
