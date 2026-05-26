@@ -16,35 +16,36 @@ counted correctly)."
   (string-display-clamp s max-w))
 
 (define (wrap-paragraph str width)
-  "Greedy word-wrap STR to WIDTH columns. Returns a list of line
-strings. A word longer than WIDTH is hard-broken at column WIDTH;
-shorter words are joined with single spaces."
+  "Greedy word-wrap STR to WIDTH columns.  Words separated by spaces;
+words longer than WIDTH are hard-broken into width-sized chunks."
   (cond
    ((or (<= width 0) (string-null? str)) (list str))
    (else
-    (let ((words (filter (lambda (w) (not (string-null? w)))
-                         (string-split str #\space))))
+    (let lp ((words (string-split str #\space))
+             (lines '())
+             (cur ""))
       (cond
-       ((null? words) (list ""))
+       ((null? words)
+        (reverse (if (string-null? cur) lines (cons cur lines))))
        (else
-        (let loop ((ws words) (cur (car words)) (acc '()))
+        (let* ((w (car words))
+               (joined (cond ((string-null? cur) w)
+                             (else (string-append cur " " w)))))
           (cond
-           ((null? (cdr ws)) (reverse (cons cur acc)))
+           ((<= (string-display-width joined) width)
+            (lp (cdr words) lines joined))
+           ((not (string-null? cur))
+            (lp words (cons cur lines) ""))
            (else
-            (let* ((next (cadr ws))
-                   (joined (string-append cur " " next)))
+            (let break ((rem w) (lines lines))
               (cond
-               ((<= (string-display-width joined) width)
-                (loop (cdr ws) joined acc))
-               ((> (string-display-width next) width)
-                ;; word itself overflows; emit current, hard-break next.
-                (let lp ((rem next) (acc (cons cur acc)))
-                  (cond
-                   ((<= (string-display-width rem) width)
-                    (loop (cdr ws) rem acc))
-                   (else (lp (string-display-clamp rem (- (string-length rem) 1))
-                             (cons (string-display-clamp rem width) acc))))))
-               (else (loop (cdr ws) next (cons cur acc))))))))))))))
+               ((<= (string-display-width rem) width)
+                (lp (cdr words) lines rem))
+               (else
+                (let* ((head     (string-display-clamp rem width))
+                       (head-len (max 1 (string-length head)))
+                       (rest     (substring rem head-len)))
+                  (break rest (cons head lines)))))))))))))))
 
 (define (wrap-text str width)
   "Split STR on newlines, word-wrap each paragraph to WIDTH. Returns a
@@ -537,6 +538,55 @@ stopping when RECT's width is exhausted."
              (cmds (view->cmds run sub mx my)))
         (loop (cdr runs) (+ col w) (append (reverse cmds) acc) (- rem w)))))))
 
+(define (clip-cmds cmds rect)
+  (let ((rl (rect-col rect))
+        (rt (rect-row rect))
+        (rr (+ (rect-col rect) (rect-w rect)))
+        (rb (+ (rect-row rect) (rect-h rect))))
+    (filter-map
+     (lambda (c)
+       (cond
+        ((text-cmd? c)
+         (cond
+          ((or (< (text-row c) rt) (>= (text-row c) rb)) #f)
+          (else
+           (let* ((col   (text-col c))
+                  (str   (text-str c))
+                  (w     (string-display-width str))
+                  (end   (+ col w)))
+             (cond
+              ((or (>= col rr) (<= end rl)) #f)
+              ((and (>= col rl) (<= end rr)) c)
+              (else
+               (let* ((left-skip  (max 0 (- rl col)))
+                      (visible-w  (max 0 (min (- rr (max col rl))
+                                              (- w left-skip))))
+                      (clipped    (string-display-clamp
+                                   (if (zero? left-skip) str
+                                       (substring str
+                                                  (min left-skip (string-length str))))
+                                   visible-w)))
+                 (make-text (max col rl) (text-row c) clipped
+                            (text-face c) (text-attrs c)))))))))
+        ((fill-cmd? c)
+         (let* ((fl (fill-col c))
+                (ft (fill-row c))
+                (fr (+ fl (fill-w c)))
+                (fb (+ ft (fill-h c)))
+                (il (max fl rl)) (it (max ft rt))
+                (ir (min fr rr)) (ib (min fb rb)))
+           (cond
+            ((or (<= ir il) (<= ib it)) #f)
+            (else (make-fill il it (- ir il) (- ib it) (fill-face c))))))
+        ((cursor-cmd? c)
+         (cond
+          ((or (< (cursor-row c) rt) (>= (cursor-row c) rb)
+               (< (cursor-col c) rl) (>= (cursor-col c) rr))
+           #f)
+          (else c)))
+        (else c)))
+     cmds)))
+
 (define (render-align node rect mx my)
   "Render an <align-node>: position the body within an alignment
 slot of the rect, on both axes.  When the body overflows on an
@@ -567,7 +617,7 @@ for chat-style tail anchoring and right-aligned status info."
                          (+ (rect-row rect) offset-y)
                          cw
                          ch)))
-    (view->cmds body sub mx my)))
+    (clip-cmds (view->cmds body sub mx my) rect)))
 
 (define (render-width node rect mx my)
   "Render a <width-node>: render the body into a target-width
