@@ -1,6 +1,7 @@
 (define-module (canary term write)
   #:use-module (canary term types)
   #:use-module (canary term ops)
+  #:use-module (canary term modes)
   #:use-module (canary width)
   #:export (term-write!)
   #:re-export (char-display-width))
@@ -60,7 +61,7 @@ the last column sets a flag rather than advancing the cursor; the
 next print consumes the flag."
   (when (term-pending-wrap? term)
     (set-term-pending-wrap! term #f)
-    (when (term-auto-margin? term)
+    (when (mode-get (term-modes term) 'autowrap)
       (set-term-cursor-x! term 0)
       (cond
        ((= (term-cursor-y term) (term-scroll-bottom term))
@@ -100,7 +101,7 @@ it (wrapping when auto-margin is on, overwriting otherwise)."
           (unless (zero? cw)
             (consume-pending-wrap! term)
             (set-term-last-char! term ch)
-            (when (term-insert? term)
+            (when (mode-get (term-modes term) 'insert)
               (term-insert-char! term cw))
             (let ((x (term-cursor-x term))
                   (y (term-cursor-y term))

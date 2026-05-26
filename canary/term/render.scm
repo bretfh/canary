@@ -1,5 +1,6 @@
 (define-module (canary term render)
   #:use-module (canary term types)
+  #:use-module (canary term modes)
   #:use-module (canary width)
   #:use-module (rnrs bytevectors)
   #:export (term-render-line
@@ -97,7 +98,7 @@ entry, with positions offset by ORIGIN (a (COL ROW) list)."
                                  segment face-pl)
                            cmds))
                (loop (cdr cs)))))))))
-    (when (term-cursor-visible? term)
+    (when (mode-get (term-modes term) 'cursor-visible)
       (set! cmds
             (cons (list 'cursor
                         (+ col0 (term-cursor-x term))
@@ -277,6 +278,6 @@ output is a full repaint (every cell emitted)."
         (loop-y (+ y 1))))
     (when (vector-ref state 3)
       (display (string-append (string #\esc) "[0m") out))
-    (when (term-cursor-visible? cur)
+    (when (mode-get (term-modes cur) 'cursor-visible)
       (display (move-to-ansi (term-cursor-x cur) (term-cursor-y cur)) out))
     (get-output-string out)))

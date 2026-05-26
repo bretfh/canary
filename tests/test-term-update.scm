@@ -12,32 +12,33 @@
 
 (test-begin "term-update")
 
+(define (cv? t) (t:mode-get (t:term-modes t) 'cursor-visible))
+(define (ins? t) (t:mode-get (t:term-modes t) 'insert))
+(define (bp? t) (t:mode-get (t:term-modes t) 'bracketed-paste))
+
 (test-group "parser delivers <op-set-mode> through the update generic"
   (let ((t (fresh)))
     (t:term-process-output! t "\x1b[?25l")
-    (test-assert "cursor-visible? cleared after CSI ?25 l"
-                 (not (t:term-cursor-visible? t)))
+    (test-assert "cursor-visible cleared after CSI ?25 l" (not (cv? t)))
     (t:term-process-output! t "\x1b[?25h")
-    (test-assert "cursor-visible? set again after CSI ?25 h"
-                 (t:term-cursor-visible? t))))
+    (test-assert "cursor-visible set again after CSI ?25 h" (cv? t))))
 
 (test-group "ANSI mode 4 (insert mode) routes through the same path"
   (let ((t (fresh)))
     (t:term-process-output! t "\x1b[4h")
-    (test-assert "insert? set"      (t:term-insert? t))
+    (test-assert "insert set"      (ins? t))
     (t:term-process-output! t "\x1b[4l")
-    (test-assert "insert? cleared"  (not (t:term-insert? t)))))
+    (test-assert "insert cleared"  (not (ins? t)))))
 
 (test-group "update can be called directly with an op record"
   (let ((t (fresh)))
+    (t:mode-set! (t:term-modes t) 'cursor-visible #f)
     (call-with-values
      (lambda () (update t (t:op-set-mode 25 #t)))
      (lambda (returned-term cmd)
        (test-eq "returns the same term" t returned-term)
-       (test-assert "no cmd produced for plain mode set"
-                    (not cmd))
-       (test-assert "cursor-visible? is now set"
-                    (t:term-cursor-visible? t))))))
+       (test-assert "no cmd produced for plain mode set" (not cmd))
+       (test-assert "cursor-visible is now set" (cv? t))))))
 
 (test-group "op records preserve mode number and private? for inspection"
   (let ((op (t:op-set-mode 1049 #t)))
@@ -48,10 +49,10 @@
 
 (test-group "multi-param CSI h splits into one op per number"
   (let ((t (fresh)))
-    (t:set-term-cursor-visible! t #f)
-    (t:set-term-bracketed-paste! t #f)
+    (t:mode-set! (t:term-modes t) 'cursor-visible #f)
+    (t:mode-set! (t:term-modes t) 'bracketed-paste #f)
     (t:term-process-output! t "\x1b[?25;2004h")
-    (test-assert "cursor-visible? set"  (t:term-cursor-visible? t))
-    (test-assert "bracketed-paste? set" (t:term-bracketed-paste? t))))
+    (test-assert "cursor-visible set"  (cv? t))
+    (test-assert "bracketed-paste set" (bp? t))))
 
 (test-end "term-update")

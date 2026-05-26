@@ -2,6 +2,8 @@
   #:use-module (srfi srfi-9)
   #:use-module (srfi srfi-9 gnu)
   #:use-module (rnrs bytevectors)
+  #:use-module (canary term modes)
+  #:re-export (mode-get mode-set! mode-save! mode-restore! mode-reset!)
   #:export (<face-attrs>
             make-face-attrs
             face-attrs?
@@ -44,11 +46,7 @@
             term-csi-params set-term-csi-params!
             term-csi-format set-term-csi-format!
             term-osc-buf set-term-osc-buf!
-            term-auto-margin? set-term-auto-margin!
-            term-insert? set-term-insert!
-            term-keypad? set-term-keypad!
-            term-bracketed-paste? set-term-bracketed-paste!
-            term-cursor-visible? set-term-cursor-visible!
+            term-modes
             term-cursor-style set-term-cursor-style!
             term-g0 set-term-g0!
             term-g1 set-term-g1!
@@ -156,8 +154,7 @@ Eq-identical, both-#f, and slot-wise equal all qualify."
               saved-cx saved-cy saved-pending-wrap? saved-attrs attrs
               scroll-top scroll-bottom
               parser-state csi-params csi-format osc-buf
-              auto-margin? insert? keypad? bracketed-paste?
-              cursor-visible? cursor-style
+              modes cursor-style
               g0 g1 g2 g3 active-charset
               scrollback scrollback-size max-scrollback
               input-fn bell-fn title-fn cwd-fn
@@ -185,11 +182,7 @@ Eq-identical, both-#f, and slot-wise equal all qualify."
   (csi-params       term-csi-params       set-term-csi-params!)
   (csi-format       term-csi-format       set-term-csi-format!)
   (osc-buf          term-osc-buf          set-term-osc-buf!)
-  (auto-margin?     term-auto-margin?     set-term-auto-margin!)
-  (insert?          term-insert?          set-term-insert!)
-  (keypad?          term-keypad?          set-term-keypad!)
-  (bracketed-paste? term-bracketed-paste? set-term-bracketed-paste!)
-  (cursor-visible?  term-cursor-visible?  set-term-cursor-visible!)
+  (modes            term-modes)
   (cursor-style     term-cursor-style     set-term-cursor-style!)
   (g0               term-g0               set-term-g0!)
   (g1               term-g1               set-term-g1!)
@@ -246,8 +239,8 @@ scrollback ring; 0 disables it."
                 0 0 #f (default-face-attrs) (default-face-attrs)
                 0 (- height 1)
                 #f '() #f ""
-                #t #f #f #f
-                #t 'block
+                (make-mode-state)
+                'block
                 'us-ascii 'us-ascii 'us-ascii 'us-ascii 'g0
                 (if (positive? max-scrollback)
                     (make-vector 64 #f)
@@ -347,11 +340,7 @@ us-ascii, attrs cleared, grid cleared, alt-screen exited."
   (set-term-pending-wrap! t #f)
   (set-term-scroll-top! t 0)
   (set-term-scroll-bottom! t (- (term-height t) 1))
-  (set-term-auto-margin! t #t)
-  (set-term-insert! t #f)
-  (set-term-keypad! t #f)
-  (set-term-bracketed-paste! t #f)
-  (set-term-cursor-visible! t #t)
+  (mode-reset! (term-modes t))
   (set-term-cursor-style! t 'block)
   (set-term-active-charset! t 'g0)
   (set-term-g0! t 'us-ascii)

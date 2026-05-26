@@ -38,7 +38,7 @@
 
 (test-group "with autowrap off, the next print overwrites the last cell"
   (let ((t (fresh 5 3)))
-    (t:set-term-auto-margin! t #f)
+    (t:mode-set! (t:term-modes t) 'autowrap #f)
     (t:term-write! t "abcde")
     (t:term-write! t "Z")
     (test-equal "cursor x stays at last column" 4 (t:term-cursor-x t))

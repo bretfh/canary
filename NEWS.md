@@ -7,6 +7,24 @@ Changes are listed newest-first.  Format follows
 
 ### Added
 
+- **Modes table as discoverable API** (`(canary term modes)`).  A
+  single `<mode-state>` slot on `<term>` replaces the five ad-hoc
+  boolean slots (auto-margin, insert, keypad, bracketed-paste,
+  cursor-visible).  Every ECMA-48 / DEC / xterm mode the parser
+  accepts is now declared in `*modes*` with a name, number, kind,
+  default, and one-line doc.  Read/write any mode by name:
+
+  ```
+  (mode-get (term-modes t) 'cursor-visible)
+  (mode-set! (term-modes t) 'sync-output #t)
+  ```
+
+  Emit-relevant modes (autowrap, insert, cursor-visible, alt-screen
+  variants, bracketed-paste) are wired to their existing consumers.
+  Input-side flags (cursor-keys, mouse modes, alt-modifier
+  variants) live in the table but no consumer reads them yet --
+  Track B will wire those when an input encoder lands.
+
 - **Typed action and op records + `update` dispatch on `<term>`.**
   Two new modules:
   - `(canary term action)` exposes `<action>` / `<action-csi>` —

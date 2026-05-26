@@ -4,6 +4,7 @@
   #:use-module (canary term types)
   #:use-module (canary term ops)
   #:use-module (canary term action)
+  #:use-module (canary term modes)
   #:export (<op>
             op?
 
@@ -78,17 +79,15 @@ DEC private modes (CSI ? Pm l), #f for ANSI modes (CSI Pm l)."
 ;;; Side effects on <term> for the mode ops.
 ;;;
 
-(define (apply-mode! term number private? value)
-  "Mutate TERM's mode flag indicated by (PRIVATE?, NUMBER) to VALUE.
-This is the shared body for set / reset of a mode."
+(define (mode-side-effect! term number private? value)
+  "Trigger side effects for modes whose semantics go beyond a flag:
+alt-screen composite modes, cursor-blink mapping into cursor-style,
+etc.  Returns #t if NUMBER had a side effect (and the flag has
+already been applied), #f if the caller still needs to set the flag."
   (cond
-   ((not private?)
-    (case number
-      ((4) (set-term-insert! term value))))
+   ((not private?) #f)
    (else
     (case number
-      ((1)    (set-term-keypad! term value))
-      ((7)    (set-term-auto-margin! term value))
       ((12)
        (cond
         (value
@@ -100,20 +99,31 @@ This is the shared body for set / reset of a mode."
          (case (term-cursor-style term)
            ((blinking-block)     (set-term-cursor-style! term 'block))
            ((blinking-underline) (set-term-cursor-style! term 'underline))
-           ((blinking-bar)       (set-term-cursor-style! term 'bar))))))
-      ((25)   (set-term-cursor-visible! term value))
+           ((blinking-bar)       (set-term-cursor-style! term 'bar)))))
+       #f)
       ((1047) (if value
                   (term-enter-alt-screen! term)
-                  (term-exit-alt-screen! term)))
+                  (term-exit-alt-screen! term))
+              #f)
       ((1048) (if value
                   (term-save-cursor! term)
-                  (term-restore-cursor! term)))
+                  (term-restore-cursor! term))
+              #f)
       ((1049) (cond
                (value (term-save-cursor! term)
                       (term-enter-alt-screen! term))
                (else  (term-exit-alt-screen! term)
-                      (term-restore-cursor! term))))
-      ((2004) (set-term-bracketed-paste! term value))))))
+                      (term-restore-cursor! term)))
+              #f)
+      (else #f)))))
+
+(define (apply-mode! term number private? value)
+  "Update TERM's mode flag for (PRIVATE?, NUMBER) to VALUE and trigger
+any associated side effect (alt-screen swap, cursor blink, etc.)."
+  (mode-side-effect! term number private? value)
+  (let ((def (mode-def-by-key (if private? 'dec-private 'ansi) number)))
+    (when def
+      (mode-set! (term-modes term) (mode-def-name def) value))))
 
 (define-method (update term (op <op-set-mode>))
   "Set the mode named by OP on TERM.  Returns (values TERM #f)."
