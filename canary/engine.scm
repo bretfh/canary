@@ -687,21 +687,36 @@ not reachable. Layout records aren't in the path; only widget nodes."
 
 (define (collect-keymaps-on-focus-path eng)
   "Walk the engine's current root toward the focused leaf, collecting
-every <keymap-node> wrapper found along the way.  Returns the list of
-their <keymap> values in priority order: innermost wrapper first
-(closest to the focused widget), outermost last.  Returns '() when no
-widget is focused or the focus chain is empty."
+every <keymap-node> wrapper found along the way INCLUDING ones inside
+the focused widget's own view tree.  Returns the list of their
+<keymap> values in priority order: innermost wrapper first (closest
+to the focused widget), outermost last.  Returns '() when no widget is
+focused or the focus chain is empty.
+
+Three contribution sources:
+- ancestor wrappers (a `with-keymap` around a parent's body that
+  contains the focused widget);
+- sibling-of-target wrappers (a `with-keymap` inside the focused
+  widget's view, scoping its own binds);
+- nested modal wrappers (a `with-keymap` inside the focused widget's
+  view that itself wraps a further focused descendant)."
   (let* ((chain  (engine-focus-chain eng))
          (root   (engine-root eng))
-         (target-id (and (pair? chain) (car chain))))
+         ;; Chain is stored root-first; the focused leaf is the last
+         ;; element.
+         (target-id (and (pair? chain) (car (last-pair chain)))))
     (cond
      ((not target-id) '())
      (else
-      (let ((collected '()))
+      (let ((collected '())
+            ;; #f while still descending toward target; #t once we're
+            ;; inside the focused widget's own view tree.  In that
+            ;; sub-walk every keymap-node collects unconditionally.
+            (inside? #f))
         (define (try-list cs)
-          (let lp ((rest cs))
-            (cond ((null? rest) #f)
-                  (else (or (walk (car rest)) (lp (cdr rest)))))))
+          (let lp ((rest cs) (any? #f))
+            (cond ((null? rest) any?)
+                  (else (lp (cdr rest) (or (walk (car rest)) any?))))))
         (define (walk node)
           (cond
            ((not node) #f)
@@ -719,26 +734,45 @@ widget is focused or the focus chain is empty."
            ((hover-node? node)   (walk (hover-node-body node)))
            ((keymap-node? node)
             (cond
+             (inside?
+              ;; We're inside the focused widget's view; every
+              ;; keymap-node along the way contributes regardless of
+              ;; whether anything below matches.
+              (walk (keymap-node-body node))
+              (set! collected (cons (keymap-node-km node) collected))
+              #t)
              ((walk (keymap-node-body node))
+              ;; Ancestor wrapper that contains target somewhere.
               (set! collected (cons (keymap-node-km node) collected))
               #t)
              (else #f)))
            ((flex-node? node)    (walk (flex-node-body node)))
            ((wrap-node? node)    #f)
            ((overlay-node? node)
-            (or (walk (overlay-node-base node))
-                (try-list (map placement-body (overlay-node-overlays node)))))
+            (try-list (cons (overlay-node-base node)
+                            (map placement-body (overlay-node-overlays node)))))
            ((is-a? node <object>)
             (cond
-             ((and (is-a? node <focusable>)
-                   (eq? (widget-id node) target-id))  #t)
+             ((and (not inside?)
+                   (is-a? node <focusable>)
+                   (eq? (widget-id node) target-id))
+              ;; Hit the focused widget: descend into its view with
+              ;; `inside?` set so keymap-nodes inside its view tree
+              ;; collect unconditionally.  Restore inside? on the
+              ;; way back so sibling branches at higher levels stay
+              ;; in search mode.
+              (let ((prev inside?))
+                (set! inside? #t)
+                (walk (memoized-view node))
+                (set! inside? prev))
+              #t)
              (else (walk (memoized-view node)))))
            (else #f)))
         (walk root)
-        ;; Collected innermost-first naturally because the post-order
-        ;; recursion conses in unwind order from the deepest match
-        ;; back up.  Reverse so the priority order returned is
-        ;; innermost-first (closest to focus = highest priority).
+        ;; Collected innermost-first naturally: post-order recursion
+        ;; conses in unwind order from the deepest match back up.
+        ;; Reverse so the returned priority order is innermost-first
+        ;; (closest to focus = highest priority).
         (reverse collected))))))
 
 (define (try-keymap-stack! eng msg)
