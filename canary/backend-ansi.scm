@@ -165,6 +165,27 @@ slot is taken from FACE directly."
          ((overline) (t:set-face-overline! tattrs #t))))
      (append (or (face-attrs face) '()) (or extra-attrs '())))))
 
+(define (blit-cells-to-term! term col row w h src-chars src-faces)
+  "Copy a W×H block from SRC-CHARS / SRC-FACES (row-major, length
+W*H) into TERM starting at (COL, ROW).  Bulk version of
+set-term-cell-at! avoiding per-cell goto/write overhead — used by
+cells-cmd."
+  (let* ((tw         (t:term-width term))
+         (th         (t:term-height term))
+         (dst-chars  (t:term-chars term))
+         (dst-faces  (t:term-faces term))
+         ;; Clip to term bounds in case the block doesn't fit.
+         (clipped-w  (min w (max 0 (- tw col))))
+         (clipped-h  (min h (max 0 (- th row)))))
+    (do ((dy 0 (+ dy 1))) ((>= dy clipped-h))
+      (let ((src-base (* dy w))
+            (dst-base (+ (* (+ row dy) tw) col)))
+        (do ((dx 0 (+ dx 1))) ((>= dx clipped-w))
+          (u32vector-set! dst-chars (+ dst-base dx)
+                          (u32vector-ref src-chars (+ src-base dx)))
+          (vector-set! dst-faces (+ dst-base dx)
+                       (vector-ref src-faces (+ src-base dx))))))))
+
 (define (render-cmds-to-term! term cmds th)
   "Apply each draw cmd in CMDS to TERM, resolving faces against
 theme TH.  Handles clear, text, fill, cursor, and image cmds; image
@@ -182,6 +203,16 @@ cmds use the registered fallback if graphics support is off."
                                   (text-attrs cmd) th)
        (t:term-goto! term (+ (text-row cmd) 1) (+ (text-col cmd) 1))
        (t:term-write! term (text-str cmd)))
+      ((cells-cmd? cmd)
+       ;; Bulk-blit a pre-rendered W×H char/face block straight into
+       ;; the term grid.  Bypasses the per-cell text-cmd → term-goto!
+       ;; → term-write! pipeline that costs ~5 µs per cell; here each
+       ;; cell is one u32vector-set! + one vector-set!, ~50 ns.  Used
+       ;; by dense rectangular content like delve's map viewport.
+       (blit-cells-to-term! term
+                            (cells-col cmd) (cells-row cmd)
+                            (cells-w cmd)   (cells-h cmd)
+                            (cells-chars cmd) (cells-faces cmd)))
       ((fill-cmd? cmd)
        (let* ((w (fill-w cmd))
               (h (fill-h cmd))

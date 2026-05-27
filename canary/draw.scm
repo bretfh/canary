@@ -9,6 +9,16 @@
             text-face
             text-attrs
 
+            <cells-cmd>
+            cells-cmd?
+            make-cells
+            cells-col
+            cells-row
+            cells-w
+            cells-h
+            cells-chars
+            cells-faces
+
             <fill-cmd>
             fill-cmd?
             make-fill
@@ -66,6 +76,22 @@
   (face text-face)
   (attrs text-attrs))
 
+;; <cells-cmd>: a pre-rendered W×H block of cells, blitted into the
+;; term in one bulk copy.  CHARS is a u32vector of code points and
+;; FACES a vector of face records (or #f for default), both length
+;; W*H, row-major.  Use this when an app has a dense rectangular
+;; region (e.g. a roguelike map viewport) and would otherwise pay
+;; for one text-cmd allocation per cell.
+(define-record-type <cells-cmd>
+  (make-cells col row w h chars faces)
+  cells-cmd?
+  (col   cells-col)
+  (row   cells-row)
+  (w     cells-w)
+  (h     cells-h)
+  (chars cells-chars)
+  (faces cells-faces))
+
 (define-record-type <fill-cmd>
   (make-fill col row w h face)
   fill-cmd?
@@ -119,7 +145,7 @@ fires on right-click, defaulting to #f (no right-click handler)."
   (%make-clickable col row w h action right-action))
 
 (define (cmd? x)
-  "Return #t if X is any draw cmd record (text, fill, cursor, clear,
-image, or clickable)."
-  (or (text-cmd? x) (fill-cmd? x) (cursor-cmd? x) (clear-cmd? x)
-      (image-cmd? x) (clickable-cmd? x)))
+  "Return #t if X is any draw cmd record (text, cells, fill, cursor,
+clear, image, or clickable)."
+  (or (text-cmd? x) (cells-cmd? x) (fill-cmd? x) (cursor-cmd? x)
+      (clear-cmd? x) (image-cmd? x) (clickable-cmd? x)))

@@ -25,6 +25,14 @@
             text-node-face
             text-node-attrs
 
+            <cells-node>
+            cells-node?
+            make-cells-node
+            cells-node-chars
+            cells-node-faces
+            cells-node-w
+            cells-node-h
+
             <text-runs-node>
             text-runs-node?
             make-text-runs-node
@@ -235,6 +243,24 @@ starts empty."
   "Return a fresh <text-runs-node> sequencing RUNS (a list of
 <text-node>s or strings) inline on a single line."
   (%text-runs-node runs #f))
+
+;; <cells-node>: pre-rendered W×H cell block (chars + faces vectors)
+;; that the renderer blits straight into the term, bypassing per-cell
+;; text-node allocation and per-cell text-cmd dispatch.  Use for dense
+;; rectangular content like a roguelike map viewport.
+(define-record-type <cells-node>
+  (%cells-node chars faces w h)
+  cells-node?
+  (chars cells-node-chars)
+  (faces cells-node-faces)
+  (w     cells-node-w)
+  (h     cells-node-h))
+
+(define (make-cells-node chars faces w h)
+  "Return a fresh <cells-node> over CHARS (u32vector length W*H, row-
+major code points) and FACES (vector length W*H, row-major face
+records or #f)."
+  (%cells-node chars faces w h))
 
 (define-record-type <fill-node>
   (%fill-node w h face cache)
@@ -570,6 +596,7 @@ stale."
 container record, a widget (user-defined widgets), a string
 (treated as a text leaf), or #f (empty)."
   (or (text-node? x) (text-runs-node? x)
+      (cells-node? x)
       (fill-node? x) (spacer-node? x)
       (vbox-node? x) (hbox-node? x) (boxed-node? x)
       (pad-node? x) (margin-node? x) (align-node? x)
@@ -610,6 +637,8 @@ known size return zero or a string-width fallback."
              ((null? rs) (cons sw 1))
              (else (let ((s (view-size (car rs))))
                      (loop (cdr rs) (+ sw (car s)))))))))
+   ((cells-node? node)
+    (cons (cells-node-w node) (cells-node-h node)))
    ((fill-node? node)
     (memo fill-node-cache set-fill-node-cache! node
           (cons (fill-node-w node) (fill-node-h node))))

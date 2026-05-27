@@ -114,6 +114,14 @@ RECT-W/H; they only need RECT-COL/ROW to position the caret."
                      (text-node-attrs node))))
    ((text-runs-node? node)
     (render-text-runs node rect mx my))
+   ((cells-node? node)
+    ;; Pre-rendered block.  Hand the chars/faces buffers straight to
+    ;; the backend via one cells-cmd — no per-cell text-cmd allocation.
+    (list (make-cells (rect-col rect) (rect-row rect)
+                      (min (cells-node-w node) (rect-w rect))
+                      (min (cells-node-h node) (rect-h rect))
+                      (cells-node-chars node)
+                      (cells-node-faces node))))
    ((fill-node? node)
     (let* ((w (min (fill-node-w node) (rect-w rect)))
            (h (min (fill-node-h node) (rect-h rect))))
