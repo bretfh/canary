@@ -232,18 +232,19 @@ Placement ids are not compared."
        (= (vector-ref a 9)  (vector-ref b 9))
        (= (vector-ref a 10) (vector-ref b 10))))
 
-(define (emit-images! b cmds)
+(define (emit-images! b port cmds)
   "Position-keyed diff. Each (col,row) origin is one placement slot.
 Deletes for slots that vanished; places for new or content-changed
-slots. Unchanged slots: zero bytes."
-  (let* ((port (ansi-backend-port b))
-         (old  (ansi-backend-placements b))
+slots. Unchanged slots: zero bytes.  All escape sequences are written
+to PORT — typically the frame-assembly string port from backend-draw,
+so a frame with graphics still ships as one write."
+  (let* ((old  (ansi-backend-placements b))
          (new  (make-hash-table)))
     ;; Resolve img-ids first so unregistered srcs drop out before the diff.
     (for-each
      (lambda (c)
        (let* ((src    (image-src c))
-              (img-id (image-id-for! b src)))
+              (img-id (image-id-for! b port src)))
          (when img-id
            (hash-set! new (pos-key (image-col c) (image-row c))
                       (vector #f img-id src
@@ -441,16 +442,18 @@ advancing the counter."
     (set! (ansi-backend-next-placement-id b) (+ id 1))
     id))
 
-(define (image-id-for! b src)
-  "Return the kitty image id for SRC, transmitting the bytes on first
-use. Returns #f if SRC isn't registered."
+(define (image-id-for! b out src)
+  "Return the kitty image id for SRC, transmitting the bytes to OUT on
+first use.  Returns #f if SRC isn't registered.  OUT is the frame-
+assembly port (so a transmit + place sequence ships atomically with
+the rest of the frame)."
   (cond
    ((hashq-ref (ansi-backend-image-ids b) src) => (lambda (id) id))
    ((not (image-registered? src)) #f)
    (else
     (let* ((id (ansi-backend-next-image-id b))
            (bv (image-bytes src)))
-      (emit-image-transmit! (ansi-backend-port b) id bv)
+      (emit-image-transmit! out id bv)
       (hashq-set! (ansi-backend-image-ids b) src id)
       (set! (ansi-backend-next-image-id b) (+ id 1))
       (set! (ansi-backend-image-transmits b)
@@ -632,19 +635,33 @@ the next frame diffs against this one."
         (lambda (gfx-cmds grid-cmds)
           (t:term-clear! cur)
           (render-cmds-to-term! cur grid-cmds (ansi-backend-theme b))
-          (let ((diff (t:term-diff->ansi prev cur)))
-            (display +sync-begin+ out)
-            (display diff out)
-            (when (pair? gfx-cmds) (emit-images! b gfx-cmds))
-            (display +sync-end+ out)
-            (force-output out)
+          (let* ((diff  (t:term-diff->ansi prev cur))
+                 ;; Assemble the whole frame in a string port, then emit
+                 ;; with one display + force-output. Two reasons it must
+                 ;; be one write:
+                 ;; - mode 2026 (synchronized output) buffers the
+                 ;;   terminal's paint until the END marker arrives. Most
+                 ;;   terminals time out at ~150 ms; over a 37 ms RTT, two
+                 ;;   separate writes routinely exceed that, the terminal
+                 ;;   aborts buffering, and the user sees the diff paint
+                 ;;   cell-by-cell ("columns shift in").
+                 ;; - even with sync mode off, splitting the diff also
+                 ;;   splits the cursor-hide/show envelope, exposing the
+                 ;;   per-cell cursor sweep mid-frame.
+                 (buf   (open-output-string)))
+            (display +sync-begin+ buf)
+            (display "\x1b[?25l" buf)       ; hide cursor for the sweep
+            (display diff buf)
+            (when (pair? gfx-cmds) (emit-images! b buf gfx-cmds))
+            (display "\x1b[?25h" buf)       ; show cursor at its resting cell
+            (display +sync-end+ buf)
+            (let ((frame (get-output-string buf)))
+              (display frame out)
+              (force-output out)
+              (set! (ansi-backend-bytes-out b)
+                    (+ (ansi-backend-bytes-out b) (string-length frame))))
             (set! (ansi-backend-frames b)
                   (+ (ansi-backend-frames b) 1))
-            (set! (ansi-backend-bytes-out b)
-                  (+ (ansi-backend-bytes-out b)
-                     (string-length +sync-begin+)
-                     (string-length diff)
-                     (string-length +sync-end+)))
             (call-with-values (lambda () (count-csi-escapes diff))
               (lambda (sgr cur-moves)
                 (set! (ansi-backend-sgr-transitions b)
