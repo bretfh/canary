@@ -40,12 +40,12 @@ Brings in:
 - Layout: `txt`, `vbox`, `hbox`, `spacer`, `pad`, `margin`, `align`,
   `width`, `height`, `fill`, `pin`, `overlay`, `boxed`, `static`,
   `on-click`, `on-hover`, `link`, `prompt-zone`, `input-zone`,
-  `output-zone`, `flex`, `wrap`, `image`
+  `output-zone`, `flex`, `wrap`, `image`, `with-keymap`
 - Borders: `border-normal`, `border-rounded`, `border-thick`,
   `border-double`, `border-ascii`
 - Theme: `theme`, `palette`, `theme-set!`, `theme-cycle!`,
   `default-theme`
-- Keymap: `keymap`, `bind`
+- Keymap: `keymap`, `bind`, `with-keymap`
 - Backend: `<ansi-backend>`, `ansi-backend`, `graphics?`, `cell-w`,
   `cell-h`
 
@@ -384,6 +384,51 @@ longer an alias for `alt`.
 
 `'quit` is engine-intercepted. Anything else is dispatched to
 `update`.
+
+### Three levels of key handling
+
+| level   | where it lives                                  | priority | use for                                  |
+|---------|-------------------------------------------------|----------|-------------------------------------------|
+| global  | engine's `keymap` slot (`run-app #:keymap`)      | lowest   | app-wide binds — quit, `ctrl-c`           |
+| scoped  | `with-keymap` wrapper in the view tree           | middle   | scene binds, modal overlays, per-pane    |
+| raw     | focused widget's `update (msg <key>)` method     | highest  | typing, inline nav (textinput, menu)     |
+
+Dispatch order on a key:
+
+1. Engine collects scoped keymaps from `with-keymap` wrappers along
+   the focus path (innermost wrapper first).
+2. Stack walks top-down: scoped innermost → scoped outermost →
+   engine global. First match fires its action symbol as a cascade
+   msg.
+3. If nothing matches, the raw key routes down the focus chain to
+   the focused widget's `update (msg <key>)`.
+
+```scheme
+(define %canvas-km
+  (keymap (bind #\h 'move-left) (bind 'escape 'open-pause)))
+
+(define %pause-km
+  (keymap (bind 'escape 'close-pause) (bind 'enter 'menu-select)))
+
+(define-method (view (c <canvas>))
+  (with-keymap %canvas-km
+    (vbox (map-viewport-view c)
+          (and (canvas-pause-menu c)
+               (with-keymap %pause-km (canvas-pause-menu c))))))
+```
+
+When the pause menu is open and focused, the active stack is
+`[%pause-km, %canvas-km, engine-global]`. `escape` matches
+`%pause-km` first and fires `'close-pause`, shadowing the canvas's
+`'open-pause` bind. When the menu closes (slot cleared, focus back
+on canvas), the stack contracts to `[%canvas-km, engine-global]`
+naturally — no push/pop bookkeeping. The wrapper vanishing from the
+tree is what de-scopes it.
+
+Scoped keymaps don't preserve multi-key chord state across renders
+(the wrapper is rebuilt per frame). Define chord-bearing keymaps as
+the engine global, where chord state is held on `<engine>` and
+survives between dispatches.
 
 ## Theme
 
