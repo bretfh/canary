@@ -137,6 +137,8 @@ lifetime filtered out."
 (define-class <tweet> (<focusable>)
   (frame #:init-value 0   #:getter tweet-frame)
   (notes #:init-value '() #:getter tweet-notes)
+  (cols  #:init-value 80  #:getter tweet-cols)
+  (rows  #:init-value 24  #:getter tweet-rows)
   (input #:init-form (textinput #:prompt "♪ "
                                 #:placeholder "type to sing"
                                 #:width 40
@@ -159,10 +161,8 @@ lifetime filtered out."
   (cons m (batch (every #:hz 12 (lambda () (tick)))
                  (focus (tweet-input m)))))
 
-(define (beak-pos sz)
-  (let* ((cols (size-width  sz))
-         (rows (size-height sz))
-         (left (max 0 (quotient (- cols %sprite-cells-w) 2)))
+(define (beak-pos cols rows)
+  (let* ((left (max 0 (quotient (- cols %sprite-cells-w) 2)))
          (top  (max 0 (- rows %sprite-h 6))))
     (values (+ left (* 2 %beak-col))
             (+ top  %beak-row))))
@@ -181,6 +181,12 @@ notes list.  Non-char CH leaves M unchanged."
   (cons (update-slots m
           #:frame (+ (tweet-frame m) 1)
           #:notes (advance-notes (tweet-notes m)))
+        #f))
+
+(define-method (update (m <tweet>) (msg <resize>))
+  (cons (update-slots m
+          #:cols (resize-width msg)
+          #:rows (resize-height msg))
         #f))
 
 (define-method (update (m <tweet>) (msg <key>))
@@ -205,8 +211,8 @@ notes list.  Non-char CH leaves M unchanged."
         (txt (format #f "frame ~4d" (tweet-frame m)) #:fg 'muted)))
 
 (define-method (view (m <tweet>))
-  (let* ((cols   (size-width sz))
-         (rows   (size-height sz))
+  (let* ((cols   (tweet-cols m))
+         (rows   (tweet-rows m))
          (sprite (sprite-node-for (tweet-frame m)))
          (top    (max 0 (- rows %sprite-h 6)))
          (body
@@ -219,7 +225,7 @@ notes list.  Non-char CH leaves M unchanged."
            (align (tweet-input m) #:h 'center #:width cols)
            (spacer 1)
            (align (txt "esc: quit" #:fg 'hint #:italic) #:h 'center #:width cols))))
-    (receive (bx by) (beak-pos sz)
+    (receive (bx by) (beak-pos cols rows)
       (apply overlay body
              (map (lambda (n)
                     (receive (nx ny) (note-pos n bx by)
