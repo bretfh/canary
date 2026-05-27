@@ -15,6 +15,7 @@
             textinput-prompt
             textinput-width
             textinput-char-limit
+            textinput-mask?
             textinput-focused?))
 
 (define-class <textinput> (<focusable>)
@@ -30,6 +31,8 @@
                #:getter textinput-width)
   (char-limit  #:init-keyword #:char-limit  #:init-value 0
                #:getter textinput-char-limit)
+  (mask?       #:init-keyword #:mask?       #:init-value #f
+               #:getter textinput-mask?)
   (focused?    #:init-keyword #:focused?    #:init-value #f
                #:getter textinput-focused?))
 
@@ -48,7 +51,10 @@
 empty, the placeholder.  When focused, draws a reverse-video cell
 at the cursor position; horizontally scrolls when value length
 exceeds width."
-  (let* ((val      (textinput-value ti))
+  (let* ((raw      (textinput-value ti))
+         (val      (if (textinput-mask? ti)
+                       (make-string (string-length raw) #\•)
+                       raw))
          (prompt   (textinput-prompt ti))
          (w        (textinput-width ti))
          (cur      (textinput-cursor ti))
