@@ -339,34 +339,71 @@ column (x - dx) from prev.  Source columns out of [0, w) are exempt
             (lp (+ x 1)))
            (else #f))))))))
 
+(define (row-identical? prev cur y)
+  "Cells in row Y of CUR equal cells in row Y of PREV — i.e. the row
+did not change between frames."
+  (let* ((w (term-width cur))
+         (prev-chars (term-chars prev)) (prev-faces (term-faces prev))
+         (cur-chars  (term-chars cur))  (cur-faces  (term-faces cur))
+         (base (* y w)))
+    (let lp ((x 0))
+      (cond
+       ((>= x w) #t)
+       ((cell-eq? prev-chars prev-faces (+ base x)
+                  cur-chars  cur-faces  (+ base x))
+        (lp (+ x 1)))
+       (else #f)))))
+
 (define %min-shift-rows 4)
 
 (define (find-shift-region prev cur dx dy)
-  "For shift candidate (dx, dy), classify every row as shift-compatible
-or not, then return (cons t b) for the largest contiguous run of
-compatible rows — provided it spans at least %min-shift-rows.  Else
-#f.  The DECSTBM-scoped scroll fast path operates on rows [t, b]
-inclusive; the rows outside that band fall through to cell-by-cell
-diff."
+  "For shift candidate (dx, dy), classify every row as 'shift /
+'identical / 'differ, then return (cons t b) for the largest
+contiguous run of rows whose classification is 'shift or 'identical —
+provided it (a) spans at least %min-shift-rows, AND (b) actually
+contains at least one 'shift row. Without (b) we'd fire the fast
+path on idle frames where row N happens to match row N+dy because
+both rows are blank/repeated content — a spurious scroll that costs
+bytes and on non-blank content would visibly corrupt the screen.
+Returns #f otherwise."
   (let* ((h (term-height cur))
-         (cls (make-vector h #f)))
+         (cls (make-vector h 'differ)))
     (do ((y 0 (+ y 1))) ((>= y h))
-      (vector-set! cls y (row-shifted-by? prev cur y dx dy)))
-    (let lp ((y 0) (best-t #f) (best-len 0) (cur-t #f) (cur-len 0))
+      (vector-set! cls y
+                   (cond
+                    ((row-identical? prev cur y)        'identical)
+                    ((row-shifted-by? prev cur y dx dy) 'shift)
+                    (else                               'differ))))
+    (let lp ((y 0)
+             (best-t #f) (best-len 0) (best-has-shift? #f)
+             (cur-t #f)  (cur-len 0)  (cur-has-shift? #f))
+      (define (finish-run!)
+        (cond
+         ((and cur-has-shift? (> cur-len best-len))
+          (values cur-t cur-len cur-has-shift?))
+         (else
+          (values best-t best-len best-has-shift?))))
       (cond
        ((>= y h)
-        (let* ((final-t   (if (> cur-len best-len) cur-t best-t))
-               (final-len (max cur-len best-len)))
-          (cond
-           ((and final-t (>= final-len %min-shift-rows))
-            (cons final-t (+ final-t final-len -1)))
-           (else #f))))
-       ((vector-ref cls y)
-        (lp (+ y 1) best-t best-len (or cur-t y) (+ cur-len 1)))
+        (call-with-values finish-run!
+          (lambda (final-t final-len final-has-shift?)
+            (cond
+             ((and final-t final-has-shift? (>= final-len %min-shift-rows))
+              (cons final-t (+ final-t final-len -1)))
+             (else #f)))))
        (else
-        (cond
-         ((> cur-len best-len) (lp (+ y 1) cur-t cur-len #f 0))
-         (else                 (lp (+ y 1) best-t best-len #f 0))))))))
+        (let ((c (vector-ref cls y)))
+          (cond
+           ((eq? c 'differ)
+            (call-with-values finish-run!
+              (lambda (nbt nbl nbh)
+                (lp (+ y 1) nbt nbl nbh #f 0 #f))))
+           (else
+            (lp (+ y 1)
+                best-t best-len best-has-shift?
+                (or cur-t y)
+                (+ cur-len 1)
+                (or cur-has-shift? (eq? c 'shift)))))))))))
 
 (define (detect-shift prev cur)
   "Return (list dx dy t b) for the best cardinal shift whose
