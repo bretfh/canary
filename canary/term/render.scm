@@ -310,10 +310,119 @@ carrying outgoing emitter state across calls."
             (vector-set! state 0 (+ x (max 1 cw)))
             (vector-set! state 3 #t))))))))
 
-(define (term-diff->ansi prev cur)
-  "Return an ANSI string that transforms a terminal displaying PREV
-into one displaying CUR.  When PREV is #f or differs in size, the
-output is a full repaint (every cell emitted)."
+(define (cell-eq? a-chars a-faces a-i b-chars b-faces b-i)
+  "Cell at flat index A-I in (A-CHARS, A-FACES) equals cell at B-I in
+(B-CHARS, B-FACES)?"
+  (and (= (u32vector-ref a-chars a-i) (u32vector-ref b-chars b-i))
+       (face-attrs-equal? (vector-ref a-faces a-i) (vector-ref b-faces b-i))))
+
+(define (shifted-by? prev cur dx dy)
+  "Convention: CUR cell at (x, y) equals PREV cell at (x-dx, y-dy)
+for every (x, y) where the source coordinate is in-bounds. The
+out-of-bounds cells are the newly-exposed edge that shift-diff->ansi
+will paint after the scroll.
+
+Bails on first mismatch.  Same-size requirement enforced by caller."
+  (let* ((w (term-width cur))
+         (h (term-height cur))
+         (prev-chars (term-chars prev)) (prev-faces (term-faces prev))
+         (cur-chars  (term-chars cur))  (cur-faces  (term-faces cur))
+         (xmin (max 0 dx))   (xmax (+ w (min 0 dx)))
+         (ymin (max 0 dy))   (ymax (+ h (min 0 dy))))
+    (let lp-y ((y ymin))
+      (cond
+       ((>= y ymax) #t)
+       (else
+        (let ((cur-row-base  (* y w))
+              (prev-row-base (* (- y dy) w)))
+          (let lp-x ((x xmin))
+            (cond
+             ((>= x xmax) (lp-y (+ y 1)))
+             ((cell-eq? prev-chars prev-faces (+ prev-row-base (- x dx))
+                        cur-chars  cur-faces  (+ cur-row-base  x))
+              (lp-x (+ x 1)))
+             (else #f)))))))))
+
+(define (detect-shift prev cur)
+  "Return (cons dx dy) if CUR is PREV shifted by one cell in a cardinal
+direction; else #f.  Diagonals are not probed — delve's keymap is
+cardinal-only.  Camera always shifts by exactly one when the player
+moves, so larger shifts don't occur."
+  (and prev
+       (= (term-width prev)  (term-width cur))
+       (= (term-height prev) (term-height cur))
+       (let lp ((cands '((0 . -1) (0 . 1) (-1 . 0) (1 . 0))))
+         (cond
+          ((null? cands) #f)
+          ((shifted-by? prev cur (caar cands) (cdar cands))
+           (car cands))
+          (else (lp (cdr cands)))))))
+
+(define (paint-edge! cur out state xs ys)
+  "Emit cells from CUR at the coordinates produced by ranges XS and YS
+(both lists), using #f prev so every cell is treated as new."
+  (let ((cur-chars (term-chars cur))
+        (cur-faces (term-faces cur))
+        (w         (term-width cur)))
+    (for-each
+     (lambda (y)
+       (for-each
+        (lambda (x)
+          (diff-cell! cur-chars cur-faces #f #f
+                      (+ (* y w) x) x y out state))
+        xs))
+     ys)))
+
+(define (iota-range n) (let lp ((i 0) (acc '()))
+                         (cond ((= i n) (reverse acc))
+                               (else (lp (+ i 1) (cons i acc))))))
+
+(define (shift-diff->ansi prev cur dx dy)
+  "Emit a terminal scroll/insert/delete to slide existing content by
+(dx, dy), then paint the newly-exposed edge.  Caller has confirmed
+prev and cur are the same size and that cur is prev shifted by
+(dx, dy) over the overlap region.
+
+Conventions: cur[x,y] = prev[x-dx, y-dy].
+- dy = -1  → content scrolls up    → \\e[1S, paint bottom row
+- dy = +1  → content scrolls down  → \\e[1T, paint top row
+- dx = -1  → content scrolls left  → per-row \\e[1P, paint right column
+- dx = +1  → content scrolls right → per-row \\e[1@, paint left column"
+  (let* ((w   (term-width cur))
+         (h   (term-height cur))
+         (out (open-output-string))
+         (state (vector #f #f #f #f #f #f)))
+    (cond
+     ((= dy -1) (display "\x1b[1S" out))
+     ((= dy 1)  (display "\x1b[1T" out))
+     ((= dx -1)
+      (do ((y 0 (+ y 1))) ((>= y h))
+        (display (move-to-ansi 0 y) out)
+        (display "\x1b[1P" out)))
+     ((= dx 1)
+      (do ((y 0 (+ y 1))) ((>= y h))
+        (display (move-to-ansi 0 y) out)
+        (display "\x1b[1@" out))))
+    ;; Cursor position after vertical scroll is unchanged; after our
+    ;; per-row moves it's at (0, h-1). Either way reset our tracking
+    ;; so the first edge cell forces an explicit move-to.
+    (vector-set! state 0 #f)
+    (vector-set! state 1 #f)
+    (cond
+     ((= dy -1) (paint-edge! cur out state (iota-range w) (list (- h 1))))
+     ((= dy 1)  (paint-edge! cur out state (iota-range w) (list 0)))
+     ((= dx -1) (paint-edge! cur out state (list (- w 1)) (iota-range h)))
+     ((= dx 1)  (paint-edge! cur out state (list 0)         (iota-range h))))
+    (when (vector-ref state 3)
+      (when (vector-ref state 4) (emit-osc-8 #f out))
+      (display (string-append (string #\esc) "[0m") out))
+    (when (mode-get (term-modes cur) 'cursor-visible)
+      (display (move-to-ansi (term-cursor-x cur) (term-cursor-y cur)) out))
+    (get-output-string out)))
+
+(define (full-diff->ansi prev cur)
+  "Cell-by-cell diff fallback — used when there's no prev, sizes
+differ, or no cardinal shift matches."
   (let* ((w (term-width cur))
          (h (term-height cur))
          (cur-chars (term-chars cur))
@@ -335,9 +444,19 @@ output is a full repaint (every cell emitted)."
               (loop-x (+ x 1)))))
         (loop-y (+ y 1))))
     (when (vector-ref state 3)
-      (when (vector-ref state 4)
-        (emit-osc-8 #f out))
+      (when (vector-ref state 4) (emit-osc-8 #f out))
       (display (string-append (string #\esc) "[0m") out))
     (when (mode-get (term-modes cur) 'cursor-visible)
       (display (move-to-ansi (term-cursor-x cur) (term-cursor-y cur)) out))
     (get-output-string out)))
+
+(define (term-diff->ansi prev cur)
+  "Return an ANSI string that transforms a terminal displaying PREV
+into one displaying CUR.  Tries a cardinal-shift fast path first
+(emits scroll/insert/delete + paints the newly-exposed edge — O(w+h)
+bytes for a movement frame on a player-centred camera); falls back
+to cell-by-cell diff for non-shifted changes."
+  (cond
+   ((detect-shift prev cur) =>
+    (lambda (shift) (shift-diff->ansi prev cur (car shift) (cdr shift))))
+   (else (full-diff->ansi prev cur))))
