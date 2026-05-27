@@ -662,7 +662,12 @@ known size return zero or a string-width fallback."
           (view-size (flex-node-body node))))
    ((wrap-node? node) (cons 1 1))
    ((is-a? node <object>)
-    (cons 0 0))
+    ;; Widgets have intrinsic size = the size of their rendered view
+    ;; tree.  Returning (0 . 0) here made every vbox/hbox containing
+    ;; a widget allocate 0 cells to it; the widget then rendered into
+    ;; an empty rect and produced no cmds.  Materialise the view so
+    ;; layout containers can size their slots correctly.
+    (view-size (memoized-view node)))
    (else (cons 0 0))))
 
 (define (view-size node)
