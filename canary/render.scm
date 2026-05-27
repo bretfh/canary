@@ -93,9 +93,15 @@ hover and click nodes; pass -1 for no pointer."
   "Render NODE into RECT, with mouse position (MX, MY) used for
 hover/click hit-testing.  Returns a flat list of draw cmds.  The
 main recursion: dispatches on node kind, slices RECT for items,
-and threads MX/MY through."
+and threads MX/MY through.
+
+A `cursor-node` is allowed through an empty RECT — its intrinsic
+size is (0 . 0) so overlay placement clipping always produces a
+(col, row, 0, 0) sub-rect, and bailing on rect-empty? here would
+silently drop the cursor placement.  Cursor cmds don't read
+RECT-W/H; they only need RECT-COL/ROW to position the caret."
   (cond
-   ((rect-empty? rect) '())
+   ((and (rect-empty? rect) (not (cursor-node? node))) '())
    ((not node) '())
    ((string? node)
     (list (make-text (rect-col rect) (rect-row rect)

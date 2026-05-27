@@ -34,7 +34,7 @@
   "Parse a mixed arg list. Returns (values positionals face attrs).
 Recognised kwargs (each consumed in place):
   #:fg c / #:bg c   — c is a hex string \"#abc123\" or a palette symbol
-  #:bold #:italic #:underline #:reverse #:strike #:dim
+  #:bold #:italic #:underline #:overline #:reverse #:strike #:blink #:dim
 FACE is #f if neither #:fg nor #:bg was supplied."
   (let lp ((args args)
            (pos '())
@@ -52,8 +52,10 @@ FACE is #f if neither #:fg nor #:bg was supplied."
      ((eq? (car args) #:bold)      (lp (cdr args) pos fg bg has-color? (cons 'bold attrs)))
      ((eq? (car args) #:italic)    (lp (cdr args) pos fg bg has-color? (cons 'italic attrs)))
      ((eq? (car args) #:underline) (lp (cdr args) pos fg bg has-color? (cons 'underline attrs)))
+     ((eq? (car args) #:overline)  (lp (cdr args) pos fg bg has-color? (cons 'overline attrs)))
      ((eq? (car args) #:reverse)   (lp (cdr args) pos fg bg has-color? (cons 'reverse attrs)))
      ((eq? (car args) #:strike)    (lp (cdr args) pos fg bg has-color? (cons 'strikethrough attrs)))
+     ((eq? (car args) #:blink)     (lp (cdr args) pos fg bg has-color? (cons 'blink attrs)))
      ((eq? (car args) #:dim)       (lp (cdr args) pos fg bg has-color? (cons 'dim attrs)))
      (else
       (lp (cdr args) (cons (car args) pos) fg bg has-color? attrs)))))
@@ -62,7 +64,8 @@ FACE is #f if neither #:fg nor #:bg was supplied."
   "Build a text node.
 Positional args are strings or nested text nodes (inline spans).
 Styling kwargs: #:fg #:bg (hex or palette symbol),
-                #:bold #:italic #:underline #:reverse #:strike #:dim."
+                #:bold #:italic #:underline #:overline #:reverse #:strike
+                #:blink #:dim."
   (call-with-values (lambda () (parse-style-args args))
     (lambda (spans eff-face rev-attrs)
       (cond
