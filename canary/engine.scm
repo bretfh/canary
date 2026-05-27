@@ -219,6 +219,7 @@ hashq of widgets seen during the walk."
        ((static-node? node)  (walk (static-node-body node)))
        ((click-node? node)   (walk (click-node-body node)))
        ((hover-node? node)   (walk (hover-node-body node)))
+       ((keymap-node? node)  (walk (keymap-node-body node)))
        ((flex-node? node)    (walk (flex-node-body node)))
        ((wrap-node? node)    #f)
        ((overlay-node? node)
@@ -429,6 +430,7 @@ but anything inside them is."
      ((static-node? current)  (walk (static-node-body current)))
      ((click-node? current)   (walk (click-node-body current)))
      ((hover-node? current)   (walk (hover-node-body current)))
+     ((keymap-node? current)  (walk (keymap-node-body current)))
      ((link-node? current)    (walk (link-node-body current)))
      ((semantic-node? current) (walk (semantic-node-body current)))
      ((flex-node? current)    (walk (flex-node-body current)))
@@ -556,6 +558,9 @@ record itself is not rebuilt (it's transient anyway)."
    ((hover-node? val)
     (match (search-and-replace (hover-node-body val) id eng msg)
       ((_ . cmd) (cons val cmd))))
+   ((keymap-node? val)
+    (match (search-and-replace (keymap-node-body val) id eng msg)
+      ((_ . cmd) (cons val cmd))))
    ((link-node? val)
     (match (search-and-replace (link-node-body val) id eng msg)
       ((_ . cmd) (cons val cmd))))
@@ -665,6 +670,7 @@ not reachable. Layout records aren't in the path; only widget nodes."
      ((static-node? node)  (walk (static-node-body node) path))
      ((click-node? node)   (walk (click-node-body node) path))
      ((hover-node? node)   (walk (hover-node-body node) path))
+     ((keymap-node? node)  (walk (keymap-node-body node) path))
      ((flex-node? node)    (walk (flex-node-body node) path))
      ((wrap-node? node)    #f)
      ((overlay-node? node)
@@ -677,6 +683,82 @@ not reachable. Layout records aren't in the path; only widget nodes."
          (else (walk (memoized-view node) new-path)))))
      (else #f)))
   (walk root '()))
+
+(define (collect-keymaps-on-focus-path eng)
+  "Walk the engine's current root toward the focused leaf, collecting
+every <keymap-node> wrapper found along the way.  Returns the list of
+their <keymap> values in priority order: innermost wrapper first
+(closest to the focused widget), outermost last.  Returns '() when no
+widget is focused or the focus chain is empty."
+  (let* ((chain  (engine-focus-chain eng))
+         (root   (engine-root eng))
+         (target-id (and (pair? chain) (car chain))))
+    (cond
+     ((not target-id) '())
+     (else
+      (let ((collected '()))
+        (define (try-list cs)
+          (let lp ((rest cs))
+            (cond ((null? rest) #f)
+                  (else (or (walk (car rest)) (lp (cdr rest)))))))
+        (define (walk node)
+          (cond
+           ((not node) #f)
+           ((string? node) #f)
+           ((vbox-node? node)    (try-list (vbox-node-items node)))
+           ((hbox-node? node)    (try-list (hbox-node-items node)))
+           ((boxed-node? node)   (walk (boxed-node-body node)))
+           ((pad-node? node)     (walk (pad-node-body node)))
+           ((margin-node? node)  (walk (margin-node-body node)))
+           ((align-node? node)   (walk (align-node-body node)))
+           ((width-node? node)   (walk (width-node-body node)))
+           ((height-node? node)  (walk (height-node-body node)))
+           ((static-node? node)  (walk (static-node-body node)))
+           ((click-node? node)   (walk (click-node-body node)))
+           ((hover-node? node)   (walk (hover-node-body node)))
+           ((keymap-node? node)
+            (cond
+             ((walk (keymap-node-body node))
+              (set! collected (cons (keymap-node-km node) collected))
+              #t)
+             (else #f)))
+           ((flex-node? node)    (walk (flex-node-body node)))
+           ((wrap-node? node)    #f)
+           ((overlay-node? node)
+            (or (walk (overlay-node-base node))
+                (try-list (map placement-body (overlay-node-overlays node)))))
+           ((is-a? node <object>)
+            (cond
+             ((and (is-a? node <focusable>)
+                   (eq? (widget-id node) target-id))  #t)
+             (else (walk (memoized-view node)))))
+           (else #f)))
+        (walk root)
+        ;; Collected innermost-first naturally because the post-order
+        ;; recursion conses in unwind order from the deepest match
+        ;; back up.  Reverse so the priority order returned is
+        ;; innermost-first (closest to focus = highest priority).
+        (reverse collected))))))
+
+(define (try-keymap-stack! eng msg)
+  "Feed MSG through the active keymap stack: scoped keymaps collected
+on the focus path (innermost first), then the engine global keymap.
+Returns the matched action (or 'pending, or #f).  Mutates the engine
+global keymap via set-engine-keymap! to preserve chord state across
+calls; scoped keymap chord state is not preserved across renders."
+  (let* ((scoped (collect-keymaps-on-focus-path eng))
+         (global (engine-keymap eng))
+         (stack  (append scoped (if global (list global) '()))))
+    (cond
+     ((null? stack) #f)
+     (else
+      (call-with-values (lambda () (feed-key-stack stack msg))
+        (lambda (action new-stack)
+          (when (and global (pair? new-stack))
+            ;; Engine global is the last entry; its chord state must
+            ;; persist between dispatches.
+            (set-engine-keymap! eng (car (last-pair new-stack))))
+          action))))))
 
 (define (route-to-focus! eng msg)
   "Dispatch MSG to the focus chain leaf-to-root.  Each id in the chain
@@ -958,8 +1040,7 @@ Routing policy:
               (run-cmd! eng cmd)
               #t)))))
        (else
-        (receive (action new-km) (feed-key (engine-keymap eng) msg)
-          (set-engine-keymap! eng new-km)
+        (let ((action (try-keymap-stack! eng msg)))
           (cond
            ((eq? action 'pending) #f)
            ((eq? action 'quit) (stop-engine! eng) #t)
@@ -988,8 +1069,7 @@ Routing policy:
                    (cmd (and m (cascade! eng m))))
               (run-cmd! eng cmd) #t))))
          (else
-          (receive (action new-km) (feed-key (engine-keymap eng) msg)
-            (set-engine-keymap! eng new-km)
+          (let ((action (try-keymap-stack! eng msg)))
             (cond
              ((eq? action 'pending) #f)
              ((eq? action 'quit) (stop-engine! eng) #t)
@@ -1014,13 +1094,24 @@ Routing policy:
    ((and (key? msg)
          (pair? (engine-focus-chain eng))
          (pair? (cdr (engine-focus-chain eng))))
-    (let* ((m (apply-filter eng msg))
-           (cmd (and m (route-to-focus! eng m))))
-      (run-cmd! eng cmd) #t))
+    ;; A widget is focused.  Consult the scoped+global keymap stack
+    ;; first; an action match wins.  If nothing matches, the raw key
+    ;; routes down the focus chain to the focused widget's update.
+    (let ((action (try-keymap-stack! eng msg)))
+      (cond
+       ((eq? action 'pending) #f)
+       ((eq? action 'quit) (stop-engine! eng) #t)
+       (action
+        (let* ((m (apply-filter eng action))
+               (cmd (and m (cascade! eng m))))
+          (run-cmd! eng cmd) #t))
+       (else
+        (let* ((m (apply-filter eng msg))
+               (cmd (and m (route-to-focus! eng m))))
+          (run-cmd! eng cmd) #t)))))
    ((or (key? msg) (mouse? msg))
     (when (mouse? msg) (note-mouse-pos! eng msg))
-    (receive (action new-km) (feed-key (engine-keymap eng) msg)
-      (set-engine-keymap! eng new-km)
+    (let ((action (try-keymap-stack! eng msg)))
       (cond
        ((eq? action 'pending) #f)
        ((eq? action 'quit) (stop-engine! eng) #t)

@@ -26,6 +26,7 @@
             output-zone
             flex
             wrap
+            with-keymap
             parse-style-args))
 
 (define %empty-text (make-text-node "" 'default '()))
@@ -244,6 +245,17 @@ mouse cursor is inside the body's rect. STYLER is a unary procedure
 (lambda (body) → view-node) — return whatever view should replace the
 body on hover. For a static substitute, use (lambda (_) replacement)."
   (make-hover-node body styler))
+
+(define (with-keymap km body)
+  "Wrap BODY with keymap KM.  When any focusable descendant of BODY is
+on the engine's focus chain, KM contributes to the active keymap
+stack (innermost wrapper has highest priority; engine global keymap
+is the bottom of the stack).  KM is a <keymap> value built with
+`keymap` and `bind`.  Composes with everything else in the tree —
+nest `with-keymap` inside `with-keymap` to layer modals; wrap a
+scene's view with one to scope its binds; vanish from the tree
+naturally when BODY (or its focusable descendants) leaves."
+  (make-keymap-node km body))
 
 (define* (flex body #:key (grow 1) (shrink 0))
   "Tag BODY as flexible inside a vbox or hbox. After the box sums its

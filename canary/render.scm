@@ -197,6 +197,8 @@ RECT-W/H; they only need RECT-COL/ROW to position the caret."
       (view->cmds effective rect mx my)))
    ((flex-node? node)
     (view->cmds (flex-node-body node) rect mx my))
+   ((keymap-node? node)
+    (view->cmds (keymap-node-body node) rect mx my))
    ((wrap-node? node)
     (render-wrap node rect))
    ((is-a? node <object>)
@@ -275,6 +277,8 @@ widget's (0,0) intrinsic and report just the border overhead."
       (probe-major (click-node-body item) probe-w probe-h axis))
      ((hover-node? item)
       (probe-major (hover-node-body item) probe-w probe-h axis))
+     ((keymap-node? item)
+      (probe-major (keymap-node-body item) probe-w probe-h axis))
      ((is-a? item <object>)
       ;; Probe at minimum size on the measured axis (1). Do NOT memoize:
       ;; the probe-size tree must not leak into the render cache, or the

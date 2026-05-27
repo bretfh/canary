@@ -173,6 +173,12 @@
             hover-node-body
             hover-node-styler
 
+            <keymap-node>
+            keymap-node?
+            make-keymap-node
+            keymap-node-km
+            keymap-node-body
+
             <flex-node>
             flex-node?
             make-flex-node
@@ -482,6 +488,20 @@ swap glyphs, wrap with overlay, return a static replacement node."
            styler))
   (%hover-node body styler #f))
 
+(define-record-type <keymap-node>
+  (%keymap-node km body cache)
+  keymap-node?
+  (km    keymap-node-km)
+  (body  keymap-node-body)
+  (cache keymap-node-cache set-keymap-node-cache!))
+
+(define (make-keymap-node km body)
+  "Return a fresh <keymap-node> attaching keymap KM to BODY.  When a
+focusable descendant of BODY is on the engine's focus chain, KM
+contributes to the active keymap stack.  See `with-keymap` in
+(canary layout) for the constructor."
+  (%keymap-node km body #f))
+
 (define-record-type <flex-node>
   (%flex-node body grow shrink cache)
   flex-node?
@@ -557,6 +577,7 @@ container record, a widget (user-defined widgets), a string
       (cursor-node? x) (overlay-node? x) (static-node? x)
       (image-node? x) (click-node? x) (link-node? x) (semantic-node? x)
       (hover-node? x)
+      (keymap-node? x)
       (flex-node? x)
       (wrap-node? x)
       (is-a? x <object>)
@@ -657,6 +678,9 @@ known size return zero or a string-width fallback."
    ((hover-node? node)
     (memo hover-node-cache set-hover-node-cache! node
           (view-size (hover-node-body node))))
+   ((keymap-node? node)
+    (memo keymap-node-cache set-keymap-node-cache! node
+          (view-size (keymap-node-body node))))
    ((flex-node? node)
     (memo flex-node-cache set-flex-node-cache! node
           (view-size (flex-node-body node))))
@@ -699,4 +723,5 @@ vbox body).  Static nodes also lose their cached cmds and rect."
    ((link-node? node)    (set-link-node-cache!    node #f))
    ((semantic-node? node)(set-semantic-node-cache! node #f))
    ((hover-node? node)   (set-hover-node-cache!   node #f))
+   ((keymap-node? node)  (set-keymap-node-cache!  node #f))
    ((flex-node? node)    (set-flex-node-cache!    node #f))))

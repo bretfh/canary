@@ -40,7 +40,9 @@
 
    txt vbox hbox spacer join pad margin align width height fill
    place-cursor pin overlay static image on-click on-hover link
-   prompt-zone input-zone output-zone flex wrap
+   prompt-zone input-zone output-zone flex wrap with-keymap
+
+   keymap-node?
 
    <border> border border? border-normal border-rounded border-thick
    border-double border-ascii boxed
