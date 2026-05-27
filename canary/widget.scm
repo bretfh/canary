@@ -28,36 +28,34 @@ cache."
         (hash-set! %slot-keyword-cache cls pairs)
         pairs)))
 
-(define (override-keywords overrides)
-  "Return the set of keywords present in the flat OVERRIDES list as a
-list of keyword symbols.  Used to skip those slots when building the
-base initargs so overrides win."
-  (let loop ((rest overrides) (acc '()))
-    (match rest
-      (()                 acc)
-      ((_)                acc)
-      ((kw _ . more)      (loop more (cons kw acc))))))
-
 (define-class <focusable> ()
   (id #:init-form (gensym "w-") #:getter widget-id))
 
 (define (update-slots obj . overrides)
   "Return a fresh instance of the same kind as OBJ with every slot
 copied from OBJ except those listed in OVERRIDES, a flat list of
-#:slot value pairs.  Unknown keywords raise an error."
-  (let* ((cls         (class-of obj))
-         (pairs       (class-slot-keywords cls))
-         (overridden? (let ((kws (override-keywords overrides)))
-                        (lambda (kw) (memq kw kws))))
-         (base        (let loop ((rest pairs) (acc '()))
-                        (match rest
-                          (() (reverse acc))
-                          (((kw . name) . more)
-                           (cond
-                            ((overridden? kw) (loop more acc))
-                            (else
-                             (loop more
-                                   (cons* (slot-ref obj name)
-                                          kw
-                                          acc)))))))))
-    (apply make cls (append base overrides))))
+#:slot value pairs.  Slot values are copied via slot-set! so the
+helper works regardless of whether a slot declares an #:init-keyword.
+Unknown override keywords raise an error."
+  (let* ((cls     (class-of obj))
+         (pairs   (class-slot-keywords cls))
+         (fresh   (make cls))
+         (touched (make-hash-table)))
+    (let loop ((rest overrides))
+      (match rest
+        (() #t)
+        (((? keyword? kw) val . more)
+         (let ((name (and=> (assq kw pairs) cdr)))
+           (cond
+            ((not name) (error "update-slots: unknown slot" kw))
+            (else
+             (slot-set! fresh name val)
+             (hashq-set! touched name #t)
+             (loop more)))))))
+    (for-each (lambda (kv)
+                (let ((name (cdr kv)))
+                  (unless (hashq-ref touched name)
+                    (when (slot-bound? obj name)
+                      (slot-set! fresh name (slot-ref obj name))))))
+              pairs)
+    fresh))
