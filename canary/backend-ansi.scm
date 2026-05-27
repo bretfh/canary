@@ -232,18 +232,18 @@ Placement ids are not compared."
        (= (vector-ref a 9)  (vector-ref b 9))
        (= (vector-ref a 10) (vector-ref b 10))))
 
-(define (emit-images! b out cmds)
+(define (emit-images! b cmds)
   "Position-keyed diff. Each (col,row) origin is one placement slot.
 Deletes for slots that vanished; places for new or content-changed
-slots. Unchanged slots: zero bytes. All escape sequences are written
-to OUT (a string port assembled by backend-draw and flushed in one
-write at end-of-frame)."
-  (let* ((old  (ansi-backend-placements b))
+slots. Unchanged slots: zero bytes."
+  (let* ((port (ansi-backend-port b))
+         (old  (ansi-backend-placements b))
          (new  (make-hash-table)))
+    ;; Resolve img-ids first so unregistered srcs drop out before the diff.
     (for-each
      (lambda (c)
        (let* ((src    (image-src c))
-              (img-id (image-id-for! b out src)))
+              (img-id (image-id-for! b src)))
          (when img-id
            (hash-set! new (pos-key (image-col c) (image-row c))
                       (vector #f img-id src
@@ -255,7 +255,7 @@ write at end-of-frame)."
     (hash-for-each
      (lambda (key old-vec)
        (unless (hash-ref new key)
-         (emit-image-delete-placement! out
+         (emit-image-delete-placement! port
                                        (vector-ref old-vec 1)
                                        (vector-ref old-vec 0))
          (set! (ansi-backend-placements-deleted b)
@@ -270,7 +270,7 @@ write at end-of-frame)."
           (else
            (when (and old-vec
                       (not (= (vector-ref old-vec 1) (vector-ref new-vec 1))))
-             (emit-image-delete-placement! out
+             (emit-image-delete-placement! port
                                            (vector-ref old-vec 1)
                                            (vector-ref old-vec 0))
              (set! (ansi-backend-placements-deleted b)
@@ -279,7 +279,7 @@ write at end-of-frame)."
                           (vector-ref old-vec 0)
                           (next-placement-id! b))))
              (vector-set! new-vec 0 pid)
-             (emit-image-place! out
+             (emit-image-place! port
                                 (vector-ref new-vec 1) pid
                                 (key->col key) (key->row key)
                                 (vector-ref new-vec 7) (vector-ref new-vec 8)
@@ -441,23 +441,23 @@ advancing the counter."
     (set! (ansi-backend-next-placement-id b) (+ id 1))
     id))
 
-(define (image-id-for! b out src)
-  "Return the kitty image id for SRC, transmitting the bytes to OUT
-(the frame-assembly port) on first use. Returns #f if SRC isn't
-registered."
+(define (image-id-for! b src)
+  "Return the kitty image id for SRC, transmitting the bytes on first
+use. Returns #f if SRC isn't registered."
   (cond
    ((hashq-ref (ansi-backend-image-ids b) src) => (lambda (id) id))
    ((not (image-registered? src)) #f)
    (else
     (let* ((id (ansi-backend-next-image-id b))
            (bv (image-bytes src)))
-      (emit-image-transmit! out id bv)
+      (emit-image-transmit! (ansi-backend-port b) id bv)
       (hashq-set! (ansi-backend-image-ids b) src id)
       (set! (ansi-backend-next-image-id b) (+ id 1))
       (set! (ansi-backend-image-transmits b)
             (+ (ansi-backend-image-transmits b) 1))
       (set! (ansi-backend-image-transmit-bytes b)
             (+ (ansi-backend-image-transmit-bytes b)
+               ;; PNG payload base64-expanded (~4/3) + framing overhead per chunk
                (quotient (* (bytevector-length bv) 4) 3)
                (* 40 (max 1 (quotient (bytevector-length bv) 3072)))))
       id))))
@@ -632,23 +632,19 @@ the next frame diffs against this one."
         (lambda (gfx-cmds grid-cmds)
           (t:term-clear! cur)
           (render-cmds-to-term! cur grid-cmds (ansi-backend-theme b))
-          (let* ((diff   (t:term-diff->ansi prev cur))
-                 ;; Assemble the whole frame in a string port; emit with
-                 ;; one display to the real socket so the kernel sees one
-                 ;; write per frame. Without this each (display …) above
-                 ;; can become its own TCP segment over the LB.
-                 (buf    (open-output-string))
-                 (_b1    (display +sync-begin+ buf))
-                 (_b2    (display diff buf))
-                 (_b3    (when (pair? gfx-cmds) (emit-images! b buf gfx-cmds)))
-                 (_b4    (display +sync-end+ buf))
-                 (frame  (get-output-string buf)))
-            (display frame out)
+          (let ((diff (t:term-diff->ansi prev cur)))
+            (display +sync-begin+ out)
+            (display diff out)
+            (when (pair? gfx-cmds) (emit-images! b gfx-cmds))
+            (display +sync-end+ out)
             (force-output out)
             (set! (ansi-backend-frames b)
                   (+ (ansi-backend-frames b) 1))
             (set! (ansi-backend-bytes-out b)
-                  (+ (ansi-backend-bytes-out b) (string-length frame)))
+                  (+ (ansi-backend-bytes-out b)
+                     (string-length +sync-begin+)
+                     (string-length diff)
+                     (string-length +sync-end+)))
             (call-with-values (lambda () (count-csi-escapes diff))
               (lambda (sgr cur-moves)
                 (set! (ansi-backend-sgr-transitions b)
