@@ -451,7 +451,7 @@ subs) can resolve to current instances."
   (let ((tbl (make-hash-table)))
     (walk-tree node
                (lambda (n)
-                 (when (is-a? n <widget>)
+                 (when (is-a? n <focusable>)
                    (hash-set! tbl (widget-id n) n))))
     tbl))
 
@@ -504,7 +504,7 @@ record itself is not rebuilt (it's transient anyway)."
    ((string? val) (cons val #f))
    ((is-a? val <object>)
     (cond
-     ((and (is-a? val <widget>) (eq? (widget-id val) id))
+     ((and (is-a? val <focusable>) (eq? (widget-id val) id))
       (plain-update eng val msg))
      (else
       (let loop ((slots (class-slots (class-of val)))
@@ -754,7 +754,7 @@ Three contribution sources:
            ((is-a? node <object>)
             (cond
              ((and (not inside?)
-                   (is-a? node <widget>)
+                   (is-a? node <focusable>)
                    (eq? (widget-id node) target-id))
               ;; Hit the focused widget: descend into its view with
               ;; `inside?` set so keymap-nodes inside its view tree
@@ -853,7 +853,7 @@ unmount can auto-cancel it."
     (let* ((cell        (make-sub-cell))
            (owner       (%current-update-widget))
            (owner-id    (and owner
-                             (is-a? owner <widget>)
+                             (is-a? owner <focusable>)
                              (widget-id owner))))
       (when id (hash-set! (engine-subs eng) id cell))
       (when (and owner-id id)
@@ -962,7 +962,7 @@ cancel, plus all screen and app cmds.  Unknown cmds are dropped."
               (ids  (cond
                      ((not path) '())
                      (else (map widget-id
-                                (filter (lambda (n) (is-a? n <widget>))
+                                (filter (lambda (n) (is-a? n <focusable>))
                                         path))))))
          (set-engine-focus-chain! eng ids)))
       (('exec command on-done)
@@ -1039,19 +1039,6 @@ debounce fiber after quiescence, and directly during bootstrap."
 re-emits after quiescence."
   (and (pair? msg) (eq? (car msg) 'resize-flushed) (resize? (cdr msg))))
 
-(define (dispatch! eng dispatcher m)
-  "Run DISPATCHER (cascade! or route-to-focus!) for M, run any cmd it
-returned, then report whether the engine root was actually rebuilt.
-The root-rebuild check is the engine's @q{did anything change?}
-signal — it works because @code{update-slots} short-circuits to the
-input instance when every override matches, so a widget returning
-@code{(cons self #f)} for a no-op tick lets the cascade skip the
-rebuild all the way up to the root.  No state change → no render."
-  (let* ((before (engine-root eng))
-         (cmd    (and m (dispatcher eng m))))
-    (run-cmd! eng cmd)
-    (not (eq? before (engine-root eng)))))
-
 (define (process-one eng msg)
   "Returns #t if anything reacted/should re-render, #f otherwise.
 
@@ -1076,18 +1063,34 @@ Routing policy:
         (let ((action (clickable-action hit)))
           (cond
            ((not action)
-            (dispatch! eng route-to-focus! (apply-filter eng msg)))
+            ;; left-press in a region with no left action → fall through
+            ;; so raw mouse can flow to focus, e.g. the canvas drag.
+            (let* ((m (apply-filter eng msg))
+                   (cmd (and m (route-to-focus! eng m))))
+              (run-cmd! eng cmd) #t))
            ((eq? action 'quit) (stop-engine! eng) #t)
            (else
-            (dispatch! eng cascade! (apply-filter eng action))))))
+            (let* ((m (apply-filter eng action))
+                   (cmd (and m (cascade! eng m))))
+              (run-cmd! eng cmd)
+              #t)))))
        (else
         (let ((action (try-keymap-stack! eng msg)))
           (cond
            ((eq? action 'pending) #f)
            ((eq? action 'quit) (stop-engine! eng) #t)
-           (action (dispatch! eng cascade! (apply-filter eng action)))
-           (else   (dispatch! eng route-to-focus! (apply-filter eng msg)))))))))
+           (action (let* ((m (apply-filter eng action))
+                          (cmd (and m (cascade! eng m))))
+                     (run-cmd! eng cmd)
+                     #t))
+           (else (let* ((m (apply-filter eng msg))
+                        (cmd (and m (route-to-focus! eng m))))
+                   (run-cmd! eng cmd)
+                   #t))))))))
    ((mouse-right-press? msg)
+    ;; Right-press: same click-region machinery, but dispatch the
+    ;; region's right-action. If the region has no right-action, fall
+    ;; through to keymap then to raw routing (canvas sample, etc.).
     (note-mouse-pos! eng msg)
     (let ((hit (find-click-region (engine-click-regions eng)
                                   (mouse-x msg) (mouse-y msg))))
@@ -1096,14 +1099,21 @@ Routing policy:
          (right
           (cond
            ((eq? right 'quit) (stop-engine! eng) #t)
-           (else (dispatch! eng cascade! (apply-filter eng right)))))
+           (else
+            (let* ((m (apply-filter eng right))
+                   (cmd (and m (cascade! eng m))))
+              (run-cmd! eng cmd) #t))))
          (else
           (let ((action (try-keymap-stack! eng msg)))
             (cond
              ((eq? action 'pending) #f)
              ((eq? action 'quit) (stop-engine! eng) #t)
-             (action (dispatch! eng cascade! (apply-filter eng action)))
-             (else   (dispatch! eng route-to-focus! (apply-filter eng msg))))))))))
+             (action (let* ((m (apply-filter eng action))
+                            (cmd (and m (cascade! eng m))))
+                       (run-cmd! eng cmd) #t))
+             (else (let* ((m (apply-filter eng msg))
+                          (cmd (and m (route-to-focus! eng m))))
+                     (run-cmd! eng cmd) #t)))))))))
    ((and (mouse? msg) (eq? (mouse-action msg) 'motion))
     ;; Motion always updates the tracked cursor (for hover restyle). If
     ;; a button is held (low 2 bits != 3 = "no button"), also route to
@@ -1111,29 +1121,48 @@ Routing policy:
     ;; stops at the position update.
     (let ((moved? (note-mouse-pos! eng msg))
           (drag?  (not (= 3 (logand (mouse-button msg) 3)))))
-      (let ((changed?
-             (and drag?
-                  (dispatch! eng route-to-focus! (apply-filter eng msg)))))
-        (or moved? changed?))))
+      (when drag?
+        (let* ((m   (apply-filter eng msg))
+               (cmd (and m (route-to-focus! eng m))))
+          (run-cmd! eng cmd)))
+      (or moved? drag?)))
    ((and (key? msg)
          (pair? (engine-focus-chain eng))
          (pair? (cdr (engine-focus-chain eng))))
+    ;; A widget is focused.  Consult the scoped+global keymap stack
+    ;; first; an action match wins.  If nothing matches, the raw key
+    ;; routes down the focus chain to the focused widget's update.
     (let ((action (try-keymap-stack! eng msg)))
       (cond
        ((eq? action 'pending) #f)
        ((eq? action 'quit) (stop-engine! eng) #t)
-       (action (dispatch! eng cascade! (apply-filter eng action)))
-       (else   (dispatch! eng route-to-focus! (apply-filter eng msg))))))
+       (action
+        (let* ((m (apply-filter eng action))
+               (cmd (and m (cascade! eng m))))
+          (run-cmd! eng cmd) #t))
+       (else
+        (let* ((m (apply-filter eng msg))
+               (cmd (and m (route-to-focus! eng m))))
+          (run-cmd! eng cmd) #t)))))
    ((or (key? msg) (mouse? msg))
     (when (mouse? msg) (note-mouse-pos! eng msg))
     (let ((action (try-keymap-stack! eng msg)))
       (cond
        ((eq? action 'pending) #f)
        ((eq? action 'quit) (stop-engine! eng) #t)
-       (action (dispatch! eng cascade! (apply-filter eng action)))
-       (else   (dispatch! eng route-to-focus! (apply-filter eng msg))))))
+       (action (let* ((m (apply-filter eng action))
+                      (cmd (and m (cascade! eng m))))
+                 (run-cmd! eng cmd)
+                 #t))
+       (else (let* ((m (apply-filter eng msg))
+                    (cmd (and m (route-to-focus! eng m))))
+               (run-cmd! eng cmd)
+               #t)))))
    (else
-    (dispatch! eng cascade! (apply-filter eng msg)))))
+    (let* ((m (apply-filter eng msg))
+           (cmd (and m (cascade! eng m))))
+      (run-cmd! eng cmd)
+      #t))))
 
 (define +resize-debounce-seconds+ 0.05)
 

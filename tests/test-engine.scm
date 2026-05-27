@@ -71,7 +71,7 @@
 ;; `(cons m thunk)` with m unchanged but a cmd to fire — losing that
 ;; cmd silently broke every action that didn't change state (login,
 ;; menu selection, etc.).
-(define-class <child> (<widget>))
+(define-class <child> (<focusable>))
 
 (define %emitted-cmd 'fire-me)
 

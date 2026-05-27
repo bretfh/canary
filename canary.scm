@@ -14,7 +14,7 @@
   #:use-module (canary widget)
 
   #:re-export
-  (<widget> widget-id update-slots
+  (<focusable> widget-id update-slots
    run-app start-engine! send
    <log-entry> log-entry? log-entry-time log-entry-source
    log-entry-level log-entry-text engine-log!

@@ -18,7 +18,7 @@
             textinput-mask?
             textinput-focused?))
 
-(define-class <textinput> (<widget>)
+(define-class <textinput> (<focusable>)
   (value       #:init-keyword #:value       #:init-value ""
                #:getter textinput-value)
   (cursor      #:init-keyword #:cursor      #:init-value 0

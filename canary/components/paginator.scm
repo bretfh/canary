@@ -20,7 +20,7 @@
             paginator-on-last-page?
             paginator-get-slice-bounds))
 
-(define-class <paginator> (<widget>)
+(define-class <paginator> (<focusable>)
   (type          #:init-keyword #:type          #:init-value 'arabic
                  #:getter paginator-type)
   (page          #:init-keyword #:page          #:init-value 0

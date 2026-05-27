@@ -42,7 +42,7 @@ LABEL.  Use `make-menu-item` directly for a non-leading hotkey."
   (make-menu-item label action
                   (char-downcase (string-ref label 0))))
 
-(define-class <menu> (<widget>)
+(define-class <menu> (<focusable>)
   (items       #:init-keyword #:items       #:init-value '()           #:getter menu-items)
   (focus       #:init-keyword #:focus       #:init-value 0             #:getter menu-focus)
   (title       #:init-keyword #:title       #:init-value #f            #:getter menu-title)

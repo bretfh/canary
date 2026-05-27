@@ -68,7 +68,7 @@ The sections below cover each piece.
 ```scheme
 (use-modules (canary) (oop goops))
 
-(define-class <counter> (<widget>)
+(define-class <counter> (<focusable>)
   (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
 
 (define-method (view (c <counter>))
@@ -98,7 +98,7 @@ view   : (lambda (self)     -> node)
 update : (lambda (self msg) -> (cons next-self cmd-or-#f))   ; optional
 ```
 
-Stateful nodes inherit from `<widget>` so they carry an
+Stateful nodes inherit from `<focusable>` so they carry an
 auto-generated identity slot the engine keys focus, mount/unmount,
 and per-widget subs by.  Read slots with their `#:getter`
 accessors; build the next state with `update-slots`.
@@ -119,7 +119,7 @@ For widgets that need to *read* the terminal size (animation budgets,
 viewport sizing), capture `<resize>` into a slot:
 
 ```scheme
-(define-class <my-app> (<widget>)
+(define-class <my-app> (<focusable>)
   (cols #:init-value 80 #:getter my-cols)
   (rows #:init-value 24 #:getter my-rows)
   ...)
@@ -160,7 +160,7 @@ it finds. Every layout primitive accepts widgets and layout records
 interchangeably.
 
 ```scheme
-(define-class <chat> (<widget>)
+(define-class <chat> (<focusable>)
   (lines #:init-value '()             #:getter chat-lines)
   (input #:init-form (textinput) #:getter chat-input))
 
@@ -417,7 +417,7 @@ The shape every non-trivial canary app converges on:
 
 ```scheme
 ;;; Root: holds the active scene, swaps it on <scene-change>.
-(define-class <app> (<widget>)
+(define-class <app> (<focusable>)
   (scene #:init-keyword #:scene #:getter app-scene))
 
 (define-method (view (a <app>))
@@ -431,7 +431,7 @@ The shape every non-trivial canary app converges on:
   (cons (update-slots a #:scene (scene-change-scene msg)) #f))
 
 ;;; Each scene owns its keymap and wraps its own view.
-(define-class <auth> (<widget>)
+(define-class <auth> (<focusable>)
   (menu #:init-form (menu #:items %auth-items) #:getter auth-menu))
 
 (define %auth-km
@@ -452,7 +452,7 @@ The shape every non-trivial canary app converges on:
 (define %pause-km
   (keymap (bind 'escape 'close-pause) (bind 'enter 'menu-select)))
 
-(define-class <canvas> (<widget>)
+(define-class <canvas> (<focusable>)
   (pause-menu #:init-value #f #:getter canvas-pause-menu))
 
 (define-method (view (c <canvas>))

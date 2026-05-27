@@ -14,7 +14,7 @@
             button-focused?
             button-border))
 
-(define-class <button> (<widget>)
+(define-class <button> (<focusable>)
   (label        #:init-keyword #:label        #:init-value ""
                 #:getter button-label)
   (action       #:init-keyword #:action       #:init-value #f

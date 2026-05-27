@@ -34,7 +34,7 @@
 
 (define-class <bot-tick> ())
 
-(define-class <chat> (<widget>)
+(define-class <chat> (<focusable>)
   (history  #:init-form (viewport #:step 1 #:from 'bottom)
             #:getter chat-history)
   (input    #:init-form (textinput #:prompt "> "
