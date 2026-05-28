@@ -31,7 +31,9 @@
             render-cmds-to-term!
             request-window-size!
             stats
-            reset-stats!))
+            reset-stats!
+            profile-frames?
+            profile-frames!))
 
 (define-class <ansi-backend> (<backend>)
   (port      #:init-keyword #:port  #:accessor ansi-backend-port)
@@ -648,6 +650,17 @@ cur exists at the wrong size and prev needs (re)allocation."
       (set! (ansi-backend-prev-term b)
             (t:make-term #:width w #:height h))))))
 
+(define %profile-frames?
+  (let ((v (getenv "CANARY_PROFILE_FRAMES")))
+    (and v (not (string=? v "")) (not (string=? v "0")))))
+
+(define (profile-frames?) %profile-frames?)
+(define (profile-frames! flag) (set! %profile-frames? (and flag #t)))
+
+(define (now-ms)
+  (* 1000.0 (/ (get-internal-real-time)
+               internal-time-units-per-second)))
+
 (define-method (backend-draw (b <ansi-backend>) cmds)
   "Render frame CMDS on backend B: partition graphics vs grid cmds,
 replay grid cmds onto B's current term, diff against the previous
@@ -658,7 +671,8 @@ the next frame diffs against this one."
          (cur-sz (ansi-backend-size b))
          (w    (if sz (size-width sz)  (size-width cur-sz)))
          (h    (if sz (size-height sz) (size-height cur-sz)))
-         (out  (ansi-backend-port b)))
+         (out  (ansi-backend-port b))
+         (t-compose-start (and %profile-frames? (now-ms))))
     (ensure-term-size! b w h)
     (let ((cur  (ansi-backend-cur-term b))
           (prev (ansi-backend-prev-term b)))
@@ -693,9 +707,17 @@ the next frame diffs against this one."
             (display diff buf)
             (when (pair? gfx-cmds) (emit-images! b buf gfx-cmds))
             (display +sync-end+ buf)
-            (let ((frame (get-output-string buf)))
+            (let* ((frame (get-output-string buf))
+                   (t-flush-start (and %profile-frames? (now-ms))))
               (display frame out)
               (force-output out)
+              (when %profile-frames?
+                (let ((compose-ms (- t-flush-start t-compose-start))
+                      (flush-ms   (- (now-ms) t-flush-start)))
+                  (format (current-error-port)
+                          "[frame] compose=~,1fms flush=~,1fms bytes=~a~%"
+                          compose-ms flush-ms (string-length frame))
+                  (force-output (current-error-port))))
               (set! (ansi-backend-bytes-out b)
                     (+ (ansi-backend-bytes-out b) (string-length frame))))
             (set! (ansi-backend-frames b)
