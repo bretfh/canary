@@ -17,6 +17,7 @@
                                             clear-log resumed
                                             focus focus? focus-target
                                             cancel cancel? cancel-id))
+  #:use-module ((canary key) #:select (key-event key=?))
   #:use-module (canary input)
   #:use-module (canary backend)
   #:use-module (canary backend-ansi)
@@ -44,6 +45,10 @@
   #:use-module (ice-9 binary-ports)
   #:use-module (rnrs bytevectors)
   #:use-module ((srfi srfi-1) #:select (take partition))
+  ;; Need srfi-1 list ops too, but `every`/`any`/`filter`/etc. would
+  ;; clash with canary/protocol's `every` (the timer cmd constructor).
+  ;; Prefix-import to keep them distinct.
+  #:use-module ((srfi srfi-1) #:prefix list/)
   #:use-module (srfi srfi-9)
   #:use-module (system foreign)
   #:use-module (oop goops)
@@ -775,6 +780,193 @@ Three contribution sources:
         ;; (closest to focus = highest priority).
         (reverse collected))))))
 
+;;; ── chord / combo handling ─────────────────────────────────────────
+;;;
+;;; Two kinds of keymap entries: <binding> (sequential, vim-style) and
+;;; <combo-binding> (set, fires when all combo keys are held at once
+;;; when one of them is pressed).  The engine sees the kitty keyboard
+;;; protocol's press / release events (canary pushes flag bit 2 in
+;;; backend-init) and tracks a held-set keyed by current time.  On
+;;; press of a key K:
+;;;
+;;;   1. Add K to held.
+;;;   2. If held exactly matches some combo's key-set → fire combo.
+;;;   3. Else if some combo's key-set ⊋ held (a longer combo could
+;;;      complete) AND K has a single-key action → defer that single
+;;;      action.  Schedule an after-cmd timer; the timer's msg flushes
+;;;      the pending action.  If a completing key arrives first, the
+;;;      timer is cancelled and the combo fires instead.
+;;;   4. Else fire single key normally.
+;;;
+;;; Release events drop K from held immediately.  On terminals without
+;;; kitty release support, the held-set also self-prunes by time so a
+;;; key that was pressed but no release ever arrived ages out after
+;;; %chord-window-seconds.
+
+;; Held-set safety net: only used when the terminal doesn't send a key-
+;; release event for a key (legacy paths).  Real terminals on the kitty
+;; keyboard protocol drive add/remove via press/release directly, and
+;; this window is moot.  Keep it long enough that a held key isn't
+;; pruned mid-chord even on slow paths.
+(define %chord-window-seconds 5.0)
+;; Defer window for a single-key action when a combo could still
+;; complete.  100 ms covers a deliberate two-finger chord press
+;; (humans land paired keys within 50–100 ms) while still firing the
+;; single before the terminal's first key-repeat (~250 ms on Linux).
+;; Tap-to-fire is immediate via the release event; this only matters
+;; for the rare case where the user neither releases nor presses a
+;; second key for 100 ms.
+(define %chord-defer-ms       100)
+(define %pending-flush-msg    'canary/chord-pending-flush)
+
+(define (held-syms-of eng)
+  "Return the list of <key>s currently held (just the keys, time
+stripped)."
+  (map car (engine-held-keys eng)))
+
+(define (prune-held! eng)
+  "Drop held entries older than the chord window.  Belt-and-braces for
+terminals that don't send release events."
+  (let* ((now (current-time))
+         (kept (list/filter (lambda (entry)
+                              (<= (- now (cdr entry)) %chord-window-seconds))
+                            (engine-held-keys eng))))
+    (set-engine-held-keys! eng kept)))
+
+(define (add-to-held! eng k)
+  "Add K to held with the current time, replacing any prior entry for
+the same key."
+  (let* ((others (list/filter (lambda (entry) (not (key=? (car entry) k)))
+                              (engine-held-keys eng))))
+    (set-engine-held-keys! eng (cons (cons k (current-time)) others))))
+
+(define (remove-from-held! eng k)
+  (set-engine-held-keys! eng
+    (list/filter (lambda (entry) (not (key=? (car entry) k)))
+                 (engine-held-keys eng))))
+
+(define (combo-strict-superset? combo-key-list held-keys)
+  "True if COMBO-KEY-LIST contains every key in HELD-KEYS and has at
+least one additional key — i.e., this combo could complete if more
+keys joined HELD-KEYS."
+  (and (> (length combo-key-list) (length held-keys))
+       (list/every (lambda (h) (list/any (lambda (c) (key=? c h))
+                                          combo-key-list))
+                   held-keys)))
+
+(define (find-combo-action-on-stack eng held)
+  "Walk the scoped + global keymap stack; return the first matching
+combo action against HELD, or #f."
+  (let* ((scoped (collect-keymaps-on-focus-path eng))
+         (global (engine-keymap eng))
+         (stack  (append scoped (if global (list global) '()))))
+    (let lp ((rest stack))
+      (cond
+       ((null? rest) #f)
+       ((keymap-match-combo (car rest) held) =>
+        (lambda (action) action))
+       (else (lp (cdr rest)))))))
+
+(define (combo-possible-on-stack? eng held)
+  "Return #t if any combo in the active keymap stack has a key-set
+that strictly contains HELD — a press of one more key could complete
+that combo."
+  (let* ((scoped (collect-keymaps-on-focus-path eng))
+         (global (engine-keymap eng))
+         (stack  (append scoped (if global (list global) '())))
+         (all-combos (list/append-map keymap-combos stack)))
+    (list/any (lambda (c) (combo-strict-superset? (combo-keys c) held))
+              all-combos)))
+
+(define (cancel-pending-sub! eng)
+  (let ((sid (engine-pending-sub-id eng)))
+    (when sid (cancel-sub! eng sid)))
+  (set-engine-pending-sub-id! eng #f))
+
+(define (clear-pending! eng)
+  "Drop pending state without firing.  Used when a combo subsumes the
+deferred single."
+  (cancel-pending-sub! eng)
+  (set-engine-pending-key!    eng #f)
+  (set-engine-pending-action! eng #f))
+
+(define (fire-pending! eng)
+  "Fire any pending single-key action via cascade; clear pending state.
+No-op if nothing is pending."
+  (let ((action (engine-pending-action eng)))
+    (cancel-pending-sub! eng)
+    (set-engine-pending-key!    eng #f)
+    (set-engine-pending-action! eng #f)
+    (when action
+      (dispatch! eng cascade! (apply-filter eng action)))))
+
+(define (schedule-pending-flush! eng)
+  "Install an after-cmd that re-enqueues %pending-flush-msg after
+%chord-defer-ms; remember its id so a completing combo or release can
+cancel it."
+  (let ((sid (gensym "canary/chord-")))
+    (set-engine-pending-sub-id! eng sid)
+    (run-cmd! eng
+              (list 'after (/ %chord-defer-ms 1000)
+                    (lambda () %pending-flush-msg)
+                    sid))))
+
+(define (dispatch-keymap-or-raw! eng msg)
+  "Standard key dispatch: try the keymap stack, route to focus on no
+match.  Returns #t if anything changed."
+  (let ((action (try-keymap-stack! eng msg)))
+    (cond
+     ((eq? action 'pending) #f)
+     ((eq? action 'quit) (stop-engine! eng) #t)
+     (action (dispatch! eng cascade! (apply-filter eng action)))
+     (else   (dispatch! eng route-to-focus! (apply-filter eng msg))))))
+
+(define (handle-key-press! eng msg)
+  "Chord-aware press handling.  Returns whether anything changed."
+  (prune-held! eng)
+  (add-to-held! eng msg)
+  (let ((held (held-syms-of eng)))
+    (cond
+     ;; Exact combo match — fires immediately, drops any pending single.
+     ;; Also drops the held-set: the two keys have been "consumed" by the
+     ;; combo, so a stale entry (e.g. on terminals that don't send a
+     ;; release event for the key) won't accidentally re-fire the same
+     ;; combo on the next press.
+     ((find-combo-action-on-stack eng held) =>
+      (lambda (action)
+        (clear-pending! eng)
+        (set-engine-held-keys! eng '())
+        (cond
+         ((eq? action 'quit) (stop-engine! eng) #t)
+         (else (dispatch! eng cascade! (apply-filter eng action))))))
+     ;; A larger combo could still complete — defer this key's single
+     ;; action if there is one, otherwise fall through.
+     ((combo-possible-on-stack? eng held)
+      (fire-pending! eng)
+      (let ((action (try-keymap-stack! eng msg)))
+        (cond
+         ((eq? action 'pending) #f)
+         ((eq? action 'quit) (stop-engine! eng) #t)
+         (action
+          (set-engine-pending-key!    eng msg)
+          (set-engine-pending-action! eng action)
+          (schedule-pending-flush! eng)
+          #t)
+         (else
+          (dispatch! eng route-to-focus! (apply-filter eng msg))))))
+     ;; No combo at play — drop any stale pending, dispatch normally.
+     (else
+      (fire-pending! eng)
+      (dispatch-keymap-or-raw! eng msg)))))
+
+(define (handle-key-release! eng msg)
+  "Drop K from held.  If K was the deferred single, fire it now (the
+user clearly released without forming a combo)."
+  (remove-from-held! eng msg)
+  (let ((pk (engine-pending-key eng)))
+    (when (and pk (key=? pk msg))
+      (fire-pending! eng))))
+
 (define (try-keymap-stack! eng msg)
   "Feed MSG through the active keymap stack: scoped keymaps collected
 on the focus path (innermost first), then the engine global keymap.
@@ -1120,26 +1312,34 @@ Routing policy:
              (and drag?
                   (dispatch! eng route-to-focus! (apply-filter eng msg)))))
         (or moved? changed?))))
+   ;; Chord-aware key handling.  Releases drop from held-set + flush
+   ;; pending single; repeats fire immediately bypassing the chord
+   ;; defer (user is intentionally holding); presses go through the
+   ;; combo-or-defer path.
+   ((and (key? msg) (eq? (key-event msg) 'release))
+    (handle-key-release! eng msg)
+    #t)
+   ((and (key? msg) (eq? (key-event msg) 'repeat))
+    ;; Repeat = key is being held.  Drop any pending defer for it
+    ;; (the user has committed) and fire the single immediately so
+    ;; hold-to-move stays snappy.  Combo detection on repeat is
+    ;; suppressed — it'd re-fire the same combo every repeat tick.
+    (clear-pending! eng)
+    (dispatch-keymap-or-raw! eng msg))
+   ((eq? msg %pending-flush-msg)
+    ;; The chord defer-window expired without a completing key —
+    ;; commit the pending single-key action.
+    (fire-pending! eng)
+    #t)
    ((and (key? msg)
          (pair? (engine-focus-chain eng))
          (pair? (cdr (engine-focus-chain eng))))
-    ;; A widget is focused.  Consult the scoped+global keymap stack
-    ;; first; an action match wins.  If nothing matches, the raw key
-    ;; routes down the focus chain to the focused widget's update.
-    (let ((action (try-keymap-stack! eng msg)))
-      (cond
-       ((eq? action 'pending) #f)
-       ((eq? action 'quit) (stop-engine! eng) #t)
-       (action (dispatch! eng cascade! (apply-filter eng action)))
-       (else   (dispatch! eng route-to-focus! (apply-filter eng msg))))))
-   ((or (key? msg) (mouse? msg))
-    (when (mouse? msg) (note-mouse-pos! eng msg))
-    (let ((action (try-keymap-stack! eng msg)))
-      (cond
-       ((eq? action 'pending) #f)
-       ((eq? action 'quit) (stop-engine! eng) #t)
-       (action (dispatch! eng cascade! (apply-filter eng action)))
-       (else   (dispatch! eng route-to-focus! (apply-filter eng msg))))))
+    (handle-key-press! eng msg))
+   ((key? msg)
+    (handle-key-press! eng msg))
+   ((mouse? msg)
+    (note-mouse-pos! eng msg)
+    (dispatch-keymap-or-raw! eng msg))
    (else
     (dispatch! eng cascade! (apply-filter eng msg)))))
 

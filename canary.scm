@@ -36,7 +36,7 @@
    <palette> palette palette?
    default-theme
 
-   <keymap> keymap keymap? bind keymap-step keymap-reset
+   <keymap> keymap keymap? bind combo keymap-step keymap-reset
 
    txt vbox hbox spacer join pad margin align width height fill
    place-cursor pin overlay static image on-click on-hover link

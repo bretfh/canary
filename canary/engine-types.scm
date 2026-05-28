@@ -30,7 +30,11 @@
             engine-subs
             engine-resize-channel
             engine-live-widgets set-engine-live-widgets!
-            engine-widget-subs))
+            engine-widget-subs
+            engine-held-keys    set-engine-held-keys!
+            engine-pending-key  set-engine-pending-key!
+            engine-pending-action set-engine-pending-action!
+            engine-pending-sub-id set-engine-pending-sub-id!))
 
 (define-record-type <engine>
   (%make-engine backend theme keymap title mouse-mode cursor alt-screen?
@@ -38,7 +42,8 @@
                 stop-ch click-regions mouse-x mouse-y
                 log-entries log-cap show-log? log-height-frac
                 focus-chain subs resize-channel
-                live-widgets widget-subs)
+                live-widgets widget-subs
+                held-keys pending-key pending-action pending-sub-id)
   engine?
   (backend     engine-backend         set-engine-backend!)
   (theme       engine-theme           set-engine-theme!)
@@ -65,7 +70,18 @@
   (subs        engine-subs)
   (resize-channel engine-resize-channel)
   (live-widgets engine-live-widgets   set-engine-live-widgets!)
-  (widget-subs  engine-widget-subs))
+  (widget-subs  engine-widget-subs)
+  ;; Chord/combo state.  HELD-KEYS is a list of (cons <key> press-time)
+  ;; — the press-time lets the engine prune stale entries on legacy
+  ;; terminals that don't send key-release events.  PENDING-KEY +
+  ;; PENDING-ACTION + PENDING-SUB-ID let the engine defer a single-key
+  ;; action while a combo is still possible: the sub-id is an after-cmd
+  ;; timer that flushes the pending action if no completing key arrives
+  ;; within the chord window.
+  (held-keys     engine-held-keys     set-engine-held-keys!)
+  (pending-key   engine-pending-key   set-engine-pending-key!)
+  (pending-action engine-pending-action set-engine-pending-action!)
+  (pending-sub-id engine-pending-sub-id set-engine-pending-sub-id!))
 
 (define* (engine #:key backend theme keymap title (mouse-mode 'off)
                       (cursor 'hidden) (alt-screen? #t) filter root
@@ -83,4 +99,5 @@ trackers) starts empty."
                 filter root #t '() (make-mutex) msg-bell
                 stop-ch '() -1 -1 '() log-cap show-log? log-height-frac
                 '() (make-hash-table) resize-channel
-                (make-hash-table) (make-hash-table)))
+                (make-hash-table) (make-hash-table)
+                '() #f #f #f))

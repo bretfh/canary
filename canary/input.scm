@@ -1,4 +1,6 @@
 (define-module (canary input)
+  #:use-module (oop goops)
+  #:use-module ((canary key) #:select (<key>))
   #:use-module (canary protocol)
   #:use-module (ice-9 textual-ports)
   #:use-module ((fibers operations) #:select (perform-operation choice-operation))
@@ -172,28 +174,37 @@ than a rest arg."
   (apply key sym mods))
 
 (define (read-csi-params-and-final port first-char)
-  "Already consumed FIRST-CHAR (a digit). Read remaining digits + ';'
-separators until a non-numeric / non-';' terminator. Return (values
-params final-char). Each param is a number or #f for missing.
-Returns (#f #f) if the stream ends before a terminator."
-  (let loop ((cur (list first-char)) (params '()))
+  "Already consumed FIRST-CHAR (a digit). Read remaining digits, ';'
+top-level separators, and ':' subparam separators until a non-numeric
+non-';' non-':' terminator. Returns (values params final-char). Each
+param is either a single integer (no subparams) or a list of integers
+(with subparams, e.g. `1:3` becomes (1 3)).  Missing numerics become
+#f.  Returns (#f #f) if the stream ends before a terminator."
+  (let loop ((cur (list first-char))    ; chars of current subvalue
+             (subs '())                 ; finished subvalues in current param (reversed)
+             (params '()))               ; finished top-level params (reversed)
+    (define (current-sub)
+      (if (null? cur) #f
+          (string->number (list->string cur))))
+    (define (close-param)
+      (let ((all (reverse (cons (current-sub) subs))))
+        (if (and (pair? all) (null? (cdr all)))
+            (car all)                   ; single subvalue → integer
+            all)))                      ; multiple → list
     (cond
      ((not (char-ready? port))
       (values #f #f))
      (else
       (let ((c (read-char port)))
         (cond
-         ((char-numeric? c) (loop (append cur (list c)) params))
+         ((char-numeric? c)
+          (loop (append cur (list c)) subs params))
+         ((char=? c #\:)
+          (loop '() (cons (current-sub) subs) params))
          ((char=? c #\;)
-          (loop '() (cons (if (null? cur) #f
-                              (string->number (list->string cur)))
-                          params)))
+          (loop '() '() (cons (close-param) params)))
          (else
-          (let ((final-params
-                 (reverse (cons (if (null? cur) #f
-                                    (string->number (list->string cur)))
-                                params))))
-            (values final-params c)))))))))
+          (values (reverse (cons (close-param) params)) c))))))))
 
 (define (parse-csi-sequence port)
   "Parse a CSI (Control Sequence Introducer) sequence after ESC[
@@ -292,15 +303,32 @@ Falls back to integer->char for anything else."
 
 (define (parse-kitty-key params)
   "Build a <key> from a kitty CSI-u parameter list PARAMS.  Shape:
-`(codepoint [modifiers [text-codepoints ...]])`.  Subparams (the
-`:event-type` form) aren't enabled by canary's flag set, so this
-treats every event as a press."
-  (let* ((cp  (and (pair? params) (car params)))
-         (mod (and (pair? params) (pair? (cdr params)) (cadr params))))
+`(codepoint [modifiers[:event-type[:text-codepoints]]] [text…])`.
+Backend pushes flag bit 2 (report event types), so the modifier
+param can be a list `(modN event-type)` where event-type is 1=press,
+2=repeat, 3=release.  Sets the returned <key>'s event slot
+accordingly."
+  (let* ((cp        (and (pair? params)
+                         (let ((p (car params)))
+                           (if (pair? p) (car p) p))))
+         (mod-param (and (pair? params) (pair? (cdr params)) (cadr params)))
+         (mod-bits  (cond ((not mod-param) 1)
+                          ((pair? mod-param) (or (car mod-param) 1))
+                          (else mod-param)))
+         (event-id  (cond ((and (pair? mod-param) (pair? (cdr mod-param)))
+                           (cadr mod-param))
+                          (else 1)))
+         (event-sym (case event-id
+                      ((2) 'repeat)
+                      ((3) 'release)
+                      (else 'press))))
     (cond
      ((not cp) (key 'unknown))
-     (else (make-key (kitty-codepoint->sym cp)
-                     (kitty-mods->mods (or mod 1)))))))
+     (else
+      (make <key>
+        #:sym   (kitty-codepoint->sym cp)
+        #:mods  (kitty-mods->mods (or mod-bits 1))
+        #:event event-sym)))))
 
 (define (parse-ss3-sequence port)
   "Parse an SS3 (Single Shift 3) sequence after ESC O has been

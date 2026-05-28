@@ -744,7 +744,13 @@ terminal size."
   (let ((out (ansi-backend-port b)))
     (display "\x1b[?1004h" out)  ; focus reporting on
     (display "\x1b[?2004h" out)  ; bracketed paste on
-    (display "\x1b[>5u"    out)  ; kitty kbd: push flags 1+4 (disambiguate + report alternate keys)
+    ;; kitty kbd: push flags 1+2+4+8 (disambiguate + report event types
+    ;; + report alternate keys + report all keys as escape codes).
+    ;; Bit 8 is what makes plain letter keys (WASD!) arrive as CSI
+    ;; sequences with press/repeat/release info instead of bare UTF-8
+    ;; characters — without it, the engine never sees release events
+    ;; for letters and can't track which keys are simultaneously held.
+    (display "\x1b[>15u"   out)
     (force-output out))
   (set! (graphics? b) (detect-kitty-graphics! b))
   (hash-clear! (ansi-backend-image-ids b))
