@@ -5,6 +5,26 @@ Changes are listed newest-first.  Format follows
 
 ## 1.0.0 — unreleased
 
+### Added
+
+- **`tools/build/` — `canary-build`, the single-file static-binary
+  build tool.**  Wraps a `guix shell` static toolchain (libguile-3.0
+  + bdw-gc + libffi + gmp + libunistring + libltdl, all static, plus
+  guile-fibers with its epoll C extension statically linked) and a
+  Zig-driven link step.  App authors write a `canary-app.scm`
+  manifest; `canary-build ship` walks the project, stages canary +
+  fibers + the app, and produces a `dist/<name>` ELF — typically
+  15-20 MB, `NEEDED` is only `libc/libm/ld-linux`.
+
+  The runtime installs an in-memory `try-module-autoload` override on
+  the `(guile)` module; module bytes come from a build-time-generated
+  `embed.zig` table baked into `.rodata`.  No cache dir, no XDG
+  paths touched, no disk artefacts after the run.  See `SHIPPING.md`
+  for the model, `tools/build/README.md` for the quickstart.
+
+  Linux x86_64 only this release.  macOS and user-declared extra C
+  extensions deferred.
+
 ### Changed (breaking)
 
 - **Stateful nodes return their next state.**  `update` is now a

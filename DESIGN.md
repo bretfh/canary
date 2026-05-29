@@ -21,6 +21,12 @@ Styling attributes are individual flags: `#:bold`, `#:italic`,
 
 ## API
 
+Dev loop is `guile -L /path/to/canary myapp.scm`. Live-coding via
+geiser, evaluate forms into a running app, etc. — the live-coding
+section near the bottom of this doc covers it. Shipping a finished
+app to end users without making them install Guile is covered in
+`SHIPPING.md` and isn't a topic here.
+
 ```scheme
 (use-modules (canary))
 ```

@@ -1,7 +1,9 @@
 # canary
 
 elm/tea inspired tui in guile. see `DESIGN.md` for architecture,
-`examples/canary-tweet.scm` for a worked example.
+`examples/canary-tweet.scm` for a worked example, `SHIPPING.md` for
+producing single-file binaries of canary apps that run on machines
+with no Guile installed.
 
 ![canary](canary.png)
 
@@ -41,7 +43,9 @@ guile -L . examples/canary-tweet.scm
 
 | target         |                                                   |
 |----------------|---------------------------------------------------|
-| `make compile` | guild compile `canary/*.scm` to `build/canary/*.go` |
-| `make test`    | run `tests/test-*.scm` under srfi-64              |
-| `make lint`    | reject ansi escapes outside backend-ansi/terminal |
-| `make repl`    | `guile --listen=37147` for geiser                 |
+| `make compile`      | guild compile `canary/*.scm` to `build/canary/*.go` |
+| `make test`         | run `tests/test-*.scm` under srfi-64              |
+| `make lint`         | reject ansi escapes outside backend-ansi/terminal |
+| `make repl`         | `guile --listen=37147` for geiser                 |
+| `make tool-install` | install `canary-build` into `~/.local/bin/`; see `SHIPPING.md` |
+| `make tool-test`    | smoke `canary-build ship` against the counter example |
