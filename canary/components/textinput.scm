@@ -67,13 +67,14 @@ next sibling, which is exactly where we want the caret."
     (define cursor-mark (place-cursor 0 0 #:style 'block))
     (cond
      ((string-null? val)
-      ;; Empty field: prompt + (cursor at this column if focused)
-      ;; + cursor-cell + placeholder.
+      ;; Empty field: prompt + (cursor when focused) + placeholder.
+      ;; Unfocused empty input shows just the placeholder (no trailing
+      ;; reverse-video cell that reads as a stray black square in the
+      ;; UI).
       (if focused?
           (hbox (txt prompt) cursor-mark
                 (txt " " #:reverse) (txt ph #:fg 'placeholder))
-          (hbox (txt prompt)
-                (txt " " #:reverse) (txt ph #:fg 'placeholder))))
+          (hbox (txt prompt) (txt ph #:fg 'placeholder))))
      (else
       (let* ((start   (max 0 (- cur (- w 5))))
              (visible (if (> (string-length val) w)
@@ -93,8 +94,11 @@ next sibling, which is exactly where we want the caret."
             (hbox (txt prompt) (txt left) cursor-mark
                   (txt cell #:reverse) (txt right))))
          (else
-          ;; Unfocused with content: cursor cell at the trailing edge.
-          (hbox (txt prompt) (txt visible) (txt " " #:reverse)))))))))
+          ;; Unfocused with content: just the prompt + value, no
+          ;; trailing block.  The previous reverse-video cell was a
+          ;; "where the cursor would land" affordance but visually
+          ;; reads as a stray square.
+          (hbox (txt prompt) (txt visible)))))))))
 
 (define-method (update (ti <textinput>) (msg <focus-in>))
   "Engine dispatches <focus-in> when this textinput joins the focus

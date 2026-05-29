@@ -303,18 +303,35 @@ Falls back to integer->char for anything else."
 
 (define (parse-kitty-key params)
   "Build a <key> from a kitty CSI-u parameter list PARAMS.  Shape:
-`(codepoint [modifiers[:event-type[:text-codepoints]]] [text…])`.
+`(codepoint[:alternate[:base]] [modifiers[:event-type[:text-codepoints]]] [text…])`.
+The first subparam carries (base shifted) when the alternate-keys
+flag is on; when shift is part of the modifier set, use the
+shifted codepoint so Shift+a -> A reaches the textinput as the
+upper-case form instead of the lower-case form.
 Backend pushes flag bit 2 (report event types), so the modifier
 param can be a list `(modN event-type)` where event-type is 1=press,
 2=repeat, 3=release.  Sets the returned <key>'s event slot
 accordingly."
-  (let* ((cp        (and (pair? params)
-                         (let ((p (car params)))
-                           (if (pair? p) (car p) p))))
+  (let* ((first     (and (pair? params) (car params)))
+         (cp-base   (cond ((pair? first) (car first))
+                          (else first)))
+         (cp-shift  (and (pair? first) (pair? (cdr first)) (cadr first)))
          (mod-param (and (pair? params) (pair? (cdr params)) (cadr params)))
          (mod-bits  (cond ((not mod-param) 1)
                           ((pair? mod-param) (or (car mod-param) 1))
                           (else mod-param)))
+         (mods      (kitty-mods->mods (or mod-bits 1)))
+         (shift?    (and (memq 'shift mods) #t))
+         (cp        (cond
+                     ;; Shift held + terminal reported an alternate
+                     ;; (shifted) codepoint: use the shifted form so
+                     ;; Shift+a is 'A and Shift+1 is '! at the key
+                     ;; layer.  Reporting the shift mod alongside is
+                     ;; redundant for self-inserting keys but harmless;
+                     ;; chord / hot-letter binds compare by sym, so
+                     ;; the upper-case sym is what they need anyway.
+                     ((and shift? cp-shift) cp-shift)
+                     (else cp-base)))
          (event-id  (cond ((and (pair? mod-param) (pair? (cdr mod-param)))
                            (cadr mod-param))
                           (else 1)))
@@ -327,7 +344,7 @@ accordingly."
      (else
       (make <key>
         #:sym   (kitty-codepoint->sym cp)
-        #:mods  (kitty-mods->mods (or mod-bits 1))
+        #:mods  mods
         #:event event-sym)))))
 
 (define (parse-ss3-sequence port)
