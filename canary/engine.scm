@@ -16,6 +16,8 @@
                                             println suspend exec set-palette cycle-palette
                                             clear-log resumed
                                             focus focus? focus-target
+                                            focus-in focus-in?
+                                            focus-out focus-out?
                                             cancel cancel? cancel-id))
   #:use-module ((canary key) #:select (<key> key-sym key-mods key-event key=?))
   #:use-module (canary input)
@@ -1182,8 +1184,28 @@ cancel, plus all screen and app cmds.  Unknown cmds are dropped."
                      ((not path) '())
                      (else (map widget-id
                                 (filter (lambda (n) (is-a? n <focusable>))
-                                        path))))))
-         (set-engine-focus-chain! eng ids)))
+                                        path)))))
+              (prev (engine-focus-chain eng)))
+         (set-engine-focus-chain! eng ids)
+         ;; Dispatch widget-level focus events to anything that just
+         ;; joined or just left the chain so its update method can
+         ;; mirror the change locally (e.g. textinput's focused? slot).
+         (for-each
+          (lambda (id)
+            (unless (member id prev)
+              (match (update-by-id eng (engine-root eng) id (focus-in))
+                ((new-root . cmd)
+                 (set-engine-root! eng new-root)
+                 (when cmd (run-cmd! eng cmd))))))
+          ids)
+         (for-each
+          (lambda (id)
+            (unless (member id ids)
+              (match (update-by-id eng (engine-root eng) id (focus-out))
+                ((new-root . cmd)
+                 (set-engine-root! eng new-root)
+                 (when cmd (run-cmd! eng cmd))))))
+          prev)))
       (('exec command on-done)
        (backend-shutdown (engine-backend eng))
        (let ((status (system command)))

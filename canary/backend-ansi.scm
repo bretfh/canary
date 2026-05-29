@@ -227,11 +227,27 @@ cmds use the registered fallback if graphics support is off."
            (t:term-goto! term (+ (fill-row cmd) r 1) (+ (fill-col cmd) 1))
            (t:term-write! term line))))
       ((cursor-cmd? cmd)
-       (t:term-goto! term (+ (cursor-row cmd) 1) (+ (cursor-col cmd) 1)))
+       ;; Defer to the end of the cmd list (handled below).  If
+       ;; processed here, any later text-cmd / cells-cmd would do its
+       ;; own term-goto and clobber the requested position.
+       #f)
       ((image-cmd? cmd)
        (render-cmds-to-term! term (image-cmd->fallback-cmds cmd) th))
       (else #f)))
-   cmds))
+   cmds)
+  ;; Apply the LAST cursor-cmd in render order, so the terminal's
+  ;; final cursor position is wherever the application asked for it
+  ;; (e.g. a textinput's place-cursor).  Multiple cursor-cmds: the
+  ;; latest one wins, matching the docstring on `place-cursor`.
+  (let ((last-cursor #f))
+    (for-each
+     (lambda (cmd)
+       (when (cursor-cmd? cmd) (set! last-cursor cmd)))
+     cmds)
+    (when last-cursor
+      (t:term-goto! term
+                    (+ (cursor-row last-cursor) 1)
+                    (+ (cursor-col last-cursor) 1)))))
 
 ;; Placement vector layout:
 ;;   #(placement-id img-id src src-x src-y src-w src-h w h px py)

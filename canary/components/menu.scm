@@ -130,8 +130,16 @@ already understood by the engine."
 (define-method (update (m <menu>) (msg <key>))
   "Navigate the menu with arrow keys, j/k, page-up/down; select via
 enter or a hot letter; emit `'menu-close` on escape so ancestors can
-react (clearing a pause-menu overlay slot, exiting auth, …)."
-  (let ((k (key-sym msg)))
+react (clearing a pause-menu overlay slot, exiting auth, …).
+
+Only acts on `'press` events.  Kitty's progressive-enhancement
+`report-event-types` flag also delivers `'release` and `'repeat`; a
+single tap on a terminal whose OS auto-repeat fires before release
+would otherwise cycle the menu twice."
+  (cond
+   ((not (eq? (key-event msg) 'press)) (cons m #f))
+   (else
+    (let ((k (key-sym msg)))
     (cond
      ((or (eq? k 'up)   (eqv? k #\k))
       (cons (update-slots m #:focus (mod-prev m)) #f))
@@ -153,4 +161,4 @@ react (clearing a pause-menu overlay slot, exiting auth, …)."
        ((find-hot m (char-downcase k))
         => (lambda (item) (cons m (fire-action (menu-item-action item)))))
        (else (cons m #f))))
-     (else (cons m #f)))))
+     (else (cons m #f)))))))

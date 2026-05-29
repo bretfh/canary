@@ -18,6 +18,8 @@
 
             <focus>   focused  focused?
             <blur>    blurred  blurred?
+            <focus-in>  focus-in  focus-in?
+            <focus-out> focus-out focus-out?
             <resume>  resumed  resumed?
 
             <paste>   paste    paste?
@@ -148,6 +150,23 @@
 (define (blurred)
   "Return a fresh <blur> event."
   (make <blur>))
+
+
+;; Widget-level focus events.  Distinct from terminal-level
+;; <focus>/<blur>: these are dispatched by the engine when the
+;; `focus` cmd changes the focus chain.  Each widget that joins the
+;; chain receives `<focus-in>`; each widget that drops out receives
+;; `<focus-out>`.  Widgets that care (textinputs, buttons, etc.) can
+;; mirror their own focused? slot in response.
+
+(define-class <focus-in>  ())
+(define-class <focus-out> ())
+
+(define (focus-in?  x) (is-a? x <focus-in>))
+(define (focus-out? x) (is-a? x <focus-out>))
+
+(define (focus-in)  (make <focus-in>))
+(define (focus-out) (make <focus-out>))
 
 
 (define-class <resume> ())

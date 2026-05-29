@@ -514,8 +514,13 @@ since insert/delete-char only affects the targeted line."
     (when (vector-ref state 3)
       (when (vector-ref state 4) (emit-osc-8 #f out))
       (display (string-append (string #\esc) "[0m") out))
-    (when (mode-get (term-modes cur) 'cursor-visible)
-      (display (move-to-ansi (term-cursor-x cur) (term-cursor-y cur)) out))
+    ;; Always park the cursor at the term's current x/y.  The engine's
+    ;; cursor-visible state is wire-level (CSI ?25h written directly to
+    ;; the output) and doesn't show up in (term-modes); without this
+    ;; unconditional goto the cursor would float to wherever the diff's
+    ;; last byte happened to land, which makes `place-cursor` and any
+    ;; "cursor at the input field" expectation impossible to honor.
+    (display (move-to-ansi (term-cursor-x cur) (term-cursor-y cur)) out)
     (get-output-string out)))
 
 (define (full-diff->ansi prev cur)
@@ -544,8 +549,8 @@ differ, or no cardinal shift matches."
     (when (vector-ref state 3)
       (when (vector-ref state 4) (emit-osc-8 #f out))
       (display (string-append (string #\esc) "[0m") out))
-    (when (mode-get (term-modes cur) 'cursor-visible)
-      (display (move-to-ansi (term-cursor-x cur) (term-cursor-y cur)) out))
+    ;; Same unconditional cursor park as in shift-diff->ansi above.
+    (display (move-to-ansi (term-cursor-x cur) (term-cursor-y cur)) out)
     (get-output-string out)))
 
 (define (term-diff->ansi prev cur)

@@ -47,10 +47,14 @@
   (apply make <textinput> args))
 
 (define-method (view (ti <textinput>))
-  "Render <textinput> TI: the prompt followed by the value or, if
-empty, the placeholder.  When focused, draws a reverse-video cell
-at the cursor position; horizontally scrolls when value length
-exceeds width."
+  "Render <textinput> TI: the prompt followed by the value (or
+placeholder when empty), with a cursor cell always visible so the
+field reads as an input target at a glance.  Unfocused → static
+reverse-video cell at the cursor position.  Focused → same cell plus
+a `place-cursor` (spliced into the hbox at the cursor column) so the
+terminal's hardware cursor sits on top and blinks naturally.  The
+cursor node is a 0-width hbox child; it inherits the column of the
+next sibling, which is exactly where we want the caret."
   (let* ((raw      (textinput-value ti))
          (val      (if (textinput-mask? ti)
                        (make-string (string-length raw) #\•)
@@ -60,11 +64,16 @@ exceeds width."
          (cur      (textinput-cursor ti))
          (focused? (textinput-focused? ti))
          (ph       (textinput-placeholder ti)))
+    (define cursor-mark (place-cursor 0 0 #:style 'block))
     (cond
-     ((and (string-null? val) (not (string-null? ph)))
-      (hbox (txt prompt)
-            (if focused? (txt " " #:reverse) (txt ""))
-            (txt ph #:fg 'placeholder)))
+     ((string-null? val)
+      ;; Empty field: prompt + (cursor at this column if focused)
+      ;; + cursor-cell + placeholder.
+      (if focused?
+          (hbox (txt prompt) cursor-mark
+                (txt " " #:reverse) (txt ph #:fg 'placeholder))
+          (hbox (txt prompt)
+                (txt " " #:reverse) (txt ph #:fg 'placeholder))))
      (else
       (let* ((start   (max 0 (- cur (- w 5))))
              (visible (if (> (string-length val) w)
@@ -72,17 +81,34 @@ exceeds width."
                                      (min (string-length val) (+ start w)))
                           val))
              (cpos    (- cur start)))
-        (if (and focused? (>= cpos 0) (<= cpos (string-length visible)))
-            (let ((left  (substring visible 0 cpos))
-                  (cell  (if (< cpos (string-length visible))
-                             (string (string-ref visible cpos))
-                             " "))
-                  (right (if (< cpos (string-length visible))
-                             (substring visible (+ cpos 1))
-                             "")))
-              (hbox (txt prompt) (txt left)
-                    (txt cell #:reverse) (txt right)))
-            (hbox (txt prompt) (txt visible))))))))
+        (cond
+         ((and focused? (>= cpos 0) (<= cpos (string-length visible)))
+          (let ((left  (substring visible 0 cpos))
+                (cell  (if (< cpos (string-length visible))
+                           (string (string-ref visible cpos))
+                           " "))
+                (right (if (< cpos (string-length visible))
+                           (substring visible (+ cpos 1))
+                           "")))
+            (hbox (txt prompt) (txt left) cursor-mark
+                  (txt cell #:reverse) (txt right))))
+         (else
+          ;; Unfocused with content: cursor cell at the trailing edge.
+          (hbox (txt prompt) (txt visible) (txt " " #:reverse)))))))))
+
+(define-method (update (ti <textinput>) (msg <focus-in>))
+  "Engine dispatches <focus-in> when this textinput joins the focus
+chain.  Mirror it in the focused? slot so the next render shows the
+cursor cell + place-cursor node and the next <key> can write text.
+Also flip the engine's cursor mode visible/block so the terminal's
+hardware cursor parks at place-cursor's position and blinks."
+  (cons (update-slots ti #:focused? #t)
+        (batch (cursor 'visible) (cursor 'block))))
+
+(define-method (update (ti <textinput>) (msg <focus-out>))
+  "Inverse of <focus-in>: this textinput just left the focus chain."
+  (cons (update-slots ti #:focused? #f)
+        (cursor 'hidden)))
 
 (define-method (update (ti <textinput>) (msg <mouse>))
   "Mouse press repositions the cursor.  Other mouse actions are
@@ -97,7 +123,15 @@ ignored."
 
 (define-method (update (ti <textinput>) (msg <key>))
   "Keys handled: backspace, delete, left, right, home, end, and
-self-inserting chars (subject to char-limit when non-zero)."
+self-inserting chars (subject to char-limit when non-zero).
+
+Only acts on `'press` events.  Kitty's report-event-types flag also
+delivers `'release` and `'repeat`; honouring those would insert each
+typed letter twice on terminals whose OS auto-repeat fires before
+release lands."
+  (cond
+   ((not (eq? (key-event msg) 'press)) (cons ti #f))
+   (else
   (let ((k     (key-sym msg))
         (val   (textinput-value ti))
         (cur   (textinput-cursor ti))
@@ -133,4 +167,4 @@ self-inserting chars (subject to char-limit when non-zero)."
                                     (substring val cur))
             #:cursor (+ cur 1)))
          (else ti))))
-     #f)))
+     #f)))))
