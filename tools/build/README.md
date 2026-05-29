@@ -60,11 +60,15 @@ start)` in `canary-app.scm` if your app is laid out differently.
 - `canary-build ship` — produces `dist/<name>` (a static ELF) and
   `dist/payload.tar` (the staged Scheme tree, kept for debugging).
 
-End user runs `./dist/my-app`. On first run the binary extracts its
-embedded payload to `${XDG_CACHE_HOME:-~/.cache}/canary/<hash>/` and
-sets `GUILE_LOAD_PATH` at it. Subsequent runs skip extraction. A
-re-shipped binary hashes differently and gets a fresh cache dir, so
-old payloads coexist until the operator wipes `~/.cache/canary/`.
+End user runs `./dist/my-app`. The binary is genuinely self-contained:
+no cache dir, no extraction, no XDG paths touched. At boot the runtime
+installs a `try-module-autoload` override on the `(guile)` module that
+resolves every requested module out of an embedded `path → bytes`
+table generated at build time.  `.go` bytecode goes through
+`load-thunk-from-memory`; if the bytecode version differs from the
+runtime's it falls through to the `.scm` source and evaluates it
+form-by-form via `primitive-eval`.  The only thing the binary touches
+on disk is its own executable file.
 
 ## What's bundled
 
@@ -99,5 +103,6 @@ old payloads coexist until the operator wipes `~/.cache/canary/`.
 | `canary-build`               | Guile CLI: `dev` / `compile` / `ship` commands     |
 | `build.zig`                  | Zig build: compile `main.zig` → `.o`, gcc-link static |
 | `guix.scm`                   | Manifest for `guix shell -m …` — static variants of guile + fibers |
-| `src/main.zig`               | Runtime: register fibers ext, extract payload, boot Guile, call entry |
+| `src/main.zig`               | Runtime: register fibers ext, install in-memory autoload override, boot Guile, call entry |
+| `src/wrappers.c`             | Tiny C shims around libguile macros that translate-c can't follow |
 | `templates/canary-app.scm.tmpl` | Starter manifest for `canary-build init` (stretch) |

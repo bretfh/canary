@@ -8,8 +8,8 @@ pub fn build(b: *std.Build) void {
     // canary-build (the Guile CLI) passes these per-project; defaults make
     // a direct `zig build` produce a runnable but useless binary so the
     // wiring is testable without the wrapper.
-    const payload_path = b.option([]const u8, "payload",
-        "Path to the tar payload to embed in the binary.") orelse "";
+    const payload_dir = b.option([]const u8, "payload-dir",
+        "Directory tree to embed.  Walked recursively; every file becomes one entry in the runtime table addressed by its path relative to this dir.") orelse "";
     const entry_module = b.option([]const u8, "entry-module",
         "Module name to resolve at startup, e.g. \"my-app main\".") orelse "guile-user";
     const entry_proc = b.option([]const u8, "entry-proc",
@@ -30,22 +30,41 @@ pub fn build(b: *std.Build) void {
     opts.addOption([]const u8, "entry_proc", entry_proc);
     obj_mod.addOptions("build_options", opts);
 
-    // Embed the payload.  WriteFile stages both embed.zig (a one-liner)
-    // and payload.bin into the same generated directory; @embedFile in
-    // embed.zig resolves "payload.bin" relative to embed.zig's source
-    // path, which lands at the staged sibling.  -Dpayload absent → an
-    // empty payload.bin is staged and main.zig errors out at startup
-    // with a clear message.
+    // Walk -Dpayload-dir at BUILD TIME, stage every file into a WriteFile
+    // tree, and generate an embed.zig that holds a `path → bytes` table
+    // built from one `@embedFile` per file.  No tar, no runtime extract,
+    // no cache dir — the runtime reads from the embedded bytes directly
+    // via a try-module-autoload override.
     const wf = b.addWriteFiles();
-    if (payload_path.len > 0) {
-        _ = wf.addCopyFile(.{ .cwd_relative = payload_path }, "payload.bin");
-    } else {
-        _ = wf.add("payload.bin", "");
+    var entries_buf = std.ArrayList(u8){};
+    defer entries_buf.deinit(b.allocator);
+
+    if (payload_dir.len > 0) {
+        var dir = std.fs.cwd().openDir(payload_dir, .{ .iterate = true }) catch |e|
+            std.debug.panic("payload-dir {s}: {}", .{ payload_dir, e });
+        defer dir.close();
+        var walker = dir.walk(b.allocator) catch unreachable;
+        defer walker.deinit();
+        while ((walker.next() catch unreachable)) |entry| {
+            if (entry.kind != .file) continue;
+            const rel = b.allocator.dupe(u8, entry.path) catch unreachable;
+            const abs = std.fs.path.join(b.allocator, &.{ payload_dir, rel }) catch unreachable;
+            _ = wf.addCopyFile(.{ .cwd_relative = abs }, rel);
+            (entries_buf.writer(b.allocator).print(
+                "    .{{ .path = \"{s}\", .bytes = @embedFile(\"{s}\") }},\n",
+                .{ rel, rel },
+            ) catch unreachable);
+        }
     }
-    const embed_lp = wf.add("embed.zig",
-        \\pub const payload: []const u8 = @embedFile("payload.bin");
+
+    const embed_content = std.fmt.allocPrint(b.allocator,
+        \\pub const Entry = struct {{ path: []const u8, bytes: []const u8 }};
+        \\pub const entries: []const Entry = &.{{
+        \\{s}
+        \\}};
         \\
-    );
+    , .{entries_buf.items}) catch unreachable;
+    const embed_lp = wf.add("embed.zig", embed_content);
     obj_mod.addAnonymousImport("embed.zig", .{
         .root_source_file = embed_lp,
     });
@@ -76,6 +95,18 @@ pub fn build(b: *std.Build) void {
     const link = b.addSystemCommand(&.{ "gcc", "-static-libgcc", "-o" });
     const out = link.addOutputFileArg(out_name);
     link.addArtifactArg(obj);
+
+    // C shims for the libguile macros that translate-c can't follow.
+    const wrappers_o = b.addSystemCommand(&.{ "gcc", "-c", "-fPIE", "-o" });
+    const wrappers_lp = wrappers_o.addOutputFileArg("wrappers.o");
+    var ci_w = std.mem.tokenizeAny(u8, r_cflags.stdout, " \t\r\n");
+    while (ci_w.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "-I")) {
+            wrappers_o.addArg(b.allocator.dupe(u8, tok) catch unreachable);
+        }
+    }
+    wrappers_o.addFileArg(b.path("src/wrappers.c"));
+    link.addFileArg(wrappers_lp);
 
     // fibers-epoll.a from the guix shell env; placed before guile so its
     // symbols (init_fibers_epoll) are pulled in before libguile resolves

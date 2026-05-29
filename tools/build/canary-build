@@ -152,11 +152,9 @@ Returns the path to a tar of staging."
        (when (file-exists? a)
          (run (string-append "cp -r " a " " staging "/"))))
      assets)
-    ;; Tar the lot.
-    (let ((tar (string-append (getcwd) "/dist/payload.tar")))
-      (run (string-append "mkdir -p " (dirname tar)))
-      (run (string-append "tar c -C " staging " . > " tar))
-      tar)))
+    ;; Return the staging dir itself — build.zig walks it at build time
+    ;; via -Dpayload-dir and embeds every file individually, no tar.
+    staging))
 
 (define (cmd-ship)
   ;; zig is pulled via `guix shell -m guix.scm` so we only require guix
@@ -180,7 +178,7 @@ Returns the path to a tar of staging."
          (tool-guix (string-append %tool-dir "/guix.scm")))
     (let ((payload (stage-payload spec staging)))
       (run (format #f
-                   "guix shell -m ~a gcc-toolchain -- bash -c 'cd ~a && zig build -Dpayload=~a -Dentry-module=\"~a\" -Dentry-proc=~a -Dapp-name=~a'"
+                   "guix shell -m ~a gcc-toolchain -- bash -c 'cd ~a && zig build -Dpayload-dir=~a -Dentry-module=\"~a\" -Dentry-proc=~a -Dapp-name=~a'"
                    tool-guix %tool-dir payload entry-mod entry-proc name))
       (run (format #f "mkdir -p dist && cp ~a/zig-out/bin/~a dist/~a"
                    %tool-dir name name))
