@@ -186,12 +186,61 @@ Returns the path to a tar of staging."
 
 ;;; ── dispatch ──────────────────────────────────────────────────────
 
+(define %help-text "\
+canary-build — ship canary apps as static binaries
+
+usage: canary-build <command>
+
+commands:
+  dev      run the app under the local guile (live-coding loop):
+           guile -L <canary> -L src src/<name>.scm
+
+  compile  guild-compile the project's .scm into build/.  optional
+           speedup before ship; not required.
+
+  ship     produce dist/<name>, a single ELF that bundles libguile,
+           guile-fibers (epoll backend), canary, and the app's .scm.
+           runs without a guile install on the target.  see
+           SHIPPING.md in canary's repo for the full model.
+
+  help     show this text.
+
+project layout (run any command from this dir):
+
+  ./
+  ├── canary-app.scm         project manifest (s-exp)
+  ├── src/<name>.scm         entry — (define-module (<name>) ...) + (main)
+  └── assets/                optional, bundled verbatim into ship
+
+canary-app.scm shape:
+
+  (canary-app
+    (name        \"my-app\")     ; binary name + default entry module
+    (version     \"0.1.0\")
+    (load-paths  \"src\")        ; dirs added to %load-path
+    ; optional overrides:
+    ; (entry-module my-app core) ; default: (name)
+    ; (entry-proc   start)       ; default: main
+    ; (assets       \"static\")    ; default: ()
+    )
+
+requirements: guile + guix on PATH.  zig + gcc come from `guix shell`.
+")
+
+(define (help)
+  (display %help-text)
+  (exit 0))
+
 (define (usage)
-  (display "usage: canary-build {dev|compile|ship}\n" (current-error-port))
+  (display "usage: canary-build {dev|compile|ship|help}\n" (current-error-port))
+  (display "       canary-build help    for the full reference\n" (current-error-port))
   (exit 2))
 
 (match (command-line)
   ((_ "dev")     (cmd-dev))
   ((_ "compile") (cmd-compile))
   ((_ "ship")    (cmd-ship))
+  ((_ "help")    (help))
+  ((_ "-h")      (help))
+  ((_ "--help")  (help))
   (_             (usage)))
