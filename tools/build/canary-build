@@ -1,0 +1,199 @@
+#!/usr/bin/env -S guile -s
+!#
+;;; canary-build — canary's app-shipping CLI.
+;;;
+;;; Reads canary-app.scm in the current directory, stages a payload tree
+;;; containing canary + the app's compiled modules, then invokes
+;;; `zig build -Dpayload=…` inside `guix shell -m guix.scm` to produce
+;;; a single static binary in dist/<name>.
+;;;
+;;; Commands:
+;;;   canary-build dev      — runs guile -L $CANARY -L src src/main.scm
+;;;   canary-build compile  — guild-compiles the project's .scm into build/
+;;;   canary-build ship     — produces dist/<name>
+;;;
+;;; canary-app.scm shape:
+;;;   (canary-app
+;;;     (name "my-app")
+;;;     (entry (my-app main))           ; module name + procedure symbol
+;;;     (version "0.1.0")
+;;;     (load-paths '("src"))           ; relative dirs added to %load-path
+;;;     (assets '()))                   ; relative dirs/files bundled verbatim
+
+(use-modules (ice-9 match)
+             (ice-9 popen)
+             (ice-9 ftw)
+             (ice-9 rdelim)
+             (srfi srfi-1))
+
+(define %tool-dir
+  ;; Resolve canary-build's install location → its sibling guix.scm.
+  (let* ((self (or (and (defined? 'current-filename) (current-filename))
+                   (car (command-line)))))
+    (dirname self)))
+
+(define (canary-repo-root)
+  ;; Walk up from %tool-dir until we find canary.scm.  Lets the tool work
+  ;; whether it lives in canary's tools/build/ or has been symlinked.
+  (let loop ((d %tool-dir))
+    (cond
+     ((file-exists? (string-append d "/canary.scm")) d)
+     ((string=? d "/") (error "canary repo root not found from" %tool-dir))
+     (else (loop (dirname d))))))
+
+(define (read-canary-app path)
+  (call-with-input-file path read))
+
+(define (alist-get key form)
+  (let ((entry (find (lambda (e) (and (pair? e) (eq? (car e) key)))
+                     (cdr form))))
+    (and entry (cdr entry))))
+
+(define (need-tool tool)
+  (let* ((p (open-input-pipe (string-append "command -v " tool " 2>/dev/null")))
+         (l (read-line p)))
+    (close-pipe p)
+    (when (or (eof-object? l) (string-null? l))
+      (format (current-error-port) "canary-build: ~a not on PATH~%" tool)
+      (exit 2))))
+
+(define (run cmd)
+  (format (current-error-port) "+ ~a~%" cmd)
+  (let ((rc (system cmd)))
+    (unless (zero? (status:exit-val rc))
+      (format (current-error-port) "command failed: ~a~%" cmd)
+      (exit 1))))
+
+;;; ── dev ────────────────────────────────────────────────────────────
+
+(define (cmd-dev)
+  (let* ((spec (read-canary-app "canary-app.scm"))
+         (paths (or (alist-get 'load-paths spec) '("src")))
+         (entry (alist-get 'entry spec))
+         (entry-mod (car entry))
+         (entry-file (string-append "src/"
+                                    (symbol->string entry-mod) ".scm")))
+    (need-tool "guile")
+    (run (string-append
+          "guile -L " (canary-repo-root)
+          " " (string-join (map (lambda (p) (string-append "-L " p)) paths) " ")
+          " " entry-file))))
+
+;;; ── compile ────────────────────────────────────────────────────────
+
+(define (cmd-compile)
+  (let* ((spec (read-canary-app "canary-app.scm"))
+         (paths (or (alist-get 'load-paths spec) '("src"))))
+    (need-tool "guild")
+    (for-each
+     (lambda (path)
+       (when (file-exists? path)
+         (ftw path
+              (lambda (file stat flag)
+                (when (and (eq? flag 'regular)
+                           (string-suffix? ".scm" file))
+                  (let ((out (string-append "build/"
+                                            (substring file (string-length path))
+                                            ".go")))
+                    (run (format #f "mkdir -p ~a && guild compile -L ~a -L ~a -o ~a ~a"
+                                 (dirname out)
+                                 (canary-repo-root)
+                                 path out file))))
+                #t))))
+     paths)))
+
+;;; ── ship ───────────────────────────────────────────────────────────
+
+(define (stage-payload spec staging)
+  "Lay out staging/site/3.0 + staging/site-ccache from the canary repo's
+build output, the user project's compiled .go, and any declared assets.
+Returns the path to a tar of staging."
+  (let* ((name (car (alist-get 'name spec)))
+         (entry (alist-get 'entry spec))
+         (paths (or (alist-get 'load-paths spec) '("src")))
+         (assets (or (alist-get 'assets spec) '())))
+    (run (string-append "mkdir -p " staging "/site/3.0 " staging "/site-ccache"))
+    ;; canary itself: .scm + build/.go (must `make compile` in canary first).
+    (let ((root (canary-repo-root)))
+      (run (string-append "cp -r " root "/canary " staging "/site/3.0/"))
+      (run (string-append "cp -r " root "/canary.scm " staging "/site/3.0/"))
+      (when (file-exists? (string-append root "/build/canary"))
+        (run (string-append "cp -r " root "/build/canary "
+                            staging "/site-ccache/"))))
+    ;; Resolve $GUIX_ENVIRONMENT for the tool's static-build env so we
+    ;; can copy guile-fibers' .scm + .go out of it.  The outer process
+    ;; may or may not be inside `guix shell`; ask it explicitly.
+    (let* ((tool-guix (string-append %tool-dir "/guix.scm"))
+           (p (open-input-pipe
+               (string-append "guix shell -m " tool-guix
+                              " -- bash -c 'echo $GUIX_ENVIRONMENT'")))
+           (env (read-line p)))
+      (close-pipe p)
+      (when (and (string? env) (not (string-null? env)))
+        (run (string-append
+              "cp -rn " env "/share/guile/site/3.0/. "
+              staging "/site/3.0/ 2>/dev/null; true"))
+        (run (string-append
+              "cp -rn " env "/lib/guile/3.0/site-ccache/. "
+              staging "/site-ccache/ 2>/dev/null; true"))))
+    ;; App sources from each declared load-path.
+    (for-each
+     (lambda (p)
+       (when (file-exists? p)
+         (run (string-append "cp -r " p "/. " staging "/site/3.0/"))))
+     paths)
+    ;; If `make compile`-style build/ exists, copy app .go.
+    (when (file-exists? "build")
+      (run (string-append "cp -r build/. " staging "/site-ccache/")))
+    ;; Assets — copied as-is to the cache root, app reads them via
+    ;; (string-append (dirname (current-filename)) "/asset.png") etc.
+    (for-each
+     (lambda (a)
+       (when (file-exists? a)
+         (run (string-append "cp -r " a " " staging "/"))))
+     assets)
+    ;; Tar the lot.
+    (let ((tar (string-append (getcwd) "/dist/payload.tar")))
+      (run (string-append "mkdir -p " (dirname tar)))
+      (run (string-append "tar c -C " staging " . > " tar))
+      tar)))
+
+(define (cmd-ship)
+  ;; zig is pulled via `guix shell -m guix.scm` so we only require guix
+  ;; on the outside.
+  (need-tool "guix")
+  (let* ((spec (read-canary-app "canary-app.scm"))
+         (name (car (alist-get 'name spec)))
+         ;; By default the module is (name) and the proc is 'main.
+         ;; Override module via (entry-module x y z), proc via
+         ;; (entry-proc some-symbol).  Common case: just (entry-proc main).
+         (entry-mod (string-join
+                     (map symbol->string
+                          (or (alist-get 'entry-module spec)
+                              (list (string->symbol name))))
+                     " "))
+         (entry-proc (symbol->string
+                      (car (or (alist-get 'entry-proc spec)
+                               '(main)))))
+         (staging (string-append "/tmp/canary-stage-" name "-"
+                                 (number->string (current-time))))
+         (tool-guix (string-append %tool-dir "/guix.scm")))
+    (let ((payload (stage-payload spec staging)))
+      (run (format #f
+                   "guix shell -m ~a gcc-toolchain -- bash -c 'cd ~a && zig build -Dpayload=~a -Dentry-module=\"~a\" -Dentry-proc=~a -Dapp-name=~a'"
+                   tool-guix %tool-dir payload entry-mod entry-proc name))
+      (run (format #f "mkdir -p dist && cp ~a/zig-out/bin/~a dist/~a"
+                   %tool-dir name name))
+      (format #t "built dist/~a~%" name))))
+
+;;; ── dispatch ──────────────────────────────────────────────────────
+
+(define (usage)
+  (display "usage: canary-build {dev|compile|ship}\n" (current-error-port))
+  (exit 2))
+
+(match (command-line)
+  ((_ "dev")     (cmd-dev))
+  ((_ "compile") (cmd-compile))
+  ((_ "ship")    (cmd-ship))
+  (_             (usage)))

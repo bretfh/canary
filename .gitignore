@@ -12,6 +12,9 @@
 *.so
 *.a
 build/
+!/tools/build/
+/tools/build/zig-out/
+/tools/build/.zig-cache/
 
 # OS
 .DS_Store
