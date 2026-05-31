@@ -839,6 +839,6 @@ when the host does not speak the protocol.
 - =gcell/= : module sources; small enough to read directly
 - =gcell/components/= : worked examples of widgets that
   participate in the cascade
-- =examples/= : counter, chat, dired-lite, gcell-tweet
+- =examples/= : counter, chat, dired-lite
 - =tests/= : snapshot and dispatch tests against the same
   ~<term>~ model the renderer writes into

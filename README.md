@@ -1,18 +1,16 @@
 # gcell
 
 elm/tea inspired tui in guile. see `DESIGN.md` for architecture,
-`examples/gcell-tweet.scm` for a worked example, `SHIPPING.md` for
+`examples/counter.scm` for a worked example, `SHIPPING.md` for
 producing single-file binaries of gcell apps that run on machines
 with no Guile installed.
-
-![gcell](gcell.png)
 
 ## run
 
 ### linux (guix)
 
 ```sh
-guix shell -m manifest.scm -- guile -L . examples/gcell-tweet.scm
+guix shell -m manifest.scm -- guile -L . examples/counter.scm
 ```
 
 `manifest.scm` pins `guile-next`, `guile-fibers`, `gcc-toolchain`,
@@ -36,7 +34,7 @@ export GUILE_SYSTEM_EXTENSIONS_PATH=/opt/homebrew/lib/guile/3.0/extensions
 then:
 
 ```sh
-guile -L . examples/gcell-tweet.scm
+guile -L . examples/counter.scm
 ```
 
 ## make
