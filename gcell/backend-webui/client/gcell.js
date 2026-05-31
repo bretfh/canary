@@ -472,13 +472,15 @@ function applyFrame(buf) {
   if (w !== gridW || h !== gridH) {
     shipLog('info', `frame newdim ${gridW}x${gridH} -> ${w}x${h} type=${frameType}`);
     // Snap canvas display + backing to exactly grid * CSS_CELL.
-    // canvas.width / gridW is now always == CSS_CELL_W exactly.
+    // Backing FIRST (resets bitmap), style after.  See onResize for
+    // why -- otherwise mid-flight composites scale the old content
+    // into the new display and look like font scaling.
     const cw = w * CSS_CELL_W;
     const ch = h * CSS_CELL_H;
-    canvas.style.width  = cw + 'px';
-    canvas.style.height = ch + 'px';
     canvas.width  = cw;
     canvas.height = ch;
+    canvas.style.width  = cw + 'px';
+    canvas.style.height = ch + 'px';
   }
   if (cellsArray.length !== total * FLOATS_PER_CELL) {
     // Grid resized: any cells we had are stale and the delta we just
@@ -683,10 +685,16 @@ function onResize(reason) {
     const rows = Math.max(5,  Math.floor(cssH / CSS_CELL_H));
     const cw = cols * CSS_CELL_W;
     const ch = rows * CSS_CELL_H;
-    canvas.style.width  = cw + 'px';
-    canvas.style.height = ch + 'px';
+    // Resize the backing FIRST.  Setting canvas.width/height resets
+    // the bitmap to transparent black at the new dims.  Setting
+    // canvas.style.width AFTER means the browser never sees a frame
+    // where display=NEW but backing=OLD-content -- which would
+    // composite as the old cells SCALED into the new display, and
+    // would look exactly like the font shrinking on a drag-resize.
     canvas.width  = cw;
     canvas.height = ch;
+    canvas.style.width  = cw + 'px';
+    canvas.style.height = ch + 'px';
     // cellsArray still holds the OLD frame's cell data, indexed by the
     // OLD grid width.  Drawing it onto the NEW bigger canvas would
     // paint the old cells in the top-left and leave the rest blank
