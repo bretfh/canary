@@ -8,6 +8,11 @@
                                             <paste> paste))
   #:use-module ((canary key) #:select (<key> key))
   #:use-module ((canary backend-ansi) #:select (render-cmds-to-term!))
+  #:use-module ((canary draw) #:select (image-cmd? image-col image-row
+                                        image-w image-h
+                                        image-src image-src-x image-src-y
+                                        image-src-w image-src-h))
+  #:use-module ((canary image) #:select (image-registered? image-bytes))
   #:use-module (canary theme)
   #:use-module ((canary term types) #:prefix t:)
   #:use-module (webui)
@@ -86,6 +91,16 @@
   (latency-ns    #:init-value 0 #:accessor wb-latency-ns)
   (latency-ns-max #:init-value 0 #:accessor wb-latency-ns-max)
   (latency-samples #:init-value 0 #:accessor wb-latency-samples)
+  ;; image-ids maps a canary image symbol -> u32 wire id assigned
+  ;; the first time we ship its bytes to the browser.  next-image-id
+  ;; is the monotonic counter; image-bytes-sent counts the unique
+  ;; uploads (telemetry).
+  (image-ids       #:init-form (make-hash-table)
+                   #:accessor webui-backend-image-ids)
+  (next-image-id   #:init-value 1
+                   #:accessor webui-backend-next-image-id)
+  (image-bytes-sent #:init-value 0
+                    #:accessor wb-image-bytes-sent)
   ;; Set in dispatch-browser-event! to monotonic internal-real-time
   ;; (ns) when the bounce delivers input; the engine's next event-loop
   ;; cycle reads it to compute queue-to-wake latency (the fiber-
@@ -350,13 +365,58 @@
   ;; load to avoid the multiply per call.
   (get-internal-real-time))
 
+(define (ensure-image-uploaded! b sym)
+  "Return the wire id for canary image symbol SYM, uploading its
+bytes to the browser via webui-send-raw if it hasn't been seen yet.
+#f when SYM isn't a registered image."
+  (and (image-registered? sym)
+       (let* ((tbl    (webui-backend-image-ids b))
+              (cached (hash-ref tbl sym)))
+         (or cached
+             (let* ((id    (webui-backend-next-image-id b))
+                    (bytes (image-bytes sym))
+                    (n     (bytevector-length bytes))
+                    (blob  (make-bytevector (+ 8 n) 0)))
+               (hash-set! tbl sym id)
+               (set! (webui-backend-next-image-id b) (+ 1 id))
+               (set! (wb-image-bytes-sent b) (+ 1 (wb-image-bytes-sent b)))
+               ;; Wire shape: u32 id, u32 byte_length, raw bytes
+               ;; (PNG/JPEG/etc; browser decodes via createImageBitmap).
+               (bytevector-u32-set! blob 0 id (endianness little))
+               (bytevector-u32-set! blob 4 n  (endianness little))
+               (bytevector-copy! bytes 0 blob 8 n)
+               (webui-send-raw (webui-backend-window b)
+                               %image-js-fn blob)
+               id)))))
+
+(define (collect-image-placements b cmds)
+  "For each <image-cmd> in CMDS, upload its bytes to the browser if
+needed (cached by image symbol → u32 id) and return a list of
+placements: (id col row w h src-x src-y src-w src-h).  Order
+preserved so later placements paint over earlier ones."
+  (let ((out '()))
+    (for-each
+     (lambda (cmd)
+       (when (image-cmd? cmd)
+         (let ((id (ensure-image-uploaded! b (image-src cmd))))
+           (when id
+             (set! out (cons (list id
+                                   (image-col cmd) (image-row cmd)
+                                   (image-w cmd) (image-h cmd)
+                                   (image-src-x cmd) (image-src-y cmd)
+                                   (image-src-w cmd) (image-src-h cmd))
+                             out))))))
+     cmds)
+    (reverse out)))
+
 (define-method (backend-draw (b <webui-backend>) cmds)
   (let* ((term (webui-backend-cur-term b))
          (th   (webui-backend-theme    b))
-         (t0   (%mono-ns)))
+         (t0   (%mono-ns))
+         (placements (collect-image-placements b cmds)))
     (render-cmds-to-term! term cmds th)
     (let* ((t1    (%mono-ns))
-           (frame (encode-frame term))
+           (frame (encode-frame term placements))
            (t2    (%mono-ns)))
       (webui-send-raw (webui-backend-window b) %frame-js-fn frame)
       (let* ((t3        (%mono-ns))
@@ -392,7 +452,18 @@
 
 (define %frame-header-size 16)
 (define %cell-size 13)
-(define %frame-version 2)  ; v2 appends a hyperlink overlay after the cells
+(define %frame-version 3)  ; v3 adds an image-placement overlay after the hyperlinks
+
+;; Frame v3 layout, after the v2 hyperlink overlay:
+;;   u16 image_count
+;;   image_count times:
+;;     u32 image_id, u16 col, u16 row, u16 w, u16 h,
+;;     u16 src_x, u16 src_y, u16 src_w, u16 src_h
+;; The image bytes themselves are pushed on a separate webui_send_raw
+;; channel (%image-js-fn / canaryImage) -- the client caches by id
+;; so we only ship a given image once per session.
+(define %image-js-fn "canaryImage")
+(define %image-placement-bytes 20)  ; 4 + 2*8
 
 (define (term-cursor-style->code style)
   (case style
@@ -427,15 +498,20 @@ overlays each (col,row,url) onto its hit-test map)."
 (define (utf8-byte-count s)
   (bytevector-length (string->utf8 s)))
 
-(define (encode-frame term)
-  "Encode TERM's visible grid into the v2 binary frame the browser
+(define (encode-frame term placements)
+  "Encode TERM's visible grid into the v3 binary frame the browser
 canaryFrame() unpacks.  Cursor coordinates come from TERM-CURSOR-X /
 TERM-CURSOR-Y (canary's term keeps them 1-indexed in the VT
 convention; subtract 1 to land on the cell grid).
 
 After the cell records (W*H * 13 bytes), a hyperlink-overlay
 section: u16 link-count + link-count entries of
-  u16 col, u16 row, u16 url-byte-length, url bytes (utf-8)."
+  u16 col, u16 row, u16 url-byte-length, url bytes (utf-8).
+
+Then the image-placement overlay (v3): u16 image-count + count
+entries of (u32 id, u16 col, u16 row, u16 w, u16 h,
+u16 src-x, u16 src-y, u16 src-w, u16 src-h).  Image bytes are NOT
+in the frame; they were streamed on the canaryImage channel."
   (let* ((w     (t:term-width term))
          (h     (t:term-height term))
          (cells (* w h))
@@ -449,11 +525,14 @@ section: u16 link-count + link-count entries of
          (link-bytes (apply + 0 (map (lambda (u)
                                        (+ 6 (bytevector-length u)))
                                      link-utf8s)))
+         (n-placements (length placements))
          (bv    (make-bytevector
                  (+ %frame-header-size
                     (* cells %cell-size)
                     2                       ; u16 link count
-                    link-bytes)
+                    link-bytes
+                    2                       ; u16 image-placement count
+                    (* n-placements %image-placement-bytes))
                  0)))
     (bytevector-u32-set! bv 0 %frame-magic (endianness little))
     (bytevector-u8-set!  bv 4 %frame-version)
@@ -483,24 +562,43 @@ section: u16 link-count + link-count entries of
                                        (and u (string? u))))
                                 (logior a 64)
                                 a))))
-    ;; Hyperlink table.
-    (let* ((cells-end (+ %frame-header-size (* cells %cell-size)))
-           (count-off cells-end))
-      (bytevector-u16-set! bv count-off (length links) (endianness little))
-      (let loop ((entries links) (utf8s link-utf8s) (off (+ count-off 2)))
-        (cond
-         ((null? entries) bv)
-         (else
-          (let* ((entry (car entries))
-                 (col   (car entry))
-                 (row   (cadr entry))
-                 (utf8  (car utf8s))
-                 (ulen  (bytevector-length utf8)))
-            (bytevector-u16-set! bv off       col  (endianness little))
-            (bytevector-u16-set! bv (+ off 2) row  (endianness little))
-            (bytevector-u16-set! bv (+ off 4) ulen (endianness little))
-            (bytevector-copy!    utf8 0 bv (+ off 6) ulen)
-            (loop (cdr entries) (cdr utf8s) (+ off 6 ulen)))))))))
+    ;; Hyperlink table.  Returns the byte offset right after the
+    ;; section so the image-placement table can pick up there.
+    (define hyperlinks-end
+      (let* ((cells-end (+ %frame-header-size (* cells %cell-size)))
+             (count-off cells-end))
+        (bytevector-u16-set! bv count-off (length links) (endianness little))
+        (let loop ((entries links) (utf8s link-utf8s) (off (+ count-off 2)))
+          (cond
+           ((null? entries) off)
+           (else
+            (let* ((entry (car entries))
+                   (col   (car entry))
+                   (row   (cadr entry))
+                   (utf8  (car utf8s))
+                   (ulen  (bytevector-length utf8)))
+              (bytevector-u16-set! bv off       col  (endianness little))
+              (bytevector-u16-set! bv (+ off 2) row  (endianness little))
+              (bytevector-u16-set! bv (+ off 4) ulen (endianness little))
+              (bytevector-copy!    utf8 0 bv (+ off 6) ulen)
+              (loop (cdr entries) (cdr utf8s) (+ off 6 ulen))))))))
+    ;; Image-placement table.
+    (bytevector-u16-set! bv hyperlinks-end n-placements (endianness little))
+    (let loop ((entries placements) (off (+ hyperlinks-end 2)))
+      (cond
+       ((null? entries) bv)
+       (else
+        (let ((p (car entries)))
+          (bytevector-u32-set! bv off       (car p)         (endianness little))
+          (bytevector-u16-set! bv (+ off 4) (cadr p)        (endianness little))
+          (bytevector-u16-set! bv (+ off 6) (caddr p)       (endianness little))
+          (bytevector-u16-set! bv (+ off 8) (cadddr p)      (endianness little))
+          (bytevector-u16-set! bv (+ off 10) (list-ref p 4) (endianness little))
+          (bytevector-u16-set! bv (+ off 12) (list-ref p 5) (endianness little))
+          (bytevector-u16-set! bv (+ off 14) (list-ref p 6) (endianness little))
+          (bytevector-u16-set! bv (+ off 16) (list-ref p 7) (endianness little))
+          (bytevector-u16-set! bv (+ off 18) (list-ref p 8) (endianness little))
+          (loop (cdr entries) (+ off %image-placement-bytes))))))))
 
 
 ;;;

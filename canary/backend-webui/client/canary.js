@@ -400,19 +400,40 @@ function applyFrame(buf) {
   // <len> utf-8 bytes.  Clear the previous map so links that left the
   // frame stop hit-testing.
   hyperlinks.clear();
-  if (version >= 2) {
-    const cellsEnd = HEADER_SIZE + total * CELL_SIZE;
-    if (u8.byteLength >= cellsEnd + 2) {
-      const linkCount = dv.getUint16(cellsEnd, true);
-      let off = cellsEnd + 2;
-      for (let i = 0; i < linkCount; i++) {
-        const col  = dv.getUint16(off, true);
-        const row  = dv.getUint16(off + 2, true);
-        const len  = dv.getUint16(off + 4, true);
-        const url  = utf8Decoder.decode(u8.subarray(off + 6, off + 6 + len));
-        hyperlinks.set(linkKey(col, row), url);
-        off += 6 + len;
-      }
+  let overlayOff = HEADER_SIZE + total * CELL_SIZE;
+  if (version >= 2 && u8.byteLength >= overlayOff + 2) {
+    const linkCount = dv.getUint16(overlayOff, true);
+    let off = overlayOff + 2;
+    for (let i = 0; i < linkCount; i++) {
+      const col  = dv.getUint16(off, true);
+      const row  = dv.getUint16(off + 2, true);
+      const len  = dv.getUint16(off + 4, true);
+      const url  = utf8Decoder.decode(u8.subarray(off + 6, off + 6 + len));
+      hyperlinks.set(linkKey(col, row), url);
+      off += 6 + len;
+    }
+    overlayOff = off;
+  }
+
+  // Image-placement overlay (v3+).  Entry: u32 id, u16 col, u16 row,
+  // u16 w, u16 h, u16 sx, u16 sy, u16 sw, u16 sh.  20 bytes each.
+  imagesPlaced = [];
+  if (version >= 3 && u8.byteLength >= overlayOff + 2) {
+    const imgCount = dv.getUint16(overlayOff, true);
+    let off = overlayOff + 2;
+    for (let i = 0; i < imgCount; i++) {
+      imagesPlaced.push({
+        id:  dv.getUint32(off,       true),
+        col: dv.getUint16(off +  4,  true),
+        row: dv.getUint16(off +  6,  true),
+        w:   dv.getUint16(off +  8,  true),
+        h:   dv.getUint16(off + 10,  true),
+        sx:  dv.getUint16(off + 12,  true),
+        sy:  dv.getUint16(off + 14,  true),
+        sw:  dv.getUint16(off + 16,  true),
+        sh:  dv.getUint16(off + 18,  true),
+      });
+      off += 20;
     }
   }
 
@@ -439,6 +460,7 @@ function draw() {
     gl.bindVertexArray(vao);
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, cellCount);
   }
+  drawImagePlacements();
   if (cursorStyle !== 0) {
     gl.useProgram(cursorProgram);
     gl.bindVertexArray(cursorVao);
@@ -624,6 +646,119 @@ document.addEventListener('paste', (e) => {
   const text = e.clipboardData.getData('text/plain');
   if (text) send('paste', { text });
 });
+
+// ---- Image cache.
+//
+// canaryImage receives PNG/JPEG bytes via webui_send_raw:
+//   u32 image_id  u32 length  raw_bytes
+// We decode via createImageBitmap (browser does it off-thread),
+// upload as a WebGL texture, and stash in the cache keyed by id.
+
+const imageCache = new Map(); // id -> { tex, w, h }
+let imagesPlaced = [];        // current frame's placements
+
+function uploadImageBitmap(id, bitmap) {
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+  imageCache.set(id, { tex, w: bitmap.width, h: bitmap.height });
+  // Trigger a redraw -- the placements from the most recent frame
+  // were waiting on this texture to land.
+  draw();
+}
+
+window.canaryImage = function (buf) {
+  const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
+  if (u8.byteLength < 8) return;
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const id = dv.getUint32(0, true);
+  const len = dv.getUint32(4, true);
+  if (u8.byteLength < 8 + len) return;
+  const blob = new Blob([u8.subarray(8, 8 + len)]);
+  createImageBitmap(blob)
+    .then(bitmap => uploadImageBitmap(id, bitmap))
+    .catch(err => shipLog('error', `image ${id} decode: ${err}`));
+};
+
+// Image-draw program: textured quads laid over the cell grid.
+
+const imageVS = `#version 300 es
+in vec2 a_quad;
+uniform vec2 a_pos;      // top-left in cells
+uniform vec2 a_size;     // w,h in cells
+uniform vec4 a_uvRect;   // src x,y,w,h in 0..1 of source texture
+uniform vec2 u_cellSize;
+uniform vec2 u_viewport;
+out vec2 v_uv;
+void main() {
+  vec2 px = (a_pos + a_quad * a_size) * u_cellSize;
+  vec2 ndc = (px / u_viewport) * 2.0 - 1.0;
+  ndc.y = -ndc.y;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  v_uv = a_uvRect.xy + a_quad * a_uvRect.zw;
+}`;
+
+const imageFS = `#version 300 es
+precision mediump float;
+uniform sampler2D u_img;
+in vec2 v_uv;
+out vec4 fragColor;
+void main() {
+  fragColor = texture(u_img, v_uv);
+}`;
+
+const imageProgram = gl.createProgram();
+gl.attachShader(imageProgram, compile(gl.VERTEX_SHADER,   imageVS));
+gl.attachShader(imageProgram, compile(gl.FRAGMENT_SHADER, imageFS));
+gl.linkProgram(imageProgram);
+if (!gl.getProgramParameter(imageProgram, gl.LINK_STATUS)) {
+  throw new Error(gl.getProgramInfoLog(imageProgram) || 'image link failed');
+}
+
+const iuPos      = gl.getUniformLocation(imageProgram, 'a_pos');
+const iuSize     = gl.getUniformLocation(imageProgram, 'a_size');
+const iuUv       = gl.getUniformLocation(imageProgram, 'a_uvRect');
+const iuCellSize = gl.getUniformLocation(imageProgram, 'u_cellSize');
+const iuViewport = gl.getUniformLocation(imageProgram, 'u_viewport');
+const iuImg      = gl.getUniformLocation(imageProgram, 'u_img');
+const iaQuadLoc  = gl.getAttribLocation(imageProgram, 'a_quad');
+
+const imageVao = gl.createVertexArray();
+gl.bindVertexArray(imageVao);
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+gl.enableVertexAttribArray(iaQuadLoc);
+gl.vertexAttribPointer(iaQuadLoc, 2, gl.FLOAT, false, 0, 0);
+
+gl.bindVertexArray(vao);
+
+function drawImagePlacements() {
+  if (imagesPlaced.length === 0) return;
+  gl.useProgram(imageProgram);
+  gl.bindVertexArray(imageVao);
+  gl.uniform2f(iuCellSize, CELL_W, CELL_H);
+  gl.uniform2f(iuViewport, canvas.width, canvas.height);
+  gl.uniform1i(iuImg, 1);
+  gl.activeTexture(gl.TEXTURE1);
+  for (const p of imagesPlaced) {
+    const entry = imageCache.get(p.id);
+    if (!entry) continue;  // bytes still in flight; skip until decoded
+    gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+    gl.uniform2f(iuPos,  p.col, p.row);
+    gl.uniform2f(iuSize, p.w,   p.h);
+    // src-x/y/w/h come from the server in pixel coords against the
+    // source image; normalise here using the cached bitmap size.
+    gl.uniform4f(iuUv,
+                 p.sx / entry.w, p.sy / entry.h,
+                 p.sw / entry.w, p.sh / entry.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  gl.bindVertexArray(vao);
+}
 
 // ---- Receive frames pushed by the server.
 //
