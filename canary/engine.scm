@@ -201,45 +201,6 @@ are logged, never raised."
     (lambda (key . args)
       (format (current-error-port) "canary render failed: ~a ~a\n" key args))))
 
-;;; ── tree walker for msg cascade ────────────────────────────────────
-
-(define (walk-nodes node sz proc)
-  "Walk the view tree rooted at NODE, calling PROC on every widget
-encountered.  Descends through layout containers; uses SZ when
-materialising lazy widget subviews via memoized-view.  Returns a
-hashq of widgets seen during the walk."
-  (let ((seen (make-hash-table)))
-    (let walk ((node node))
-      (cond
-       ((not node) #f)
-       ((string? node) #f)
-       ((vbox-node? node)
-        (for-each walk (vbox-node-items node)))
-       ((hbox-node? node)
-        (for-each walk (hbox-node-items node)))
-       ((boxed-node? node)   (walk (boxed-node-body node)))
-       ((pad-node? node)     (walk (pad-node-body node)))
-       ((margin-node? node)  (walk (margin-node-body node)))
-       ((align-node? node)   (walk (align-node-body node)))
-       ((width-node? node)   (walk (width-node-body node)))
-       ((height-node? node)  (walk (height-node-body node)))
-       ((static-node? node)  (walk (static-node-body node)))
-       ((click-node? node)   (walk (click-node-body node)))
-       ((hover-node? node)   (walk (hover-node-body node)))
-       ((keymap-node? node)  (walk (keymap-node-body node)))
-       ((flex-node? node)    (walk (flex-node-body node)))
-       ((wrap-node? node)    #f)
-       ((overlay-node? node)
-        (walk (overlay-node-base node))
-        (for-each (lambda (p) (walk (placement-body p)))
-                  (overlay-node-overlays node)))
-       ((is-a? node <object>)
-        (hashq-set! seen node #t)
-        (proc node)
-        (walk (memoized-view node)))
-       (else #f)))
-    seen))
-
 ;;; ── input + dispatch ───────────────────────────────────────────────
 
 (define (input-loop eng)
