@@ -319,18 +319,19 @@ the caller is accumulating; we cons new ones onto its front."
   "For each of NODE's slots that holds a node (directly or inside a
 list), dispatch MSG into the contained node first and substitute the
 returned value back into NODE.  Returns (cons rebuilt-node
-list-of-child-cmds)."
-  (let loop ((slots (class-slots (class-of node)))
+list-of-child-cmds).  Iterates the cached (keyword . name) pair list
+shared with `update-slots`, so the slot list for each kind of node is
+materialised through GOOPS at most once per class."
+  (let loop ((pairs (class-slot-keywords (class-of node)))
              (overrides '())
              (cmds '()))
-    (match slots
+    (match pairs
       (() (cons (if (null? overrides)
                     node
                     (apply update-slots node overrides))
                 (reverse cmds)))
-      ((slot . rest)
-       (let* ((name (slot-definition-name slot))
-              (val  (slot-ref node name)))
+      (((kw . name) . rest)
+       (let ((val (slot-ref node name)))
          (match (cascade-value eng val msg cmds)
            ((new-val . new-cmds)
             (cond
@@ -338,7 +339,7 @@ list-of-child-cmds)."
               (loop rest overrides new-cmds))
              (else
               (loop rest
-                    (cons* (symbol->keyword name) new-val overrides)
+                    (cons* kw new-val overrides)
                     new-cmds))))))))))
 
 (define (dispatch-update! eng node msg)

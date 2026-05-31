@@ -2,6 +2,7 @@
   #:use-module (oop goops)
   #:use-module (ice-9 match)
   #:export (update-slots
+            class-slot-keywords
             <focusable>
             widget-id))
 
