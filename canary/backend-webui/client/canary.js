@@ -33,27 +33,45 @@ const canvas = document.getElementById('cv');
 const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
 if (!gl) throw new Error('webgl2 required');
 
-// ---- Atlas (rasterised glyphs in a 2D canvas, uploaded as a texture)
+// ---- Atlas: three font weights (regular / bold / italic) rasterised
+// into separate hidden 2D canvases, uploaded together as a WebGL 2
+// sampler2DArray texture.  The shader picks a layer per cell based on
+// the bold/italic attr bits.
 
-const atlasCanvas = document.createElement('canvas');
-atlasCanvas.width  = ATLAS_COLS * CELL_W;
-atlasCanvas.height = ATLAS_ROWS * CELL_H;
-const actx = atlasCanvas.getContext('2d');
-actx.imageSmoothingEnabled = false;
+const ATLAS_LAYERS = 3;
+const LAYER_REGULAR = 0;
+const LAYER_BOLD    = 1;
+const LAYER_ITALIC  = 2;
+const LAYER_FONTS = ['', 'bold ', 'italic '];
 
-const atlasMap = new Map(); // codepoint -> slot
+const atlasCanvases = [];
+const atlasCtxs = [];
+for (let i = 0; i < ATLAS_LAYERS; i++) {
+  const c = document.createElement('canvas');
+  c.width  = ATLAS_COLS * CELL_W;
+  c.height = ATLAS_ROWS * CELL_H;
+  const ctx = c.getContext('2d');
+  ctx.imageSmoothingEnabled = false;
+  atlasCanvases.push(c);
+  atlasCtxs.push(ctx);
+}
+
+const atlasMap = new Map(); // codepoint -> slot (shared across layers)
 let nextSlot = 0;
 let atlasDirty = true;
 
 function rasteriseGlyph(cp, slot) {
   const x = (slot % ATLAS_COLS) * CELL_W;
   const y = Math.floor(slot / ATLAS_COLS) * CELL_H;
-  actx.fillStyle = '#000';
-  actx.fillRect(x, y, CELL_W, CELL_H);
-  actx.fillStyle = '#fff';
-  actx.font = `${FONT_PX}px monospace`;
-  actx.textBaseline = 'top';
-  actx.fillText(String.fromCodePoint(cp || 32), x, y);
+  for (let i = 0; i < ATLAS_LAYERS; i++) {
+    const actx = atlasCtxs[i];
+    actx.fillStyle = '#000';
+    actx.fillRect(x, y, CELL_W, CELL_H);
+    actx.fillStyle = '#fff';
+    actx.font = `${LAYER_FONTS[i]}${FONT_PX}px monospace`;
+    actx.textBaseline = 'top';
+    actx.fillText(String.fromCodePoint(cp || 32), x, y);
+  }
 }
 
 function atlasIndexFor(cp) {
@@ -68,21 +86,29 @@ function atlasIndexFor(cp) {
   return slot;
 }
 
-// Pre-rasterise printable ASCII.
+// Pre-rasterise printable ASCII into every layer.
 for (let cp = 32; cp < 127; cp++) atlasIndexFor(cp);
 
 const atlasTex = gl.createTexture();
 gl.activeTexture(gl.TEXTURE0);
-gl.bindTexture(gl.TEXTURE_2D, atlasTex);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+// Immutable storage so we don't keep allocating per upload.
+gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8,
+                ATLAS_COLS * CELL_W, ATLAS_ROWS * CELL_H, ATLAS_LAYERS);
 
 function syncAtlas() {
   gl.activeTexture(gl.TEXTURE0);
-  gl.bindTexture(gl.TEXTURE_2D, atlasTex);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvas);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
+  for (let i = 0; i < ATLAS_LAYERS; i++) {
+    gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0,
+                     0, 0, i,
+                     ATLAS_COLS * CELL_W, ATLAS_ROWS * CELL_H, 1,
+                     gl.RGBA, gl.UNSIGNED_BYTE, atlasCanvases[i]);
+  }
   atlasDirty = false;
 }
 syncAtlas();
@@ -125,7 +151,7 @@ void main() {
 
 const FS = `#version 300 es
 precision mediump float;
-uniform sampler2D u_atlas;
+uniform mediump sampler2DArray u_atlas;
 in vec2 v_uv;
 in vec2 v_cellUv;
 in vec4 v_fg;
@@ -139,22 +165,28 @@ bool hasAttr(float attrs, float bit) {
 }
 
 void main() {
-  bool inverse = hasAttr(v_attrs, 8.0);
+  bool bold    = hasAttr(v_attrs, 1.0);
+  bool italic  = hasAttr(v_attrs, 2.0);
   bool ulined  = hasAttr(v_attrs, 4.0);
+  bool inverse = hasAttr(v_attrs, 8.0);
   bool struck  = hasAttr(v_attrs, 16.0);
   bool faint   = hasAttr(v_attrs, 32.0);
+
+  // Atlas layer: 0 regular, 1 bold, 2 italic.  Bold wins over italic
+  // when both flags are set; we don't carry a bold-italic layer yet.
+  float layer = bold ? 1.0 : (italic ? 2.0 : 0.0);
 
   vec4 fg = v_fg;
   vec4 bg = v_bg;
   if (inverse) { vec4 t = fg; fg = bg; bg = t; }
   if (faint)   { fg = vec4(fg.rgb * 0.6, fg.a); }
 
-  float a = texture(u_atlas, v_uv).r;
+  float a = texture(u_atlas, vec3(v_uv, layer)).r;
   vec4 col = mix(bg, fg, a);
 
-  // Underline: lower ~10% of cell.
+  // Underline: lower ~12% of cell.
   if (ulined && v_cellUv.y > 0.88) col = fg;
-  // Strikethrough: middle ~10% band.
+  // Strikethrough: middle ~8% band.
   if (struck && v_cellUv.y > 0.46 && v_cellUv.y < 0.54) col = fg;
 
   fragColor = col;
