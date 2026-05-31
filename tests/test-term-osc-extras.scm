@@ -1,8 +1,8 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             ((canary term types)  #:prefix t:)
-             ((canary term parser) #:prefix t:))
+             ((gcell term types)  #:prefix t:)
+             ((gcell term parser) #:prefix t:))
 
 (define (capture-osc opener key)
   (let ((box (list #f)))

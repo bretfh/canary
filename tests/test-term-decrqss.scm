@@ -2,9 +2,9 @@
 
 (use-modules (srfi srfi-64)
              (srfi srfi-13)
-             ((canary term types)  #:prefix t:)
-             ((canary term ops)    #:prefix t:)
-             ((canary term parser) #:prefix t:))
+             ((gcell term types)  #:prefix t:)
+             ((gcell term ops)    #:prefix t:)
+             ((gcell term parser) #:prefix t:))
 
 (define (reply-of input)
   (let ((box (list #f)))

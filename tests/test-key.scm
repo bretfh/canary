@@ -1,7 +1,7 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             (canary key))
+             (gcell key))
 
 (test-begin "key")
 

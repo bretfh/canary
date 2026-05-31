@@ -1,18 +1,18 @@
-# canary
+# gcell
 
 elm/tea inspired tui in guile. see `DESIGN.md` for architecture,
-`examples/canary-tweet.scm` for a worked example, `SHIPPING.md` for
-producing single-file binaries of canary apps that run on machines
+`examples/gcell-tweet.scm` for a worked example, `SHIPPING.md` for
+producing single-file binaries of gcell apps that run on machines
 with no Guile installed.
 
-![canary](canary.png)
+![gcell](gcell.png)
 
 ## run
 
 ### linux (guix)
 
 ```sh
-guix shell -m manifest.scm -- guile -L . examples/canary-tweet.scm
+guix shell -m manifest.scm -- guile -L . examples/gcell-tweet.scm
 ```
 
 `manifest.scm` pins `guile-next`, `guile-fibers`, `gcc-toolchain`,
@@ -36,16 +36,16 @@ export GUILE_SYSTEM_EXTENSIONS_PATH=/opt/homebrew/lib/guile/3.0/extensions
 then:
 
 ```sh
-guile -L . examples/canary-tweet.scm
+guile -L . examples/gcell-tweet.scm
 ```
 
 ## make
 
 | target         |                                                   |
 |----------------|---------------------------------------------------|
-| `make compile`      | guild compile `canary/*.scm` to `build/canary/*.go` |
+| `make compile`      | guild compile `gcell/*.scm` to `build/gcell/*.go` |
 | `make test`         | run `tests/test-*.scm` under srfi-64              |
 | `make lint`         | reject ansi escapes outside backend-ansi/terminal |
 | `make repl`         | `guile --listen=37147` for geiser                 |
-| `make tool-install` | install `canary-build` into `~/.local/bin/`; see `SHIPPING.md` |
-| `make tool-test`    | smoke `canary-build ship` against the counter example |
+| `make tool-install` | install `gcell-build` into `~/.local/bin/`; see `SHIPPING.md` |
+| `make tool-test`    | smoke `gcell-build ship` against the counter example |

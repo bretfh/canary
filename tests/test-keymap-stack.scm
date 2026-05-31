@@ -2,13 +2,13 @@
 
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
-             (canary key)
-             (canary keymap)
-             (canary keymap-input)
-             (canary view)
-             (canary layout)
-             (canary render)
-             (canary draw))
+             (gcell key)
+             (gcell keymap)
+             (gcell keymap-input)
+             (gcell view)
+             (gcell layout)
+             (gcell render)
+             (gcell draw))
 
 (test-begin "keymap-stack")
 

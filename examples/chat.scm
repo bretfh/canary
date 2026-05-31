@@ -5,16 +5,16 @@
 ;;; between history (scroll with j/k) and input (typing). Enter posts
 ;;; your message and the fake bot replies after a delay.
 ;;;
-;;; Run: guile -L /path/to/guile-canary examples/chat.scm
+;;; Run: guile -L /path/to/guile-gcell examples/chat.scm
 ;;; Tab    switch focus between input and history
 ;;; j / k  scroll history (when history is focused)
 ;;; ↵      send (when input is focused)
 ;;; ctrl-c quit
 
-(use-modules (canary)
-             (canary components panel)
-             (canary components textinput)
-             (canary components viewport)
+(use-modules (gcell)
+             (gcell components panel)
+             (gcell components textinput)
+             (gcell components viewport)
              (oop goops))
 
 (define %bot-names '("nora" "kai" "rin" "atlas"))

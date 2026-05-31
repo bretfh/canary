@@ -1,8 +1,8 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             (canary faces)
-             (canary backend-ansi))
+             (gcell faces)
+             (gcell backend-ansi))
 
 (test-begin "faces")
 

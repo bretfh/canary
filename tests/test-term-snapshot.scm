@@ -2,10 +2,10 @@
 
 (use-modules (srfi srfi-64)
              (srfi srfi-13)
-             (canary layout)
-             (canary term types)
-             (canary term render)
-             (canary term snapshot))
+             (gcell layout)
+             (gcell term types)
+             (gcell term render)
+             (gcell term snapshot))
 
 (define (trim-trailing-spaces-per-line s)
   (string-join (map (lambda (line) (string-trim-right line #\space))

@@ -2,10 +2,10 @@
 
 (use-modules (srfi srfi-64)
              (srfi srfi-13)
-             ((canary term types) #:prefix t:)
-             ((canary term ops)   #:prefix t:)
-             ((canary term write) #:prefix t:)
-             ((canary term render) #:prefix t:))
+             ((gcell term types) #:prefix t:)
+             ((gcell term ops)   #:prefix t:)
+             ((gcell term write) #:prefix t:)
+             ((gcell term render) #:prefix t:))
 
 (define (fresh w h)
   (t:make-term #:width w #:height h))

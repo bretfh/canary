@@ -2,7 +2,7 @@
              (gnu packages guile)
              (gnu packages guile-xyz)
              (gnu packages version-control)
-             (canary deps webui))
+             (gcell deps webui))
 
 (packages->manifest
  (list guile-next

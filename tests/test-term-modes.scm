@@ -2,8 +2,8 @@
 
 (use-modules (srfi srfi-64)
              (srfi srfi-1)
-             ((canary term types)  #:prefix t:)
-             ((canary term modes)  #:prefix t:))
+             ((gcell term types)  #:prefix t:)
+             ((gcell term modes)  #:prefix t:))
 
 (define (fresh)
   (t:make-term #:width 10 #:height 3))

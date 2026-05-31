@@ -7,20 +7,20 @@
              (gnu packages guile)
              (gnu packages guile-xyz))
 
-(define %canary-checkout
+(define %gcell-checkout
   (dirname (current-filename)))
 
-(define %canary-source
-  (local-file %canary-checkout
-              "guile-canary-source"
+(define %gcell-source
+  (local-file %gcell-checkout
+              "guile-gcell-source"
               #:recursive? #t
-              #:select? (git-predicate %canary-checkout)))
+              #:select? (git-predicate %gcell-checkout)))
 
-(define-public guile-canary
+(define-public guile-gcell
   (package
-    (name "guile-canary")
+    (name "guile-gcell")
     (version "1.0.0")
-    (source %canary-source)
+    (source %gcell-source)
     (build-system gnu-build-system)
     (arguments
      (list
@@ -44,9 +44,9 @@
                             (let ((dst (string-append site "/" f)))
                               (mkdir-p (dirname dst))
                               (copy-file f dst)))
-                          (find-files "canary" "\\.scm$"))
-                (copy-file "canary.scm"
-                           (string-append site "/canary.scm"))
+                          (find-files "gcell" "\\.scm$"))
+                (copy-file "gcell.scm"
+                           (string-append site "/gcell.scm"))
                 (for-each (lambda (f)
                             (let* ((rel (substring f (string-length "build/")))
                                    (dst (string-append ccache "/" rel)))
@@ -71,7 +71,7 @@ kitty graphics, symbolic palette-resolved faces and a multi-chord keymap.
 Subscriptions installed via (every #:id k ...) are cancellable.  Re-evaluating
 a @code{define-method} or @code{define-class} updates the running process
 without restart.  Built on guile-fibers.")
-    (home-page "https://github.com/bretfhorne/guile-canary")
+    (home-page "https://github.com/bretfhorne/guile-gcell")
     (license l:gpl3+)))
 
-guile-canary
+guile-gcell

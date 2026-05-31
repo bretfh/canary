@@ -1,13 +1,13 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             (canary view)
-             (canary layout)
-             (canary widget)
-             (canary protocol)
-             (canary keymap)
-             ((canary engine-types) #:select (engine))
-             ((canary backend-test) #:select (make-test-backend))
+             (gcell view)
+             (gcell layout)
+             (gcell widget)
+             (gcell protocol)
+             (gcell keymap)
+             ((gcell engine-types) #:select (engine))
+             ((gcell backend-test) #:select (make-test-backend))
              (oop goops))
 
 (test-begin "cascade-noop")
@@ -22,7 +22,7 @@
 ;; reuses the same node.  Exercises the (eq? new-node node) gate in
 ;; dispatch-update!.
 
-(let* ((dispatch-update! (@@ (canary engine) dispatch-update!))
+(let* ((dispatch-update! (@@ (gcell engine) dispatch-update!))
        (w   (make <noop>))
        (cache (make-hash-table))
        (eng (engine #:backend (make-test-backend)
@@ -49,7 +49,7 @@
 (define-method (update (w <bump>) (msg <tick>))
   (cons (update-slots w #:n (+ 1 (bump-n w))) #f))
 
-(let* ((dispatch-update! (@@ (canary engine) dispatch-update!))
+(let* ((dispatch-update! (@@ (gcell engine) dispatch-update!))
        (w   (make <bump>))
        (eng (engine #:backend (make-test-backend)
                     #:keymap  (keymap)

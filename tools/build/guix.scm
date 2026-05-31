@@ -21,7 +21,7 @@
              (gnu packages autotools)
              (gnu packages pkg-config)
              (gnu packages zig)
-             (canary deps webui))
+             (gcell deps webui))
 
 (define (with-static pkg)
   "Return PKG with --enable-static added (and any upstream

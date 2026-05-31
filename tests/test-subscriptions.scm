@@ -1,13 +1,13 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             (canary view)
-             (canary layout)
-             (canary widget)
-             (canary protocol)
-             (canary keymap)
-             ((canary engine-types) #:select (engine engine-root))
-             ((canary backend-test) #:select (make-test-backend))
+             (gcell view)
+             (gcell layout)
+             (gcell widget)
+             (gcell protocol)
+             (gcell keymap)
+             ((gcell engine-types) #:select (engine engine-root))
+             ((gcell backend-test) #:select (make-test-backend))
              (oop goops))
 
 (test-begin "subscriptions")
@@ -37,7 +37,7 @@
 
 ;;; Gate: ticker fires on <tick>, inert is skipped entirely; the inert
 ;;; instance is identity-preserved across the cascade.
-(let* ((cascade! (@@ (canary engine) cascade!))
+(let* ((cascade! (@@ (gcell engine) cascade!))
        (root (make <pair-root>))
        (eng  (engine #:backend (make-test-backend)
                      #:keymap  (keymap)
@@ -55,7 +55,7 @@
                    (eq? new-b (pair-b (if (eq? new-root root) root new-root)))))))
 
 ;;; widget-handles? introspection.
-(let* ((widget-handles? (@@ (canary engine) widget-handles?))
+(let* ((widget-handles? (@@ (gcell engine) widget-handles?))
        (t (make <ticker>))
        (i (make <inert>)))
   (test-assert "ticker handles <tick>"
@@ -73,8 +73,8 @@
   (set! (inert-calls s) (+ 1 (inert-calls s)))
   (cons s #f))
 
-(let* ((widget-handles? (@@ (canary engine) widget-handles?))
-       (cascade! (@@ (canary engine) cascade!))
+(let* ((widget-handles? (@@ (gcell engine) widget-handles?))
+       (cascade! (@@ (gcell engine) cascade!))
        (i (make <inert>))
        (eng (engine #:backend (make-test-backend)
                     #:keymap  (keymap)

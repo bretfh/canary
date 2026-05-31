@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast });
 
     // ---- user-supplied build flags --------------------------------------
-    // canary-build (the Guile CLI) passes these per-project; defaults make
+    // gcell-build (the Guile CLI) passes these per-project; defaults make
     // a direct `zig build` produce a runnable but useless binary so the
     // wiring is testable without the wrapper.
     const payload_dir = b.option([]const u8, "payload-dir",
@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     const entry_proc = b.option([]const u8, "entry-proc",
         "Procedure within the entry module to call with no args.") orelse "main";
     const out_name = b.option([]const u8, "app-name",
-        "Name of the produced binary.") orelse "canary-app";
+        "Name of the produced binary.") orelse "gcell-app";
     const backend = b.option([]const u8, "backend",
         "Backend the app uses: 'ansi' (default, minimal) or 'webui' " ++
         "(pulls libwebui-2-static.a + the guile-webui bounce shim).")
@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
         }
     }
 
-    const obj = b.addObject(.{ .name = "canary-app-main", .root_module = obj_mod });
+    const obj = b.addObject(.{ .name = "gcell-app-main", .root_module = obj_mod });
 
     // Link with gcc — Guile's fat-LTO archives need its linker plugin;
     // LLD can't follow them.  pkg-config --static --libs drives the dep
@@ -174,7 +174,7 @@ pub fn build(b: *std.Build) void {
         link.addFileArg(bounce_wrap_lp);
 
         // libwebui-2-static.a is in the same profile lib dir as the
-        // other static deps (the canary deps webui package installs it
+        // other static deps (the gcell deps webui package installs it
         // alongside the .so).  Whole-archive so every exported symbol
         // is retained even though the producing app only calls a
         // subset via dynamic-link "webui-2"; otherwise dlsym at

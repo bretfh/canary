@@ -2,10 +2,10 @@
 
 (use-modules (srfi srfi-64)
              (oop goops)
-             (canary view)
-             ((canary term types)    #:prefix t:)
-             ((canary term parser)   #:prefix t:)
-             ((canary term dispatch) #:prefix t:))
+             (gcell view)
+             ((gcell term types)    #:prefix t:)
+             ((gcell term parser)   #:prefix t:)
+             ((gcell term dispatch) #:prefix t:))
 
 (define (fresh)
   (t:make-term #:width 10 #:height 3))

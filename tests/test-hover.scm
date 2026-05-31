@@ -2,10 +2,10 @@
 
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
-             (canary view)
-             (canary layout)
-             (canary render)
-             (canary draw))
+             (gcell view)
+             (gcell layout)
+             (gcell render)
+             (gcell draw))
 
 (test-begin "hover")
 

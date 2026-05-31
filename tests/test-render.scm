@@ -2,11 +2,11 @@
 
 (use-modules (srfi srfi-64)
              (srfi srfi-1)
-             (canary view)
-             (canary layout)
-             (canary borders)
-             (canary draw)
-             (canary render))
+             (gcell view)
+             (gcell layout)
+             (gcell borders)
+             (gcell draw)
+             (gcell render))
 
 (test-begin "render")
 

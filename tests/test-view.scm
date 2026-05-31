@@ -1,8 +1,8 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             (canary view)
-             (canary layout))
+             (gcell view)
+             (gcell layout))
 
 (test-begin "view")
 

@@ -1,0 +1,52 @@
+(define-module (gcell term color)
+  #:export (color-index->rgb))
+
+(define *base16*
+  #(#(24 24 24)
+    #(172 66 66)
+    #(144 169 89)
+    #(244 191 117)
+    #(106 159 181)
+    #(170 117 159)
+    #(117 181 170)
+    #(216 216 216)
+    #(107 107 107)
+    #(197 85 85)
+    #(170 196 116)
+    #(254 202 136)
+    #(130 184 200)
+    #(194 140 184)
+    #(147 211 195)
+    #(248 248 248)))
+
+(define *cube-levels* #(0 95 135 175 215 255))
+
+(define *palette*
+  (let ((p (make-vector 256 #f)))
+    (let loop ((i 0))
+      (when (< i 16)
+        (vector-set! p i (vector-ref *base16* i))
+        (loop (+ i 1))))
+    (let loop ((i 16))
+      (when (< i 232)
+        (let* ((idx (- i 16))
+               (r (vector-ref *cube-levels* (quotient idx 36)))
+               (g (vector-ref *cube-levels* (quotient (modulo idx 36) 6)))
+               (b (vector-ref *cube-levels* (modulo idx 6))))
+          (vector-set! p i (vector r g b)))
+        (loop (+ i 1))))
+    (let loop ((i 232))
+      (when (< i 256)
+        (let ((v (+ 8 (* 10 (- i 232)))))
+          (vector-set! p i (vector v v v)))
+        (loop (+ i 1))))
+    p))
+
+(define (color-index->rgb i)
+  "Return the (R G B) vector for 256-colour palette index I (0-15
+base16, 16-231 6×6×6 colour cube, 232-255 grayscale ramp), or #f if
+I is out of range."
+  (and (integer? i)
+       (>= i 0)
+       (< i 256)
+       (vector-ref *palette* i)))
