@@ -101,6 +101,15 @@
                    #:accessor webui-backend-next-image-id)
   (image-bytes-sent #:init-value 0
                     #:accessor wb-image-bytes-sent)
+  ;; Cached previous cell-region bytevector (W*H * cell-size).  Set to
+  ;; the last full cells block we put on the wire; encode-frame diffs
+  ;; against it to decide between a full and a delta frame.  Reset to
+  ;; #f on resize / mark-dirty / connect so the next frame is full.
+  (cells-cache      #:init-value #f
+                    #:accessor webui-backend-cells-cache)
+  (delta-frames     #:init-value 0 #:accessor wb-delta-frames)
+  (delta-cells      #:init-value 0 #:accessor wb-delta-cells)
+  (delta-skipped    #:init-value 0 #:accessor wb-delta-skipped)
   ;; Set in dispatch-browser-event! to monotonic internal-real-time
   ;; (ns) when the bounce delivers input; the engine's next event-loop
   ;; cycle reads it to compute queue-to-wake latency (the fiber-
@@ -146,8 +155,17 @@
 
 (define-method (backend-handle-resize! (b <webui-backend>) w h)
   (set! (webui-backend-size-slot b) (size w h))
+  ;; Grid dimensions just changed: any cached cell block has the wrong
+  ;; shape, so the next frame must be full.
+  (set! (webui-backend-cells-cache b) #f)
   (let ((term (webui-backend-cur-term b)))
     (when term (t:term-resize! term w h))))
+
+(define-method (backend-mark-dirty! (b <webui-backend>))
+  ;; Drop the diff baseline so the next encode-frame emits a full frame
+  ;; regardless of how little changed.  Callers use this when downstream
+  ;; (browser refresh, theme swap) needs a fresh slate.
+  (set! (webui-backend-cells-cache b) #f))
 
 (define (js-string-literal s)
   "Escape S as a JavaScript double-quoted string literal."
@@ -416,7 +434,7 @@ preserved so later placements paint over earlier ones."
          (placements (collect-image-placements b cmds)))
     (render-cmds-to-term! term cmds th)
     (let* ((t1    (%mono-ns))
-           (frame (encode-frame term placements))
+           (frame (encode-frame b term placements))
            (t2    (%mono-ns)))
       (webui-send-raw (webui-backend-window b) %frame-js-fn frame)
       (let* ((t3        (%mono-ns))
@@ -452,7 +470,8 @@ preserved so later placements paint over earlier ones."
 
 (define %frame-header-size 16)
 (define %cell-size 13)
-(define %frame-version 3)  ; v3 adds an image-placement overlay after the hyperlinks
+(define %delta-cell-size 17)  ; u32 index + 13-byte cell record
+(define %frame-version 4)  ; v4: byte 5 is frame_type (0 full, 1 delta)
 
 ;; Frame v3 layout, after the v2 hyperlink overlay:
 ;;   u16 image_count
@@ -498,25 +517,71 @@ overlays each (col,row,url) onto its hit-test map)."
 (define (utf8-byte-count s)
   (bytevector-length (string->utf8 s)))
 
-(define (encode-frame term placements)
-  "Encode TERM's visible grid into the v3 binary frame the browser
-canaryFrame() unpacks.  Cursor coordinates come from TERM-CURSOR-X /
-TERM-CURSOR-Y (canary's term keeps them 1-indexed in the VT
-convention; subtract 1 to land on the cell grid).
-
-After the cell records (W*H * 13 bytes), a hyperlink-overlay
-section: u16 link-count + link-count entries of
-  u16 col, u16 row, u16 url-byte-length, url bytes (utf-8).
-
-Then the image-placement overlay (v3): u16 image-count + count
-entries of (u32 id, u16 col, u16 row, u16 w, u16 h,
-u16 src-x, u16 src-y, u16 src-w, u16 src-h).  Image bytes are NOT
-in the frame; they were streamed on the canaryImage channel."
-  (let* ((w     (t:term-width term))
+(define (build-cells-bv term)
+  "Encode every cell of TERM into a fresh bytevector (W*H * %cell-size).
+This is the canonical cell section the frame's full path copies
+verbatim; the delta path slices into it by cell index."
+  (let* ((w     (t:term-width  term))
          (h     (t:term-height term))
          (cells (* w h))
          (chars (t:term-chars term))
          (faces (t:term-faces term))
+         (bv    (make-bytevector (* cells %cell-size) 0)))
+    (do ((i 0 (+ i 1)))
+        ((= i cells) bv)
+      (let* ((off  (* i %cell-size))
+             (cp   (u32vector-ref chars i))
+             (face (vector-ref    faces i))
+             (a    (face->attrs face)))
+        (bytevector-u32-set! bv off cp (endianness little))
+        (bytevector-u32-set! bv (+ off 4)
+                             (face-fg->rgb face) (endianness little))
+        (bytevector-u32-set! bv (+ off 8)
+                             (face-bg->rgb face) (endianness little))
+        (bytevector-u8-set! bv (+ off 12)
+                            (if (and face
+                                     (let ((u (t:face-hyperlink face)))
+                                       (and u (string? u))))
+                                (logior a 64)
+                                a))))))
+
+(define (cells-diff-indices old new)
+  "Return the list of cell indices where NEW differs from OLD (both
+bytevectors with the same %cell-size stride).  Reversed insertion
+order is irrelevant because the wire decoder treats each index
+independently."
+  (let* ((n     (bytevector-length new))
+         (cells (quotient n %cell-size))
+         (out   '()))
+    (do ((i 0 (+ i 1)))
+        ((= i cells) (reverse out))
+      (let ((off (* i %cell-size)))
+        (let scan ((j 0))
+          (cond
+           ((= j %cell-size) #f)            ; equal, no diff
+           ((= (bytevector-u8-ref old (+ off j))
+               (bytevector-u8-ref new (+ off j)))
+            (scan (+ j 1)))
+           (else
+            (set! out (cons i out)))))))))
+
+(define (encode-frame b term placements)
+  "Encode TERM's visible state as a v4 binary frame.
+
+Layout: 16-byte header (magic, version, frame_type, width, height,
+cursor_col, cursor_row, cursor_style, cursor_attrs) then a cell
+section followed by a hyperlink overlay and an image-placement
+overlay.
+
+The cell section is either a full grid copy (W*H * %cell-size
+bytes) or a delta (u32 count + count entries of (u32 index,
+%cell-size bytes)), selected per-frame by whichever encoding has
+the smaller wire cost.  When the backend has no cells-cache (first
+frame, mark-dirty, resize) we always emit a full frame and seed
+the cache."
+  (let* ((w     (t:term-width term))
+         (h     (t:term-height term))
+         (cells (* w h))
          (cx    (max 0 (- (t:term-cursor-x term) 1)))
          (cy    (max 0 (- (t:term-cursor-y term) 1)))
          (style (term-cursor-style->code (t:term-cursor-style term)))
@@ -526,79 +591,100 @@ in the frame; they were streamed on the canaryImage channel."
                                        (+ 6 (bytevector-length u)))
                                      link-utf8s)))
          (n-placements (length placements))
-         (bv    (make-bytevector
-                 (+ %frame-header-size
-                    (* cells %cell-size)
-                    2                       ; u16 link count
-                    link-bytes
-                    2                       ; u16 image-placement count
-                    (* n-placements %image-placement-bytes))
-                 0)))
+         (new-cells (build-cells-bv term))
+         (full-cell-bytes (* cells %cell-size))
+         (cache (webui-backend-cells-cache b))
+         (deltas (and cache
+                      (= (bytevector-length cache) full-cell-bytes)
+                      (cells-diff-indices cache new-cells)))
+         (delta-count (and deltas (length deltas)))
+         (delta-bytes (and delta-count
+                           (+ 4 (* delta-count %delta-cell-size))))
+         (do-delta? (and delta-bytes (< delta-bytes full-cell-bytes)))
+         (cell-region-size (if do-delta? delta-bytes full-cell-bytes))
+         (bv (make-bytevector
+              (+ %frame-header-size
+                 cell-region-size
+                 2 link-bytes
+                 2 (* n-placements %image-placement-bytes))
+              0)))
+    ;; Header.
     (bytevector-u32-set! bv 0 %frame-magic (endianness little))
     (bytevector-u8-set!  bv 4 %frame-version)
-    (bytevector-u8-set!  bv 5 0)
+    (bytevector-u8-set!  bv 5 (if do-delta? 1 0))
     (bytevector-u16-set! bv 6  w  (endianness little))
     (bytevector-u16-set! bv 8  h  (endianness little))
     (bytevector-u16-set! bv 10 cx (endianness little))
     (bytevector-u16-set! bv 12 cy (endianness little))
     (bytevector-u8-set!  bv 14 style)
     (bytevector-u8-set!  bv 15 0)
-    (do ((i 0 (+ i 1)))
-        ((= i cells))
-      (let* ((off  (+ %frame-header-size (* i %cell-size)))
-             (cp   (u32vector-ref chars i))
-             (face (vector-ref    faces i))
-             (a    (face->attrs face)))
-        (bytevector-u32-set! bv off cp (endianness little))
-        (bytevector-u32-set! bv (+ off 4)
-                             (face-fg->rgb face) (endianness little))
-        (bytevector-u32-set! bv (+ off 8)
-                             (face-bg->rgb face) (endianness little))
-        ;; Bit 6 of attrs flags "this cell carries a hyperlink" so the
-        ;; client can do a cheap test before consulting the overlay.
-        (bytevector-u8-set! bv (+ off 12)
-                            (if (and face
-                                     (let ((u (t:face-hyperlink face)))
-                                       (and u (string? u))))
-                                (logior a 64)
-                                a))))
-    ;; Hyperlink table.  Returns the byte offset right after the
-    ;; section so the image-placement table can pick up there.
-    (define hyperlinks-end
-      (let* ((cells-end (+ %frame-header-size (* cells %cell-size)))
-             (count-off cells-end))
-        (bytevector-u16-set! bv count-off (length links) (endianness little))
-        (let loop ((entries links) (utf8s link-utf8s) (off (+ count-off 2)))
-          (cond
-           ((null? entries) off)
-           (else
-            (let* ((entry (car entries))
-                   (col   (car entry))
-                   (row   (cadr entry))
-                   (utf8  (car utf8s))
-                   (ulen  (bytevector-length utf8)))
-              (bytevector-u16-set! bv off       col  (endianness little))
-              (bytevector-u16-set! bv (+ off 2) row  (endianness little))
-              (bytevector-u16-set! bv (+ off 4) ulen (endianness little))
-              (bytevector-copy!    utf8 0 bv (+ off 6) ulen)
-              (loop (cdr entries) (cdr utf8s) (+ off 6 ulen))))))))
-    ;; Image-placement table.
-    (bytevector-u16-set! bv hyperlinks-end n-placements (endianness little))
-    (let loop ((entries placements) (off (+ hyperlinks-end 2)))
-      (cond
-       ((null? entries) bv)
-       (else
-        (let ((p (car entries)))
-          (bytevector-u32-set! bv off       (car p)         (endianness little))
-          (bytevector-u16-set! bv (+ off 4) (cadr p)        (endianness little))
-          (bytevector-u16-set! bv (+ off 6) (caddr p)       (endianness little))
-          (bytevector-u16-set! bv (+ off 8) (cadddr p)      (endianness little))
-          (bytevector-u16-set! bv (+ off 10) (list-ref p 4) (endianness little))
-          (bytevector-u16-set! bv (+ off 12) (list-ref p 5) (endianness little))
-          (bytevector-u16-set! bv (+ off 14) (list-ref p 6) (endianness little))
-          (bytevector-u16-set! bv (+ off 16) (list-ref p 7) (endianness little))
-          (bytevector-u16-set! bv (+ off 18) (list-ref p 8) (endianness little))
-          (loop (cdr entries) (+ off %image-placement-bytes))))))))
+    ;; Cell section.
+    (cond
+     (do-delta?
+      (bytevector-u32-set! bv %frame-header-size delta-count
+                           (endianness little))
+      (let loop ((ds deltas) (off (+ %frame-header-size 4)))
+        (cond
+         ((null? ds) #f)
+         (else
+          (let ((idx (car ds)))
+            (bytevector-u32-set! bv off idx (endianness little))
+            (bytevector-copy! new-cells (* idx %cell-size)
+                              bv (+ off 4) %cell-size)
+            (loop (cdr ds) (+ off %delta-cell-size))))))
+      (set! (wb-delta-frames b) (+ 1 (wb-delta-frames b)))
+      (set! (wb-delta-cells b)  (+ delta-count (wb-delta-cells b)))
+      (set! (wb-delta-skipped b)
+            (+ (- cells delta-count) (wb-delta-skipped b))))
+     (else
+      (bytevector-copy! new-cells 0 bv %frame-header-size full-cell-bytes)))
+    ;; Hyperlink overlay.
+    (let ((hl-start (+ %frame-header-size cell-region-size)))
+      (bytevector-u16-set! bv hl-start (length links) (endianness little))
+      (let loop ((entries links) (utf8s link-utf8s) (off (+ hl-start 2)))
+        (cond
+         ((null? entries)
+          ;; Image-placement overlay.
+          (bytevector-u16-set! bv off n-placements (endianness little))
+          (let ploop ((ps placements) (poff (+ off 2)))
+            (cond
+             ((null? ps) #f)
+             (else
+              (let ((p (car ps)))
+                (bytevector-u32-set! bv poff       (car p)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff  4) (cadr p)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff  6) (caddr p)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff  8) (cadddr p)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff 10) (list-ref p 4)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff 12) (list-ref p 5)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff 14) (list-ref p 6)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff 16) (list-ref p 7)
+                                     (endianness little))
+                (bytevector-u16-set! bv (+ poff 18) (list-ref p 8)
+                                     (endianness little))
+                (ploop (cdr ps) (+ poff %image-placement-bytes)))))))
+         (else
+          (let* ((entry (car entries))
+                 (col   (car entry))
+                 (row   (cadr entry))
+                 (utf8  (car utf8s))
+                 (ulen  (bytevector-length utf8)))
+            (bytevector-u16-set! bv off       col  (endianness little))
+            (bytevector-u16-set! bv (+ off 2) row  (endianness little))
+            (bytevector-u16-set! bv (+ off 4) ulen (endianness little))
+            (bytevector-copy!    utf8 0 bv (+ off 6) ulen)
+            (loop (cdr entries) (cdr utf8s) (+ off 6 ulen)))))))
+    ;; Update cache so the next frame can diff against the bytes the
+    ;; browser is now displaying.
+    (set! (webui-backend-cells-cache b) new-cells)
+    bv))
 
 
 ;;;
@@ -789,6 +875,11 @@ JSON dependency for L1; the wire schema is closed."
 (define (resize-backend! b w h)
   (let ((term (webui-backend-cur-term b)))
     (set! (webui-backend-size-slot b) (size w h))
+    ;; Drop the diff baseline.  Handles both genuine resizes (new
+    ;; dimensions invalidate per-cell offsets) and browser reconnects
+    ;; at the same size, where the client has no previous frame to
+    ;; delta against.
+    (set! (webui-backend-cells-cache b) #f)
     (when term (t:term-resize! term w h))))
 
 ;; Minimal JSON peekers: the wire shapes are flat objects with string
@@ -912,7 +1003,10 @@ suffixed `-ns'; cumulative + max + mean for each timing channel."
       (queue-samples   . ,(wb-queue-samples b))
       (queue-ms-mean   . ,(ns->ms (%mean-ns (wb-queue-ns b)
                                             (wb-queue-samples b))))
-      (queue-ms-max    . ,(ns->ms (wb-queue-ns-max b))))))
+      (queue-ms-max    . ,(ns->ms (wb-queue-ns-max b)))
+      (delta-frames    . ,(wb-delta-frames b))
+      (delta-cells     . ,(wb-delta-cells b))
+      (delta-skipped   . ,(wb-delta-skipped b)))))
 
 (define (reset-webui-backend-stats! b)
   "Zero every counter on B and clear the input-types histogram."
@@ -933,8 +1027,10 @@ suffixed `-ns'; cumulative + max + mean for each timing channel."
 
 (define (format-stats-line stats)
   (format #f
-    "frames=~a inputs=~a bounce=~a parse-errs=~a bytes=~a~%  draw  ~,2f/~,2f ms  encode ~,2f/~,2f ms  send ~,2f/~,2f ms~%  cycle ~,2f/~,2f ms  drain ~,2f/~,2f ms  process ~,2f/~,2f ms  render ~,2f/~,2f ms~%  queue ~,2f/~,2f ms (n=~a)  lat ~,2f/~,2f ms (n=~a)"
+    "frames=~a (delta=~a, skipped=~a cells) inputs=~a bounce=~a parse-errs=~a bytes=~a~%  draw  ~,2f/~,2f ms  encode ~,2f/~,2f ms  send ~,2f/~,2f ms~%  cycle ~,2f/~,2f ms  drain ~,2f/~,2f ms  process ~,2f/~,2f ms  render ~,2f/~,2f ms~%  queue ~,2f/~,2f ms (n=~a)  lat ~,2f/~,2f ms (n=~a)"
     (assq-ref stats 'frames-sent)
+    (assq-ref stats 'delta-frames)
+    (assq-ref stats 'delta-skipped)
     (assq-ref stats 'inputs)
     (assq-ref stats 'bounce-bind-calls)
     (assq-ref stats 'parse-errors)

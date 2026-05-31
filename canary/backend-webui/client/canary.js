@@ -14,14 +14,20 @@ const CELL_SIZE   = 13;
 
 // Frame layout (matches encode-frame in canary/backend-webui.scm):
 //   u32 magic 0..3
-//   u8  version 4
-//   u8  reserved 5
+//   u8  version 4   (v4 adds delta frames)
+//   u8  frame_type 5  (0=full grid, 1=delta from previous frame)
 //   u16 width 6..7
 //   u16 height 8..9
 //   u16 cursor_col 10..11
 //   u16 cursor_row 12..13
 //   u8  cursor_style (0=hidden, 1=block, 2=underline, 3=bar) 14
 //   u8  cursor_attrs (bit 0 blink) 15
+//
+// Cell section depends on frame_type:
+//   full:  width*height * 13 bytes (u32 cp, u32 fg, u32 bg, u8 attrs)
+//   delta: u32 count + count entries of (u32 cell_index, 13 bytes)
+//
+// Hyperlink overlay (v2+) and image-placement overlay (v3+) follow.
 
 const FONT_PX = 16;
 const CELL_W  = 9;
@@ -359,14 +365,27 @@ function linkKey(col, row) { return (row << 16) | col; }
 
 const utf8Decoder = new TextDecoder('utf-8');
 
+function writeCellSlot(idx, w, cp, fg, bg, attrs) {
+  const col = idx % w;
+  const row = (idx - col) / w;
+  let p = idx * FLOATS_PER_CELL;
+  cellsArray[p++] = col;
+  cellsArray[p++] = row;
+  cellsArray[p++] = atlasIndexFor(cp);
+  unpackColor(fg, cellsArray, p, DEFAULT_FG); p += 4;
+  unpackColor(bg, cellsArray, p, DEFAULT_BG); p += 4;
+  cellsArray[p++] = attrs;
+}
+
 function applyFrame(buf) {
   const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   if (dv.getUint32(0, true) !== MAGIC) return;
-  // dv.getUint8(4): version.  v1: cells only.  v2: cells + hyperlink
-  // overlay (u16 count + entries).  Forward-compat: unknown trailing
-  // bytes are ignored.
-  const version = dv.getUint8(4);
+  // version & frame_type.  v1 cells only; v2 hyperlinks overlay;
+  // v3 image-placement overlay; v4 byte 5 carries frame_type
+  // (0 full, 1 delta).
+  const version   = dv.getUint8(4);
+  const frameType = (version >= 4) ? dv.getUint8(5) : 0;
   const w = dv.getUint16(6, true);
   const h = dv.getUint16(8, true);
   cursorCol   = dv.getUint16(10, true);
@@ -375,24 +394,37 @@ function applyFrame(buf) {
   cursorBlink = (dv.getUint8(15) & 1) !== 0;
   const total = w * h;
   if (cellsArray.length !== total * FLOATS_PER_CELL) {
+    // Grid resized: any cells we had are stale and the delta we just
+    // received (if any) can't be applied to a fresh array.  The server
+    // clears its cache on resize so the next frame should be full --
+    // until then we paint what we can.
     cellsArray = new Float32Array(total * FLOATS_PER_CELL);
   }
   gridW = w; gridH = h;
-  let p = 0;
-  for (let i = 0; i < total; i++) {
-    const off = HEADER_SIZE + i * CELL_SIZE;
-    const cp    = dv.getUint32(off,     true);
-    const fg    = dv.getUint32(off + 4, true);
-    const bg    = dv.getUint32(off + 8, true);
-    const attrs = dv.getUint8 (off + 12);
-    const col = i % w;
-    const row = (i - col) / w;
-    cellsArray[p++] = col;
-    cellsArray[p++] = row;
-    cellsArray[p++] = atlasIndexFor(cp);
-    unpackColor(fg, cellsArray, p, DEFAULT_FG); p += 4;
-    unpackColor(bg, cellsArray, p, DEFAULT_BG); p += 4;
-    cellsArray[p++] = attrs;
+  let cellsEnd;
+  if (frameType === 1) {
+    const deltaCount = dv.getUint32(HEADER_SIZE, true);
+    let off = HEADER_SIZE + 4;
+    for (let i = 0; i < deltaCount; i++) {
+      const idx   = dv.getUint32(off,       true);
+      const cp    = dv.getUint32(off +  4,  true);
+      const fg    = dv.getUint32(off +  8,  true);
+      const bg    = dv.getUint32(off + 12,  true);
+      const attrs = dv.getUint8 (off + 16);
+      writeCellSlot(idx, w, cp, fg, bg, attrs);
+      off += 17;
+    }
+    cellsEnd = off;
+  } else {
+    for (let i = 0; i < total; i++) {
+      const off   = HEADER_SIZE + i * CELL_SIZE;
+      const cp    = dv.getUint32(off,     true);
+      const fg    = dv.getUint32(off + 4, true);
+      const bg    = dv.getUint32(off + 8, true);
+      const attrs = dv.getUint8 (off + 12);
+      writeCellSlot(i, w, cp, fg, bg, attrs);
+    }
+    cellsEnd = HEADER_SIZE + total * CELL_SIZE;
   }
   cellCount = total;
 
@@ -400,7 +432,7 @@ function applyFrame(buf) {
   // <len> utf-8 bytes.  Clear the previous map so links that left the
   // frame stop hit-testing.
   hyperlinks.clear();
-  let overlayOff = HEADER_SIZE + total * CELL_SIZE;
+  let overlayOff = cellsEnd;
   if (version >= 2 && u8.byteLength >= overlayOff + 2) {
     const linkCount = dv.getUint16(overlayOff, true);
     let off = overlayOff + 2;
