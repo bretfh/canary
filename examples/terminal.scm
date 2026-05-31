@@ -298,8 +298,8 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
     p))
 
 (define (main)
-  (let* ((rows 36)
-         (cols 120)
+  (let* ((rows 24)
+         (cols 80)
          (master+pid (spawn-shell rows cols))
          (master (car master+pid))
          (pid    (cdr master+pid))

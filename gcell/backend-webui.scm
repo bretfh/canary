@@ -26,6 +26,8 @@
   #:use-module ((ice-9 textual-ports) #:select (get-string-all))
   #:use-module ((ice-9 ports) #:select (call-with-input-file))
   #:use-module ((ice-9 threads) #:select (call-with-new-thread join-thread))
+  #:use-module ((ice-9 popen) #:select (open-input-pipe close-pipe))
+  #:use-module ((srfi srfi-13) #:select (string-contains))
   #:use-module (ice-9 match)
   #:use-module ((ice-9 format) #:select (format))
   #:export (<webui-backend>
@@ -34,7 +36,8 @@
             webui-backend-theme
             set-webui-backend-theme!
             webui-backend-stats
-            reset-webui-backend-stats!))
+            reset-webui-backend-stats!
+            webui-backend-reload!))
 
 ;;; Commentary:
 ;;;
@@ -164,7 +167,13 @@
   ;; shape, so the next frame must be full.
   (set! (webui-backend-cells-cache b) #f)
   (let ((term (webui-backend-cur-term b)))
-    (when term (t:term-resize! term w h))))
+    (when term (t:term-resize! term w h)))
+  (let ((eng (webui-backend-engine b)))
+    (when eng
+      (false-if-exception
+       ((module-ref (resolve-module '(gcell engine)) 'engine-log!)
+        eng 'webui 'info
+        (format #f "resize accepted: grid=~ax~a" w h))))))
 
 (define-method (backend-mark-dirty! (b <webui-backend>))
   ;; Drop the diff baseline so the next encode-frame emits a full frame
@@ -291,6 +300,161 @@
 ;; Frame format magic, little-endian "GCEL" (0x4C454347).
 (define %frame-magic #x4C454347)
 
+;; Device pixels per cell on the browser side.  Must stay in sync with
+;; CELL_W_DEV / CELL_H_DEV defaults in backend-webui/client/gcell.js.
+;; Used to translate the backend's cell-grid `#:size` into the pixel
+;; window size we ask webui to open the browser at, so the engine's
+;; first frame fits the window exactly.  These are device px because
+;; cells are now rendered in device px (so the chosen font px equals
+;; that many actual pixels on screen, locked against Wayland
+;; fractional-scale drift).
+(define %css-cell-w 10)
+(define %css-cell-h 20)
+
+
+;;;
+;;; Firefox profile prefs (Wayland font-scale lock).
+;;;
+;;; webui's _webui_browser_create_new_profile (webui.c:6010-6219) creates
+;;; a Firefox profile under $HOME/.WebUI/WebUIFirefoxProfile-NoHC and writes
+;;; a prefs.js with `browser.tabs.inTitlebar=0`, plus a userChrome.css that
+;;; collapses every toolbar.  On Wayland (sway, etc.) that combination
+;;; makes Firefox decide whether to draw its own CSD titlebar based on
+;;; window dimensions; the titlebar shows/hides as the window is resized,
+;;; which silently shifts inner viewport height while devicePixelRatio
+;;; stays at 1.  Combined with Firefox's default
+;;; `layout.css.devPixelsPerPx=-1.0` ("auto") and Wayland fractional
+;;; scaling, the rendered glyph size drifts at certain window dims while
+;;; JS still reads dpr=1 and CSS px stays constant.  That's the
+;;; "font is literal pixels tall at certain window sizes" report.
+;;;
+;;; The fix is to pre-create the profile ourselves with prefs that lock
+;;; both: `layout.css.devPixelsPerPx=1.0` pins 1 CSS px = 1 device px, and
+;;; `browser.tabs.inTitlebar=1` keeps the system titlebar so the inner
+;;; viewport stops jumping.  We also disable Wayland fractional scale
+;;; support entirely to remove the underlying drift source.
+;;;
+;;; Since both the profile folder AND a profiles.ini entry exist after we
+;;; create them, webui's create-profile branch (webui.c:6147) short-
+;;; circuits and our prefs survive every subsequent webui_show.
+
+(define %gcell-firefox-profile-name "WebUIFirefoxProfile-NoHC")
+
+(define (%webui-firefox-profile-path)
+  "Return the Firefox profile path webui will use for this app on Linux.
+Mirrors webui.c:6113-6133 for the non-snap case."
+  (let ((home (or (getenv "HOME") "/tmp")))
+    (string-append home "/.WebUI/" %gcell-firefox-profile-name)))
+
+(define (%firefox-profiles-ini-path)
+  "Return the path to Firefox's profiles.ini.  webui consults this to
+decide whether the profile already exists (webui.c:6103-6108)."
+  (let ((home (or (getenv "HOME") "/tmp")))
+    (let ((std  (string-append home "/.mozilla/firefox/profiles.ini"))
+          (snap (string-append home
+                               "/snap/firefox/common/.mozilla/firefox/profiles.ini")))
+      (cond
+       ((file-exists? std)  std)
+       ((file-exists? snap) snap)
+       (else std)))))
+
+(define (%profiles-ini-has? ini name)
+  "Return #t when NAME is registered as a profile in INI."
+  (and (file-exists? ini)
+       (let ((text (call-with-input-file ini get-string-all)))
+         (string-contains text (string-append "Name=" name)))))
+
+(define (%mkdir-p dir)
+  "mkdir -p DIR; tolerates already-existing intermediate dirs."
+  (let loop ((parts (filter (lambda (s) (positive? (string-length s)))
+                             (string-split dir #\/)))
+             (acc "/"))
+    (cond
+     ((null? parts) #t)
+     (else
+      (let ((next (string-append acc (car parts))))
+        (unless (file-exists? next)
+          (false-if-exception (mkdir next)))
+        (loop (cdr parts) (string-append next "/")))))))
+
+(define (%write-file! path text)
+  "Overwrite PATH with TEXT."
+  (let ((p (open-output-file path)))
+    (display text p)
+    (close-port p)))
+
+(define %gcell-firefox-prefs
+  ;; Pin the CSS-to-device pixel ratio (kills Wayland fractional drift).
+  ;; Force the system titlebar so the inner viewport stops oscillating.
+  ;; Disable Wayland fractional scale negotiation entirely; we want
+  ;; integer-only DPR for predictable rendering.
+  ;; Keep the webui defaults we still want: legacy stylesheets enabled
+  ;; (so userChrome.css loads), skip default-browser nag, don't warn on
+  ;; close.  Last-write-wins inside prefs.js, so listing inTitlebar=1
+  ;; after webui would have written =0 makes ours stick.
+  (string-append
+   "user_pref(\"toolkit.legacyUserProfileCustomizations.stylesheets\", true);\n"
+   "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n"
+   "user_pref(\"browser.tabs.warnOnClose\", false);\n"
+   "user_pref(\"browser.tabs.inTitlebar\", 1);\n"
+   "user_pref(\"layout.css.devPixelsPerPx\", \"1.0\");\n"
+   "user_pref(\"widget.wayland.fractional-scale.enabled\", false);\n"))
+
+(define %gcell-firefox-user-chrome
+  ;; Same chrome-collapse rules webui ships at webui.c:6210-6215.  We
+  ;; reproduce them because we're pre-creating the profile ourselves;
+  ;; webui's create-profile branch will short-circuit on a populated
+  ;; profile and never get a chance to write its own userChrome.css.
+  (string-append
+   "#navigator-toolbox,#TabsToolbar,#nav-bar,#PersonalToolbar,#sidebar-box"
+   "{visibility:collapse!important;height:0!important;margin:0!important;"
+   "padding:0!important;}"
+   "#titlebar{visibility:visible!important;display:flex!important;}"
+   "#browser{margin-top:0!important;padding-top:0!important;}"))
+
+(define (%firefox-create-profile! name path)
+  "Invoke `firefox -CreateProfile NAME PATH` synchronously so Firefox
+registers the profile in profiles.ini.  Returns #t on success."
+  (let* ((cmd  (string-append
+                "firefox -CreateProfile \"" name " " path "\""
+                " >/dev/null 2>&1"))
+         (port (open-input-pipe cmd)))
+    (close-pipe port)
+    ;; Wait briefly for the profile dir to materialise.  Firefox's
+    ;; CreateProfile is normally instant but Wayland session start can
+    ;; add latency.
+    (let loop ((tries 20))
+      (cond
+       ((file-exists? path) #t)
+       ((zero? tries) #f)
+       (else
+        (usleep 100000)
+        (loop (- tries 1)))))))
+
+(define (%ensure-gcell-firefox-prefs!)
+  "Pre-create the Firefox profile webui will use, with prefs that lock
+font rendering against Wayland fractional-scale drift.  Idempotent on
+subsequent runs: re-writes prefs.js + userChrome.css every time so
+edits to the constants above take effect on the next gcell launch
+without the user having to delete the profile dir."
+  (let* ((path (%webui-firefox-profile-path))
+         (ini  (%firefox-profiles-ini-path))
+         (name %gcell-firefox-profile-name))
+    ;; Ensure profile is registered in profiles.ini.  Without this entry
+    ;; webui's _webui_browser_create_new_profile takes the slow path
+    ;; (delete + firefox -CreateProfile + write its own prefs), which
+    ;; would clobber ours.
+    (unless (%profiles-ini-has? ini name)
+      (%firefox-create-profile! name path))
+    (when (file-exists? path)
+      (let ((prefs (string-append path "/prefs.js"))
+            (chrome-dir (string-append path "/chrome")))
+        (%write-file! prefs %gcell-firefox-prefs)
+        (unless (file-exists? chrome-dir)
+          (false-if-exception (mkdir chrome-dir)))
+        (%write-file! (string-append chrome-dir "/userChrome.css")
+                      %gcell-firefox-user-chrome)))))
+
 (define-method (backend-init (b <webui-backend>))
   (let* ((sz   (webui-backend-size-slot b))
          (w    (webui-new-window))
@@ -314,7 +478,14 @@
     ;; on requests without the auth cookie, which makes the demo
     ;; fragile against curl-based probes; disable it for the dev demo.
     (webui-set-config +webui-config-use-cookies+ #f)
-    (webui-set-size w 960 600)
+    (let ((px-w (max 320 (* (size-width  sz) %css-cell-w)))
+          (px-h (max 240 (* (size-height sz) %css-cell-h))))
+      (webui-set-size w px-w px-h))
+    ;; Pre-seed the Firefox profile with locked prefs BEFORE webui-show.
+    ;; Once both the profile dir and the profiles.ini entry exist, webui
+    ;; skips its own profile-creation branch (webui.c:6147) and our
+    ;; prefs survive every subsequent launch.
+    (%ensure-gcell-firefox-prefs!)
     ;; The browser sends every key/mouse/resize event through this one
     ;; bind, tagged by type in the JSON payload.  webui invokes the
     ;; callback from a CIVETweb worker thread; guile-webui's bounce
@@ -346,30 +517,68 @@
                (lambda args
                  (format (current-error-port)
                          "webui-wait thread error: ~s~%" args))))))
-    ;; Telemetry: dump a one-line stats snapshot every 2s to stderr.
-    ;; engine-log! also surfaces these in gcell's log overlay; the
-    ;; stderr line is for tooling reading the server log directly.
+    ;; Telemetry: dump a one-line stats snapshot every 2s to stderr AND
+    ;; to engine-log! so it surfaces on the in-grid log overlay the user
+    ;; is actually looking at while they use the app.  The stderr line
+    ;; remains for tooling that reads the server log directly.
     (set! (webui-backend-stats-thread b)
           (call-with-new-thread
            (lambda ()
-             (let loop ()
-               (catch #t
-                 (lambda ()
-                   (sleep 2)
-                   (let ((line (format-stats-line
-                                (webui-backend-stats b))))
-                     (format (current-error-port)
-                             "[gcell backend-webui stats] ~a~%" line)
-                     (force-output (current-error-port))))
-                 (lambda args
-                   (format (current-error-port)
-                           "stats-thread error: ~s~%" args)))
-               (loop)))))
+             (let loop ((prev-key #f))
+               (let ((key (catch #t
+                            (lambda ()
+                              (sleep 2)
+                              (let* ((stats (webui-backend-stats b))
+                                     (cur (list (assq-ref stats 'frames-sent)
+                                                (assq-ref stats 'inputs)
+                                                (assq-ref stats 'parse-errors)
+                                                (assq-ref stats 'bytes-out))))
+                                (cond
+                                 ((equal? cur prev-key) prev-key)
+                                 (else
+                                  (let* ((line (format-stats-line stats))
+                                         (sz   (webui-backend-size-slot b))
+                                         (one-line
+                                          (format #f "stats grid=~ax~a ~a"
+                                                  (size-width sz) (size-height sz)
+                                                  (string-map
+                                                   (lambda (c)
+                                                     (if (char=? c #\newline)
+                                                         #\space c))
+                                                   line))))
+                                    (format (current-error-port)
+                                            "[gcell backend-webui stats] ~a~%" line)
+                                    (force-output (current-error-port))
+                                    (let ((eng (webui-backend-engine b)))
+                                      (when eng
+                                        (false-if-exception
+                                         ((module-ref (resolve-module '(gcell engine))
+                                                      'engine-log!)
+                                          eng 'webui 'info one-line))))
+                                    cur)))))
+                            (lambda args
+                              (format (current-error-port)
+                                      "stats-thread error: ~s~%" args)
+                              prev-key))))
+                 (loop key))))))
     (let ((port (webui-get-port w)))
       (when (positive? port)
         (format (current-error-port)
                 "gcell webui: http://127.0.0.1:~a/~%" port)
         (force-output (current-error-port))))))
+
+(define (webui-backend-reload! b)
+  "Push a fresh HTML+JS bundle to the connected browser.  Calls into
+webui_show on the existing window, which sends a WEBUI_CMD_NAVIGATION
+packet (webui.c:8954-8975); the bridge handles it by issuing
+`location.replace(url)`, causing the browser to re-fetch / -evaluate
+the inline gcell.js without the user pressing Ctrl-Shift-R.
+
+Use this after editing gcell/backend-webui/client/gcell.js (or any
+client asset) when you want the running session to pick up the new
+code instead of stopping and restarting the gcell process."
+  (let ((w (webui-backend-window b)))
+    (when w (webui-show w (client-html)))))
 
 (define-method (backend-shutdown (b <webui-backend>))
   (let ((w (webui-backend-window b)))
@@ -670,10 +879,6 @@ the cache."
     (bytevector-u16-set! bv 12 cy (endianness little))
     (bytevector-u8-set!  bv 14 style)
     (bytevector-u8-set!  bv 15 0)
-    (format (current-error-port)
-            "[encode-frame] w=~a h=~a delta=~a cells=~a~%"
-            w h do-delta? (if do-delta? delta-count cells))
-    (force-output (current-error-port))
     (%reset-colour-sample!)
     ;; Cell section.
     (cond
@@ -870,6 +1075,15 @@ already fired before the WebSocket came up."
     (format (current-error-port)
             "[gcell backend-webui] window event type=~a~%" type)
     (force-output (current-error-port))
+    (when eng
+      (false-if-exception
+       ((module-ref (resolve-module '(gcell engine)) 'engine-log!)
+        eng 'webui 'info
+        (format #f "window event type=~a (~a)" type
+                (cond
+                 ((= type +webui-event-connected+) "connected")
+                 ((= type +webui-event-disconnected+) "disconnected")
+                 (else "other"))))))
     (cond
      ((= type +webui-event-connected+)
       (set! (webui-backend-cells-cache b) #f)
@@ -1211,6 +1425,9 @@ Ctrl-Shift-R needed."
   (string-append
    "<!doctype html><html><head>"
    "<meta charset=\"utf-8\">"
+   "<meta name=\"viewport\""
+   " content=\"width=device-width, initial-scale=1.0,"
+   " minimum-scale=1.0, maximum-scale=1.0, user-scalable=no\">"
    "<meta http-equiv=\"Cache-Control\""
    " content=\"no-store, no-cache, must-revalidate, max-age=0\">"
    "<meta http-equiv=\"Pragma\" content=\"no-cache\">"

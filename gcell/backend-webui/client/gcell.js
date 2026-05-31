@@ -36,15 +36,31 @@ const CELL_SIZE   = 13;
 // rescale.  The atlas is rasterised at a 2x oversampling so glyphs
 // have enough source resolution; LINEAR atlas filter downsamples
 // to the shader's CSS-pixel cell size with no aliasing.
+// Cell + font sizing — interpreted as DEVICE pixels, not CSS pixels.
+// CSS-pixel sizing was the previous approach and it broke on Wayland
+// Firefox at certain window dims: the browser fractionally scales
+// CSS->device behind our back, and a glyph rasterised at "16 CSS px"
+// ends up rendered at a varying number of physical pixels depending
+// on the inner-viewport size. Anchoring to device pixels makes the
+// chosen font px equal to that many actual pixels on screen, full
+// stop, regardless of compositor scaling, fractional DPR, or which
+// window dimension Firefox decides to redraw chrome at.
+//
+// URL overrides: ?cell-w=N&cell-h=M&font=K (all device px).
 const __qs = new URLSearchParams(window.location.search);
-const CSS_CELL_W = parseInt(__qs.get('cw'),   10) || 10;
-const CSS_CELL_H = parseInt(__qs.get('ch'),   10) || 20;
-const FONT_CSS_PX = parseInt(__qs.get('font'), 10) || 16;
+const CELL_W_DEV  = parseInt(__qs.get('cell-w'), 10) || 10;
+const CELL_H_DEV  = parseInt(__qs.get('cell-h'), 10) || 20;
+const FONT_PX_DEV = parseInt(__qs.get('font'),   10) || 16;
+// Legacy names retained because the shader / atlas pipeline references
+// them by these identifiers. Read as "this many device px per cell /
+// per glyph", oversampled 2x for atlas rasterisation quality.
+const CSS_CELL_W = CELL_W_DEV;
+const CSS_CELL_H = CELL_H_DEV;
+const FONT_CSS_PX = FONT_PX_DEV;
 const ATLAS_OVERSAMPLE = 2;
-// Atlas slot size in pixels (only used to rasterise the texture).
-const CELL_W  = CSS_CELL_W  * ATLAS_OVERSAMPLE;
-const CELL_H  = CSS_CELL_H  * ATLAS_OVERSAMPLE;
-const FONT_PX = FONT_CSS_PX * ATLAS_OVERSAMPLE;
+const CELL_W  = CELL_W_DEV  * ATLAS_OVERSAMPLE;
+const CELL_H  = CELL_H_DEV  * ATLAS_OVERSAMPLE;
+const FONT_PX = FONT_PX_DEV * ATLAS_OVERSAMPLE;
 const ATLAS_COLS = 16;
 const ATLAS_ROWS = 16;
 
@@ -454,6 +470,11 @@ function writeCellSlot(idx, w, cp, fg, bg, attrs) {
 
 function applyFrame(buf) {
   if (gl.isContextLost()) return;
+  // Defence: a server frame can land before onResize has run (initial
+  // boot) or after window.innerWidth has drifted (Wayland fractional
+  // scaling settles a bit after page load). Re-snap before drawing
+  // so canvas dims always match the live window.
+  syncCanvasToWindow();
   const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   if (dv.getUint32(0, true) !== MAGIC) return;
@@ -470,17 +491,17 @@ function applyFrame(buf) {
   cursorBlink = (dv.getUint8(15) & 1) !== 0;
   const total = w * h;
   if (w !== gridW || h !== gridH) {
-    shipLog('info', `frame newdim ${gridW}x${gridH} -> ${w}x${h} type=${frameType}`);
-    // Snap canvas display + backing to exactly grid * CSS_CELL.
-    // Backing FIRST (resets bitmap), style after.  See onResize for
-    // why -- otherwise mid-flight composites scale the old content
-    // into the new display and look like font scaling.
-    const cw = w * CSS_CELL_W;
-    const ch = h * CSS_CELL_H;
-    canvas.width  = cw;
-    canvas.height = ch;
-    canvas.style.width  = cw + 'px';
-    canvas.style.height = ch + 'px';
+    if (gridW !== 0 || gridH !== 0) {
+      shipLog('info', `frame grid ${gridW}x${gridH} -> ${w}x${h} type=${frameType}`);
+    }
+    // Don't touch canvas backing/style from here -- syncCanvasToWindow
+    // owns it and runs on every onResize. If we resized backing to
+    // w * CSS_CELL_W here, a server frame at stale dims could land
+    // after the user shrank the window and stretch the backing far
+    // beyond the viewport while style stayed at the new (smaller)
+    // value, making the shader's cells render at sub-pixel scale.
+    // Keep the backing pinned to the window and let extra grid cells
+    // clip; the next server frame at the new dims will fix the count.
   }
   if (cellsArray.length !== total * FLOATS_PER_CELL) {
     // Grid resized: any cells we had are stale and the delta we just
@@ -625,7 +646,42 @@ function draw() {
 
 // Keep the cursor blink animation going even when the server hasn't
 // pushed a new frame.  Cheap (single quad), harmless.
+//
+// Also: enforce canvas-tracks-window every animation frame. Firefox
+// on Wayland sometimes does not fire window.resize during a drag --
+// only at release, or fires it for the wrong values. If canvas
+// backing stays at the old size while canvas.style follows window
+// (or vice versa), the browser stretches the fixed-pixel backing
+// into the new viewport and cells visibly scale with the window.
+// That's the "font is literal pixels tall after drag, fixed only by
+// reload" symptom: backing stayed at e.g. 1200 while style shrank
+// to "600px", so each backing pixel rendered as half a CSS pixel.
+//
+// Fix: every animation frame, if window inner changed, re-sync
+// canvas backing + style to the live window AND repaint the cells
+// we already have. Cells are positioned in backing pixels by the
+// shader (a_cell * u_cellSize), so existing cells render at constant
+// 10x20 backing px = 10x20 CSS px regardless of window size --
+// what's off the new canvas just clips, and the next server frame
+// will fix the count. No flicker, no clear, no resize round-trip
+// needed for visual stability.
+let __lastSyncW = 0, __lastSyncH = 0, __lastSyncDpr = 0;
 function tickCursor() {
+  const iw = window.innerWidth, ih = window.innerHeight;
+  const dpr = window.devicePixelRatio || 1;
+  if (iw !== __lastSyncW || ih !== __lastSyncH || dpr !== __lastSyncDpr) {
+    __lastSyncW = iw;
+    __lastSyncH = ih;
+    __lastSyncDpr = dpr;
+    syncCanvasToWindow();
+    if (cellCount > 0) draw();
+    // Grid in DEVICE pixels (cells are device-px now).
+    const devW = Math.max(1, Math.round(iw * dpr));
+    const devH = Math.max(1, Math.round(ih * dpr));
+    const cols = Math.max(20, Math.floor(devW / CSS_CELL_W));
+    const rows = Math.max(5,  Math.floor(devH / CSS_CELL_H));
+    send('resize', { width: cols, height: rows });
+  }
   if (cursorBlink && cursorStyle !== 0) draw();
   requestAnimationFrame(tickCursor);
 }
@@ -677,85 +733,235 @@ window.addEventListener('unhandledrejection', e => {
   console.info  = wrap(console.info .bind(console), 'info');
 })();
 
+// Canvas is the window viewport. Both backing and style track
+// window.innerWidth / innerHeight in CSS pixels, 1:1. The shader
+// positions cells at CSS_CELL_W x CSS_CELL_H in this coord system,
+// so cells always render at exactly that pixel size regardless of
+// what the server says the grid dims are. If the server hasn't
+// caught up with a resize yet, extra cells just clip at the right /
+// bottom edge -- they never get squished, and a single source (the
+// real window inner size) owns canvas dims so applyFrame and
+// onResize can't fight over them.
+function syncCanvasToWindow() {
+  const cssW = Math.max(1, window.innerWidth);
+  const cssH = Math.max(1, window.innerHeight);
+  // Backing is in DEVICE pixels (CSS px * DPR). Display is in CSS px,
+  // sized to the actual window viewport. Browser maps 1 backing px to
+  // 1 device px on screen; shader paints cells at u_cellSize device px
+  // each, so a "24 px" glyph is always 24 actual pixels regardless of
+  // window dimension or Wayland fractional scale.
+  const dpr  = window.devicePixelRatio || 1;
+  const devW = Math.max(1, Math.round(cssW * dpr));
+  const devH = Math.max(1, Math.round(cssH * dpr));
+  if (canvas.width  !== devW) canvas.width  = devW;
+  if (canvas.height !== devH) canvas.height = devH;
+  if (canvas.style.width  !== cssW + 'px') canvas.style.width  = cssW + 'px';
+  if (canvas.style.height !== cssH + 'px') canvas.style.height = cssH + 'px';
+}
+
+let __lastResizeKey = '';
 function onResize(reason) {
   try {
     const cssW = window.innerWidth;
     const cssH = window.innerHeight;
-    const cols = Math.max(20, Math.floor(cssW / CSS_CELL_W));
-    const rows = Math.max(5,  Math.floor(cssH / CSS_CELL_H));
-    const cw = cols * CSS_CELL_W;
-    const ch = rows * CSS_CELL_H;
-    // Resize the backing FIRST.  Setting canvas.width/height resets
-    // the bitmap to transparent black at the new dims.  Setting
-    // canvas.style.width AFTER means the browser never sees a frame
-    // where display=NEW but backing=OLD-content -- which would
-    // composite as the old cells SCALED into the new display, and
-    // would look exactly like the font shrinking on a drag-resize.
-    canvas.width  = cw;
-    canvas.height = ch;
-    canvas.style.width  = cw + 'px';
-    canvas.style.height = ch + 'px';
-    // cellsArray still holds the OLD frame's cell data, indexed by the
-    // OLD grid width.  Drawing it onto the NEW bigger canvas would
-    // paint the old cells in the top-left and leave the rest blank
-    // until the server's new-dim frame arrives -- which reads as
-    // "cells never updated, stuck in old position".  Instead: clear
-    // the framebuffer + drop the stale cells, and let applyFrame
-    // paint the next frame from the server.  Invalidating the local
-    // grid state also forces applyFrame to treat the next frame as a
-    // dim change (full repaint guaranteed).
+    const dpr  = window.devicePixelRatio || 1;
+    const devW = Math.max(1, Math.round(cssW * dpr));
+    const devH = Math.max(1, Math.round(cssH * dpr));
+    const cols = Math.max(20, Math.floor(devW / CSS_CELL_W));
+    const rows = Math.max(5,  Math.floor(devH / CSS_CELL_H));
+    syncCanvasToWindow();
     cellCount = 0;
     cellsArray = new Float32Array(0);
     gridW = 0;
     gridH = 0;
-    gl.viewport(0, 0, cw, ch);
+    gl.viewport(0, 0, canvas.width, canvas.height);
     gl.clearColor(0, 0, 0, 1);
     gl.clear(gl.COLOR_BUFFER_BIT);
-    shipLog('info', `onResize(${reason||'?'}) inner=${cssW}x${cssH}`
-                   +` canvas=${cw}x${ch} grid=${cols}x${rows}`);
+    const key = `${cssW}x${cssH}|${cols}x${rows}|${dpr}`;
+    if (key !== __lastResizeKey) {
+      shipLog('info', `resize(${reason||'?'}) inner=${cssW}x${cssH} dpr=${dpr}`
+                     +` canvas=${canvas.width}x${canvas.height} grid=${cols}x${rows}`);
+      __lastResizeKey = key;
+    }
     send('resize', { width: cols, height: rows });
   } catch (e) {
     shipLog('error', `onResize threw: ${e && e.message ? e.message : e}`);
   }
 }
 
-window.addEventListener('resize',  () => { shipLog('info','evt=window.resize'); onResize('window.resize'); });
-window.addEventListener('orientationchange', () => { shipLog('info','evt=orientationchange'); onResize('orientationchange'); });
-document.addEventListener('fullscreenchange', () => { shipLog('info','evt=fullscreenchange'); onResize('fullscreenchange'); });
+window.addEventListener('resize', () => onResize('window.resize'));
+window.addEventListener('orientationchange', () => onResize('orientationchange'));
+document.addEventListener('fullscreenchange', () => onResize('fullscreenchange'));
 if (typeof ResizeObserver !== 'undefined') {
-  new ResizeObserver(() => { shipLog('info','evt=resizeObserver'); onResize('resizeObserver'); }).observe(document.documentElement);
+  new ResizeObserver(() => onResize('resizeObserver')).observe(document.documentElement);
 }
 let __lastW = window.innerWidth, __lastH = window.innerHeight;
 setInterval(() => {
   if (window.innerWidth !== __lastW || window.innerHeight !== __lastH) {
-    shipLog('info', `evt=poll innerChanged ${__lastW}x${__lastH} -> ${window.innerWidth}x${window.innerHeight}`);
     __lastW = window.innerWidth;
     __lastH = window.innerHeight;
     onResize('poll');
   }
 }, 250);
-// Heartbeat: ships current dims every 2s.  If these stop, JS is
-// frozen / page died.  If canvas backing diverges from style * DPR,
-// onResize is not effectively taking hold.
+// ---- Deep instrumentation ----
+//
+// The user has reported "font is literal pixels tall at certain window
+// dims" / glyph size drift that JS-level numbers (DPR=1, cells=16x32
+// dev px, canvas backing == style * DPR) don't visibly explain.  The
+// surface metrics above are stable but the rendered glyph isn't.  The
+// instrumentation below measures the things that can still drift even
+// when those numbers don't move:
+//
+//   * actualBoundingBoxAscent/Descent + advance width of 'M' in the
+//     SAME font config the atlas uses -- these come from the browser's
+//     font hinter and can move with HiDPI / system font cache changes
+//     even if FONT_PX hasn't changed.
+//   * matchMedia at DPR thresholds (1, 1.5, 2, 3) -- the only fully
+//     reliable way to detect Wayland fractional-scale flips in real
+//     time; the polled window.devicePixelRatio sometimes lies.
+//   * getComputedStyle(canvas) -- catches CSS transforms / zoom that
+//     downstream pages or extensions might inject.
+//   * focus / blur / visibility -- these can re-trigger Firefox font
+//     rendering pipelines on Wayland.
+//   * a derived "drift" line that fires only when one of the tracked
+//     metrics changed since the previous heartbeat, so the user can
+//     spot the transition without scrolling through identical hbs.
+//
+// All output funnels through shipLog -> server engine-log! -> the
+// in-grid log overlay.
+
+const __probeCanvas = document.createElement('canvas');
+__probeCanvas.width  = Math.max(64, FONT_PX_DEV * 4);
+__probeCanvas.height = Math.max(64, FONT_PX_DEV * 4);
+const __probeCtx = __probeCanvas.getContext('2d');
+
+function measureGlyphFootprint() {
+  // Mirror exactly what rasteriseGlyph does for the atlas: same font
+  // family, same px size, same weight.  We measure 'M' (canonical wide
+  // glyph) plus the textMetrics bounding box so any browser-side
+  // hinting / sub-pixel decisions show up here.
+  try {
+    __probeCtx.font = `${FONT_PX}px ${ATLAS_FONT_FAMILY}`;
+    const m = __probeCtx.measureText('M');
+    const ascent  = m.actualBoundingBoxAscent  || 0;
+    const descent = m.actualBoundingBoxDescent || 0;
+    return {
+      advance: +m.width.toFixed(2),
+      ascent:  +ascent.toFixed(2),
+      descent: +descent.toFixed(2),
+      height:  +(ascent + descent).toFixed(2),
+      fontEm:  +(m.fontBoundingBoxAscent || 0).toFixed(2)
+              + +(m.fontBoundingBoxDescent || 0).toFixed(2),
+    };
+  } catch (e) {
+    return { error: String(e) };
+  }
+}
+
+// DPR threshold mediaqueries: register one listener per breakpoint so
+// any fractional-scale transition logs immediately, not just on the
+// next 2s tick.  Thresholds chosen to bracket every common Wayland
+// fractional ratio (1.0, 1.25, 1.5, 1.75, 2.0, 3.0).
+const __DPR_THRESHOLDS = [1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
+for (const t of __DPR_THRESHOLDS) {
+  try {
+    const mql = window.matchMedia(`(resolution: ${t}dppx)`);
+    mql.addEventListener('change', e => {
+      shipLog('info', `evt=dpr-cross threshold=${t}dppx matches=${e.matches}`
+                     +` reported=${window.devicePixelRatio}`);
+      onResize('dpr-cross');
+    });
+  } catch (_) { /* old browsers */ }
+}
+
+// Catch font readiness / re-rendering.  When the system serves a
+// fallback first and the proper font lands a few ms later, glyph
+// rasterisation needs to redo the atlas; we ship the event so any
+// post-load drift is attributable.
+if (document.fonts && document.fonts.ready) {
+  document.fonts.ready.then(() => {
+    shipLog('info', `evt=fonts.ready status=${document.fonts.status}`);
+  }).catch(() => {});
+  document.fonts.addEventListener &&
+    document.fonts.addEventListener('loadingdone', () => {
+      shipLog('info', `evt=fonts.loadingdone status=${document.fonts.status}`);
+    });
+}
+
+// Focus/blur/visibility/orientation don't get their own log lines —
+// the sampler will surface any actual rendering effect they cause.
+
+// Ctrl+Shift+D = one-shot deep dump.  Bypasses preventDefault chain
+// because we attach BEFORE the existing keydown handler in capture
+// phase; the engine never sees the chord, so it doesn't conflict with
+// app key bindings.
+window.addEventListener('keydown', (e) => {
+  if (e.ctrlKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
+    e.preventDefault();
+    e.stopPropagation();
+    dumpDeepProbe('user');
+  }
+}, true);
+
+function dumpDeepProbe(reason) {
+  const cs = window.getComputedStyle(canvas);
+  const gm = measureGlyphFootprint();
+  const r  = canvas.getBoundingClientRect();
+  shipLog('info', `probe[${reason}] css={w:${cs.width},h:${cs.height},`
+                 +`transform:${cs.transform},zoom:${cs.zoom||''},`
+                 +`imgRendering:${cs.imageRendering}}`
+                 +` glyph=${JSON.stringify(gm)}`
+                 +` rect={x:${r.x.toFixed(1)},y:${r.y.toFixed(1)},`
+                 +`w:${r.width.toFixed(2)},h:${r.height.toFixed(2)}}`
+                 +` screenXY=${window.screenX},${window.screenY}`
+                 +` dprMatches=${__DPR_THRESHOLDS
+                       .filter(t => window.matchMedia(`(resolution: ${t}dppx)`).matches)
+                       .join(',') || 'none'}`);
+}
+
+// Change-only sampler: every 1s, snapshot the values that affect what
+// the user sees, and emit a single line ONLY when one changed. No
+// 2s-heartbeat spam. If the page is frozen the absence of any DRIFT
+// line for a long time during a known window resize is the signal.
+// The first sample emits as `BASELINE` so there's exactly one
+// reference point per session.
+let __hbPrev = null;
 setInterval(() => {
-  // Get the actual rendered rect (post-layout, post any browser
-  // scaling).  If this differs from canvas.style.* the browser is
-  // scaling the canvas behind our backs.
   const r = canvas.getBoundingClientRect();
   const vv = window.visualViewport;
-  const vvScale = vv ? vv.scale : '?';
-  const vvW = vv ? Math.round(vv.width) : '?';
-  shipLog('info', `hb inner=${window.innerWidth}x${window.innerHeight}`
-                 +` outer=${window.outerWidth}x${window.outerHeight}`
-                 +` screen=${screen.width}x${screen.height}`
-                 +` dpr=${window.devicePixelRatio}`
-                 +` vv=${vvW}@${vvScale}`
-                 +` canvas=${canvas.width}x${canvas.height}`
-                 +` style=${canvas.style.width || '?'}x${canvas.style.height || '?'}`
-                 +` rect=${Math.round(r.width)}x${Math.round(r.height)}`
-                 +` cellPx=${(r.width / Math.max(1, gridW)).toFixed(2)}`
-                 +` gridW=${gridW} gridH=${gridH}`);
-}, 2000);
+  const vvScale = vv ? Math.round(vv.scale * 1000) / 1000 : '?';
+  const dpr = window.devicePixelRatio;
+  const gm = measureGlyphFootprint();
+  const backingExpected = Math.round(window.innerWidth * dpr);
+  const cur = {
+    dpr,
+    inner:  `${window.innerWidth}x${window.innerHeight}`,
+    outer:  `${window.outerWidth}x${window.outerHeight}`,
+    canvas: `${canvas.width}x${canvas.height}`,
+    style:  `${canvas.style.width || '?'}x${canvas.style.height || '?'}`,
+    rect:   `${Math.round(r.width)}x${Math.round(r.height)}`,
+    grid:   `${gridW}x${gridH}`,
+    glyph:  `${gm.advance}x${gm.height}`,
+    vv:     `${vvScale}`,
+    backing: Math.abs(canvas.width - backingExpected) > 1
+             ? `MISMATCH(${canvas.width}!=${backingExpected})` : 'ok',
+  };
+  if (!__hbPrev) {
+    shipLog('info',
+      `BASELINE ${Object.entries(cur).map(([k,v])=>`${k}=${v}`).join(' ')}`);
+  } else {
+    const changed = Object.keys(cur).filter(k => cur[k] !== __hbPrev[k]);
+    if (changed.length) {
+      const parts = changed.map(k =>
+        `${k}:${__hbPrev[k]}->${cur[k]}`).join(' ');
+      shipLog('info', `DRIFT ${parts}`);
+    }
+  }
+  __hbPrev = cur;
+}, 1000);
+
+// Initial deep probe so the first connection captures a baseline.
+setTimeout(() => dumpDeepProbe('init'), 500);
 // Make sure clicks land focus -- some webui-launched windows boot
 // without document focus and then keydown events miss the document.
 canvas.addEventListener('mousedown', () => canvas.focus());
@@ -830,11 +1036,13 @@ document.addEventListener('keyup',   dispatchKey);
 
 function cellPosFromMouseEvent(e) {
   const rect = canvas.getBoundingClientRect();
-  // CSS-pixel offsets / CSS cell size yields the same grid coords the
-  // server sees from the resize event.
+  // Cells are sized in device pixels; mouse events come in CSS pixels.
+  // Multiply offsets by DPR before dividing by the device-px cell size
+  // so cell coords match the grid the server is rendering.
+  const dpr = window.devicePixelRatio || 1;
   return {
-    x: Math.floor((e.clientX - rect.left) / CSS_CELL_W),
-    y: Math.floor((e.clientY - rect.top)  / CSS_CELL_H),
+    x: Math.floor(((e.clientX - rect.left) * dpr) / CSS_CELL_W),
+    y: Math.floor(((e.clientY - rect.top)  * dpr) / CSS_CELL_H),
   };
 }
 
@@ -1016,6 +1224,10 @@ function buildAllGl() {
   imagesPlaced = [];
 }
 buildAllGl();
+// Anchor the canvas to the live window immediately so the first
+// applyFrame / draw paints into a viewport that matches what the user
+// sees, instead of HTML's 300x150 default canvas.
+syncCanvasToWindow();
 
 canvas.addEventListener('webglcontextlost', (e) => {
   // Must preventDefault, otherwise the browser never fires the
@@ -1033,10 +1245,15 @@ canvas.addEventListener('webglcontextrestored', () => {
   gridW = 0; gridH = 0;
   cellCount = 0;
   cellsArray = new Float32Array(0);
-  send('resize', {
-    width:  Math.max(20, Math.floor(window.innerWidth  / CSS_CELL_W)),
-    height: Math.max(5,  Math.floor(window.innerHeight / CSS_CELL_H)),
-  });
+  {
+    const dpr  = window.devicePixelRatio || 1;
+    const devW = Math.max(1, Math.round(window.innerWidth  * dpr));
+    const devH = Math.max(1, Math.round(window.innerHeight * dpr));
+    send('resize', {
+      width:  Math.max(20, Math.floor(devW / CSS_CELL_W)),
+      height: Math.max(5,  Math.floor(devH / CSS_CELL_H)),
+    });
+  }
 });
 
 function drawImagePlacements(cellW, cellH) {
