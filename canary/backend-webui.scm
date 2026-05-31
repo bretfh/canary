@@ -392,7 +392,7 @@
 
 (define %frame-header-size 16)
 (define %cell-size 13)
-(define %frame-version 1)
+(define %frame-version 2)  ; v2 appends a hyperlink overlay after the cells
 
 (define (term-cursor-style->code style)
   (case style
@@ -402,11 +402,40 @@
     ((bar beam ibeam)    3)
     (else                1)))
 
+(define (collect-hyperlinks term)
+  "Walk TERM and return a list of (col row url-string) for every cell
+whose face carries a hyperlink.  Sparse: cells without hyperlinks
+contribute nothing.  Adjacent cells with the same URL each get their
+own entry — this keeps the wire decoder dumb (the client just
+overlays each (col,row,url) onto its hit-test map)."
+  (let* ((w     (t:term-width  term))
+         (h     (t:term-height term))
+         (faces (t:term-faces  term))
+         (n     (* w h))
+         (out   '()))
+    (do ((i 0 (+ i 1)))
+        ((= i n))
+      (let ((face (vector-ref faces i)))
+        (when face
+          (let ((url (t:face-hyperlink face)))
+            (when (and url (string? url) (> (string-length url) 0))
+              (let* ((col (modulo i w))
+                     (row (quotient i w)))
+                (set! out (cons (list col row url) out))))))))
+    (reverse out)))
+
+(define (utf8-byte-count s)
+  (bytevector-length (string->utf8 s)))
+
 (define (encode-frame term)
-  "Encode TERM's visible grid into the v1 binary frame the browser
-canaryFrame() unpacks.  Cursor coordinates come straight from
-TERM-CURSOR-X / TERM-CURSOR-Y (canary's term keeps them 1-indexed in
-the VT convention; subtract 1 to land on the cell grid)."
+  "Encode TERM's visible grid into the v2 binary frame the browser
+canaryFrame() unpacks.  Cursor coordinates come from TERM-CURSOR-X /
+TERM-CURSOR-Y (canary's term keeps them 1-indexed in the VT
+convention; subtract 1 to land on the cell grid).
+
+After the cell records (W*H * 13 bytes), a hyperlink-overlay
+section: u16 link-count + link-count entries of
+  u16 col, u16 row, u16 url-byte-length, url bytes (utf-8)."
   (let* ((w     (t:term-width term))
          (h     (t:term-height term))
          (cells (* w h))
@@ -415,8 +444,17 @@ the VT convention; subtract 1 to land on the cell grid)."
          (cx    (max 0 (- (t:term-cursor-x term) 1)))
          (cy    (max 0 (- (t:term-cursor-y term) 1)))
          (style (term-cursor-style->code (t:term-cursor-style term)))
+         (links (collect-hyperlinks term))
+         (link-utf8s (map (lambda (l) (string->utf8 (caddr l))) links))
+         (link-bytes (apply + 0 (map (lambda (u)
+                                       (+ 6 (bytevector-length u)))
+                                     link-utf8s)))
          (bv    (make-bytevector
-                 (+ %frame-header-size (* cells %cell-size)) 0)))
+                 (+ %frame-header-size
+                    (* cells %cell-size)
+                    2                       ; u16 link count
+                    link-bytes)
+                 0)))
     (bytevector-u32-set! bv 0 %frame-magic (endianness little))
     (bytevector-u8-set!  bv 4 %frame-version)
     (bytevector-u8-set!  bv 5 0)
@@ -430,14 +468,39 @@ the VT convention; subtract 1 to land on the cell grid)."
         ((= i cells))
       (let* ((off  (+ %frame-header-size (* i %cell-size)))
              (cp   (u32vector-ref chars i))
-             (face (vector-ref    faces i)))
+             (face (vector-ref    faces i))
+             (a    (face->attrs face)))
         (bytevector-u32-set! bv off cp (endianness little))
         (bytevector-u32-set! bv (+ off 4)
                              (face-fg->rgb face) (endianness little))
         (bytevector-u32-set! bv (+ off 8)
                              (face-bg->rgb face) (endianness little))
-        (bytevector-u8-set!  bv (+ off 12) (face->attrs face))))
-    bv))
+        ;; Bit 6 of attrs flags "this cell carries a hyperlink" so the
+        ;; client can do a cheap test before consulting the overlay.
+        (bytevector-u8-set! bv (+ off 12)
+                            (if (and face
+                                     (let ((u (t:face-hyperlink face)))
+                                       (and u (string? u))))
+                                (logior a 64)
+                                a))))
+    ;; Hyperlink table.
+    (let* ((cells-end (+ %frame-header-size (* cells %cell-size)))
+           (count-off cells-end))
+      (bytevector-u16-set! bv count-off (length links) (endianness little))
+      (let loop ((entries links) (utf8s link-utf8s) (off (+ count-off 2)))
+        (cond
+         ((null? entries) bv)
+         (else
+          (let* ((entry (car entries))
+                 (col   (car entry))
+                 (row   (cadr entry))
+                 (utf8  (car utf8s))
+                 (ulen  (bytevector-length utf8)))
+            (bytevector-u16-set! bv off       col  (endianness little))
+            (bytevector-u16-set! bv (+ off 2) row  (endianness little))
+            (bytevector-u16-set! bv (+ off 4) ulen (endianness little))
+            (bytevector-copy!    utf8 0 bv (+ off 6) ulen)
+            (loop (cdr entries) (cdr utf8s) (+ off 6 ulen)))))))))
 
 
 ;;;

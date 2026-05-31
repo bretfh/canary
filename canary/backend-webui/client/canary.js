@@ -319,11 +319,22 @@ function unpackColor(packed, out, off, fallback) {
   }
 }
 
+// Per-frame (col,row) → URL hit-test map for OSC-8 hyperlinks.
+// Rebuilt from the trailing overlay section each frame; rare to be
+// large.
+const hyperlinks = new Map();
+function linkKey(col, row) { return (row << 16) | col; }
+
+const utf8Decoder = new TextDecoder('utf-8');
+
 function applyFrame(buf) {
   const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   if (dv.getUint32(0, true) !== MAGIC) return;
-  // dv.getUint8(4): version.  Only v1 understood; ignore unknown.
+  // dv.getUint8(4): version.  v1: cells only.  v2: cells + hyperlink
+  // overlay (u16 count + entries).  Forward-compat: unknown trailing
+  // bytes are ignored.
+  const version = dv.getUint8(4);
   const w = dv.getUint16(6, true);
   const h = dv.getUint16(8, true);
   cursorCol   = dv.getUint16(10, true);
@@ -352,6 +363,27 @@ function applyFrame(buf) {
     cellsArray[p++] = attrs;
   }
   cellCount = total;
+
+  // Hyperlink overlay (v2+).  Each entry: u16 col, u16 row, u16 len,
+  // <len> utf-8 bytes.  Clear the previous map so links that left the
+  // frame stop hit-testing.
+  hyperlinks.clear();
+  if (version >= 2) {
+    const cellsEnd = HEADER_SIZE + total * CELL_SIZE;
+    if (u8.byteLength >= cellsEnd + 2) {
+      const linkCount = dv.getUint16(cellsEnd, true);
+      let off = cellsEnd + 2;
+      for (let i = 0; i < linkCount; i++) {
+        const col  = dv.getUint16(off, true);
+        const row  = dv.getUint16(off + 2, true);
+        const len  = dv.getUint16(off + 4, true);
+        const url  = utf8Decoder.decode(u8.subarray(off + 6, off + 6 + len));
+        hyperlinks.set(linkKey(col, row), url);
+        off += 6 + len;
+      }
+    }
+  }
+
   if (atlasDirty) syncAtlas();
   gl.bindBuffer(gl.ARRAY_BUFFER, cellsBuf);
   gl.bufferData(gl.ARRAY_BUFFER, cellsArray, gl.STREAM_DRAW);
@@ -504,6 +536,18 @@ let lastMove = { x: -1, y: -1, ts: 0 };
 canvas.addEventListener('mousedown', (e) => {
   const { x, y } = cellPosFromMouseEvent(e);
   mouseHeld = MOUSE_BTNS[e.button] || 'left';
+  // OSC-8 hyperlinks: a left-click on a linked cell opens the URL
+  // in a new tab and skips the canary input shipment, matching the
+  // behaviour terminals adopt for OSC-8 (clicks are claimed by the
+  // link layer).
+  if (mouseHeld === 'left') {
+    const url = hyperlinks.get(linkKey(x, y));
+    if (url) {
+      window.open(url, '_blank', 'noopener,noreferrer');
+      mouseHeld = 'none';
+      return;
+    }
+  }
   send('mouse', { x, y, button: mouseHeld, action: 'press' });
 });
 
@@ -516,6 +560,9 @@ canvas.addEventListener('mouseup', (e) => {
 
 canvas.addEventListener('mousemove', (e) => {
   const { x, y } = cellPosFromMouseEvent(e);
+  // Hover affordance for hyperlinks: switch the cursor to pointer
+  // when over a linked cell, default otherwise.
+  canvas.style.cursor = hyperlinks.has(linkKey(x, y)) ? 'pointer' : 'default';
   const now = performance.now();
   // Coalesce moves to ~60 Hz AND to actual cell-position changes.
   // canary's input loop does the same throttle for ANSI mouse events.
