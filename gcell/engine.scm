@@ -1359,11 +1359,11 @@ Routing policy:
    (else
     (dispatch! eng cascade! (apply-filter eng msg)))))
 
-(define +resize-debounce-seconds+ 0.05)
+(define +resize-debounce-seconds+ 0.01)
 
 (define (resize-debounce-loop eng)
   "Receive <resize> msgs from ENG's resize-channel; coalesce any
-bursts that arrive within a 50 ms quiescence window; emit one wrapped
+bursts that arrive within a 10 ms quiescence window; emit one wrapped
 <resize-flushed> back into the engine per burst.  Wakes on stop-ch
 so shutdown can drop a fiber that would otherwise block on the
 channel forever."

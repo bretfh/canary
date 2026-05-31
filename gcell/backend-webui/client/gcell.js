@@ -131,20 +131,30 @@ function atlasIndexFor(cp) {
 // Pre-rasterise printable ASCII into every layer.
 for (let cp = 32; cp < 127; cp++) atlasIndexFor(cp);
 
-const atlasTex = gl.createTexture();
-gl.activeTexture(gl.TEXTURE0);
-gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
-// LINEAR: atlas is oversampled (2x); shader's per-frame cell size
-// is in device pixels via current DPR, which is usually < atlas
-// resolution.  LINEAR downscale keeps glyphs crisp; NEAREST would
-// alias when downscaling.
-gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-// Immutable storage so we don't keep allocating per upload.
-gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8,
-                ATLAS_COLS * CELL_W, ATLAS_ROWS * CELL_H, ATLAS_LAYERS);
+// Every GPU-side resource lives in a `let` so the context-restore
+// path can re-create them after a `webglcontextlost` event.  The
+// CPU-side atlas canvases survive the loss; only the texture has to
+// be rebuilt + re-uploaded.
+let atlasTex;
+function buildAtlasTexture() {
+  atlasTex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0);
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
+  // LINEAR: atlas is oversampled (2x); shader's per-frame cell size
+  // is in device pixels via current DPR, which is usually < atlas
+  // resolution.  LINEAR downscale keeps glyphs crisp; NEAREST would
+  // alias when downscaling.
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  // Immutable storage so we don't keep allocating per upload.
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8,
+                  ATLAS_COLS * CELL_W, ATLAS_ROWS * CELL_H, ATLAS_LAYERS);
+  // Force the next syncAtlas to re-upload from the (still alive) 2D
+  // canvases.
+  atlasDirty = true;
+}
 
 function syncAtlas() {
   gl.activeTexture(gl.TEXTURE0);
@@ -157,7 +167,6 @@ function syncAtlas() {
   }
   atlasDirty = false;
 }
-syncAtlas();
 
 // ---- Cell shaders + program.
 //
@@ -248,66 +257,72 @@ function compile(type, src) {
   return s;
 }
 
-const program = gl.createProgram();
-gl.attachShader(program, compile(gl.VERTEX_SHADER,   VS));
-gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
-gl.linkProgram(program);
-if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-  throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
-}
-gl.useProgram(program);
-
-const uCellSize   = gl.getUniformLocation(program, 'u_cellSize');
-const uViewport   = gl.getUniformLocation(program, 'u_viewport');
-const uAtlasCells = gl.getUniformLocation(program, 'u_atlasCells');
-const uAtlas      = gl.getUniformLocation(program, 'u_atlas');
-
-gl.uniform2f(uCellSize,   CELL_W, CELL_H);
-gl.uniform2f(uAtlasCells, ATLAS_COLS, ATLAS_ROWS);
-gl.uniform1i(uAtlas, 0);
-
-// ---- Geometry: one quad, instanced per cell.
-
-const quadBuf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-gl.bufferData(gl.ARRAY_BUFFER,
-              new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]),
-              gl.STATIC_DRAW);
-
-const aQuad  = gl.getAttribLocation(program, 'a_quad');
-const aCell  = gl.getAttribLocation(program, 'a_cell');
-const aGlyph = gl.getAttribLocation(program, 'a_glyph');
-const aFg    = gl.getAttribLocation(program, 'a_fg');
-const aBg    = gl.getAttribLocation(program, 'a_bg');
-const aAttrs = gl.getAttribLocation(program, 'a_attrs');
-
-const vao = gl.createVertexArray();
-gl.bindVertexArray(vao);
-
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-gl.enableVertexAttribArray(aQuad);
-gl.vertexAttribPointer(aQuad, 2, gl.FLOAT, false, 0, 0);
-
-const cellsBuf = gl.createBuffer();
-gl.bindBuffer(gl.ARRAY_BUFFER, cellsBuf);
 // Per cell: 2 cell + 1 glyph + 4 fg + 4 bg + 1 attrs = 12 floats.
 const FLOATS_PER_CELL = 12;
 const cellStride = FLOATS_PER_CELL * 4;
-gl.enableVertexAttribArray(aCell);
-gl.vertexAttribPointer(aCell, 2, gl.FLOAT, false, cellStride, 0);
-gl.vertexAttribDivisor(aCell, 1);
-gl.enableVertexAttribArray(aGlyph);
-gl.vertexAttribPointer(aGlyph, 1, gl.FLOAT, false, cellStride, 8);
-gl.vertexAttribDivisor(aGlyph, 1);
-gl.enableVertexAttribArray(aFg);
-gl.vertexAttribPointer(aFg, 4, gl.FLOAT, false, cellStride, 12);
-gl.vertexAttribDivisor(aFg, 1);
-gl.enableVertexAttribArray(aBg);
-gl.vertexAttribPointer(aBg, 4, gl.FLOAT, false, cellStride, 28);
-gl.vertexAttribDivisor(aBg, 1);
-gl.enableVertexAttribArray(aAttrs);
-gl.vertexAttribPointer(aAttrs, 1, gl.FLOAT, false, cellStride, 44);
-gl.vertexAttribDivisor(aAttrs, 1);
+
+let program, uCellSize, uViewport, uAtlasCells, uAtlas;
+let aQuad, aCell, aGlyph, aFg, aBg, aAttrs;
+let quadBuf, cellsBuf, vao;
+
+function buildCellProgram() {
+  program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER,   VS));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+  }
+  gl.useProgram(program);
+
+  uCellSize   = gl.getUniformLocation(program, 'u_cellSize');
+  uViewport   = gl.getUniformLocation(program, 'u_viewport');
+  uAtlasCells = gl.getUniformLocation(program, 'u_atlasCells');
+  uAtlas      = gl.getUniformLocation(program, 'u_atlas');
+
+  gl.uniform2f(uCellSize,   CELL_W, CELL_H);
+  gl.uniform2f(uAtlasCells, ATLAS_COLS, ATLAS_ROWS);
+  gl.uniform1i(uAtlas, 0);
+
+  // ---- Geometry: one quad, instanced per cell.
+  quadBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.bufferData(gl.ARRAY_BUFFER,
+                new Float32Array([0,0, 1,0, 0,1, 0,1, 1,0, 1,1]),
+                gl.STATIC_DRAW);
+
+  aQuad  = gl.getAttribLocation(program, 'a_quad');
+  aCell  = gl.getAttribLocation(program, 'a_cell');
+  aGlyph = gl.getAttribLocation(program, 'a_glyph');
+  aFg    = gl.getAttribLocation(program, 'a_fg');
+  aBg    = gl.getAttribLocation(program, 'a_bg');
+  aAttrs = gl.getAttribLocation(program, 'a_attrs');
+
+  vao = gl.createVertexArray();
+  gl.bindVertexArray(vao);
+
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(aQuad);
+  gl.vertexAttribPointer(aQuad, 2, gl.FLOAT, false, 0, 0);
+
+  cellsBuf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, cellsBuf);
+  gl.enableVertexAttribArray(aCell);
+  gl.vertexAttribPointer(aCell, 2, gl.FLOAT, false, cellStride, 0);
+  gl.vertexAttribDivisor(aCell, 1);
+  gl.enableVertexAttribArray(aGlyph);
+  gl.vertexAttribPointer(aGlyph, 1, gl.FLOAT, false, cellStride, 8);
+  gl.vertexAttribDivisor(aGlyph, 1);
+  gl.enableVertexAttribArray(aFg);
+  gl.vertexAttribPointer(aFg, 4, gl.FLOAT, false, cellStride, 12);
+  gl.vertexAttribDivisor(aFg, 1);
+  gl.enableVertexAttribArray(aBg);
+  gl.vertexAttribPointer(aBg, 4, gl.FLOAT, false, cellStride, 28);
+  gl.vertexAttribDivisor(aBg, 1);
+  gl.enableVertexAttribArray(aAttrs);
+  gl.vertexAttribPointer(aAttrs, 1, gl.FLOAT, false, cellStride, 44);
+  gl.vertexAttribDivisor(aAttrs, 1);
+}
 
 // ---- Cursor pass: one quad, no instancing, driven by uniforms.
 //
@@ -345,29 +360,34 @@ void main() {
   fragColor = vec4(u_cursorColor.rgb, u_cursorColor.a * u_cursorAlpha);
 }`;
 
-const cursorProgram = gl.createProgram();
-gl.attachShader(cursorProgram, compile(gl.VERTEX_SHADER,   cursorVS));
-gl.attachShader(cursorProgram, compile(gl.FRAGMENT_SHADER, cursorFS));
-gl.linkProgram(cursorProgram);
-if (!gl.getProgramParameter(cursorProgram, gl.LINK_STATUS)) {
-  throw new Error(gl.getProgramInfoLog(cursorProgram) || 'cursor link failed');
+let cursorProgram, cuCell, cuCellSize, cuViewport, cuStyle, cuAlpha, cuColor;
+let cuQuadLoc, cursorVao;
+
+function buildCursorProgram() {
+  cursorProgram = gl.createProgram();
+  gl.attachShader(cursorProgram, compile(gl.VERTEX_SHADER,   cursorVS));
+  gl.attachShader(cursorProgram, compile(gl.FRAGMENT_SHADER, cursorFS));
+  gl.linkProgram(cursorProgram);
+  if (!gl.getProgramParameter(cursorProgram, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(cursorProgram) || 'cursor link failed');
+  }
+
+  cuCell      = gl.getUniformLocation(cursorProgram, 'u_cursorCell');
+  cuCellSize  = gl.getUniformLocation(cursorProgram, 'u_cellSize');
+  cuViewport  = gl.getUniformLocation(cursorProgram, 'u_viewport');
+  cuStyle     = gl.getUniformLocation(cursorProgram, 'u_cursorStyle');
+  cuAlpha     = gl.getUniformLocation(cursorProgram, 'u_cursorAlpha');
+  cuColor     = gl.getUniformLocation(cursorProgram, 'u_cursorColor');
+  cuQuadLoc   = gl.getAttribLocation(cursorProgram, 'a_quad');
+
+  cursorVao = gl.createVertexArray();
+  gl.bindVertexArray(cursorVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(cuQuadLoc);
+  gl.vertexAttribPointer(cuQuadLoc, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(vao);
 }
-
-const cuCell      = gl.getUniformLocation(cursorProgram, 'u_cursorCell');
-const cuCellSize  = gl.getUniformLocation(cursorProgram, 'u_cellSize');
-const cuViewport  = gl.getUniformLocation(cursorProgram, 'u_viewport');
-const cuStyle     = gl.getUniformLocation(cursorProgram, 'u_cursorStyle');
-const cuAlpha     = gl.getUniformLocation(cursorProgram, 'u_cursorAlpha');
-const cuColor     = gl.getUniformLocation(cursorProgram, 'u_cursorColor');
-const cuQuadLoc   = gl.getAttribLocation(cursorProgram, 'a_quad');
-
-const cursorVao = gl.createVertexArray();
-gl.bindVertexArray(cursorVao);
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-gl.enableVertexAttribArray(cuQuadLoc);
-gl.vertexAttribPointer(cuQuadLoc, 2, gl.FLOAT, false, 0, 0);
-
-gl.bindVertexArray(vao);
 
 // ---- Frame application
 
@@ -433,6 +453,7 @@ function writeCellSlot(idx, w, cp, fg, bg, attrs) {
 }
 
 function applyFrame(buf) {
+  if (gl.isContextLost()) return;
   const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   if (dv.getUint32(0, true) !== MAGIC) return;
@@ -568,6 +589,7 @@ function cursorAlpha() {
 }
 
 function draw() {
+  if (gl.isContextLost()) return;
   // Cells are always CSS_CELL_W x CSS_CELL_H *CSS pixels* in size.
   // Canvas backing equals the window in CSS pixels (no DPR).  Shader
   // paints at the same CSS-pixel scale -- one source of truth.
@@ -941,29 +963,73 @@ void main() {
   fragColor = texture(u_img, v_uv);
 }`;
 
-const imageProgram = gl.createProgram();
-gl.attachShader(imageProgram, compile(gl.VERTEX_SHADER,   imageVS));
-gl.attachShader(imageProgram, compile(gl.FRAGMENT_SHADER, imageFS));
-gl.linkProgram(imageProgram);
-if (!gl.getProgramParameter(imageProgram, gl.LINK_STATUS)) {
-  throw new Error(gl.getProgramInfoLog(imageProgram) || 'image link failed');
+let imageProgram, iuPos, iuSize, iuUv, iuCellSize, iuViewport, iuImg, iaQuadLoc;
+let imageVao;
+
+function buildImageProgram() {
+  imageProgram = gl.createProgram();
+  gl.attachShader(imageProgram, compile(gl.VERTEX_SHADER,   imageVS));
+  gl.attachShader(imageProgram, compile(gl.FRAGMENT_SHADER, imageFS));
+  gl.linkProgram(imageProgram);
+  if (!gl.getProgramParameter(imageProgram, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(imageProgram) || 'image link failed');
+  }
+
+  iuPos      = gl.getUniformLocation(imageProgram, 'a_pos');
+  iuSize     = gl.getUniformLocation(imageProgram, 'a_size');
+  iuUv       = gl.getUniformLocation(imageProgram, 'a_uvRect');
+  iuCellSize = gl.getUniformLocation(imageProgram, 'u_cellSize');
+  iuViewport = gl.getUniformLocation(imageProgram, 'u_viewport');
+  iuImg      = gl.getUniformLocation(imageProgram, 'u_img');
+  iaQuadLoc  = gl.getAttribLocation(imageProgram, 'a_quad');
+
+  imageVao = gl.createVertexArray();
+  gl.bindVertexArray(imageVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(iaQuadLoc);
+  gl.vertexAttribPointer(iaQuadLoc, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(vao);
 }
 
-const iuPos      = gl.getUniformLocation(imageProgram, 'a_pos');
-const iuSize     = gl.getUniformLocation(imageProgram, 'a_size');
-const iuUv       = gl.getUniformLocation(imageProgram, 'a_uvRect');
-const iuCellSize = gl.getUniformLocation(imageProgram, 'u_cellSize');
-const iuViewport = gl.getUniformLocation(imageProgram, 'u_viewport');
-const iuImg      = gl.getUniformLocation(imageProgram, 'u_img');
-const iaQuadLoc  = gl.getAttribLocation(imageProgram, 'a_quad');
+// Bootstrap + context-loss/restore wire-up.
+function buildAllGl() {
+  buildAtlasTexture();
+  buildCellProgram();
+  buildCursorProgram();
+  buildImageProgram();
+  syncAtlas();
+  // GPU-side image textures are gone on a context loss; the cache
+  // entries point at dead handles.  Drop them so the next placement
+  // re-uploads (server's image-ids hash is server-side; for now the
+  // image data has to be resent by the server -- not blocking the
+  // common case of the terminal example which has no images).
+  imageCache.clear();
+  imagesPlaced = [];
+}
+buildAllGl();
 
-const imageVao = gl.createVertexArray();
-gl.bindVertexArray(imageVao);
-gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-gl.enableVertexAttribArray(iaQuadLoc);
-gl.vertexAttribPointer(iaQuadLoc, 2, gl.FLOAT, false, 0, 0);
-
-gl.bindVertexArray(vao);
+canvas.addEventListener('webglcontextlost', (e) => {
+  // Must preventDefault, otherwise the browser never fires the
+  // restored event.  See WEBGL_lose_context.
+  e.preventDefault();
+  shipLog('error', 'webgl context lost');
+});
+canvas.addEventListener('webglcontextrestored', () => {
+  shipLog('info', 'webgl context restored, rebuilding GL state');
+  buildAllGl();
+  // Force a full frame from the server: the engine will encode at
+  // current dims regardless of what the client thinks, but we want
+  // the client's grid invalidated so applyFrame's newdim path runs
+  // and reallocates cellsArray cleanly.
+  gridW = 0; gridH = 0;
+  cellCount = 0;
+  cellsArray = new Float32Array(0);
+  send('resize', {
+    width:  Math.max(20, Math.floor(window.innerWidth  / CSS_CELL_W)),
+    height: Math.max(5,  Math.floor(window.innerHeight / CSS_CELL_H)),
+  });
+});
 
 function drawImagePlacements(cellW, cellH) {
   if (imagesPlaced.length === 0) return;

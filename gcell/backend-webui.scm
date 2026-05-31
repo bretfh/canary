@@ -464,10 +464,18 @@ its render-frame just before invoking backend-draw."
 
 (define-method (backend-draw (b <webui-backend>) cmds)
   (let* ((term (webui-backend-cur-term b))
+         (sz   (webui-backend-size-slot b))
          (th   (webui-backend-theme    b))
          (t0   (%mono-ns))
          (placements (collect-image-placements b cmds))
          (clicks     (engine-click-rects b)))
+    ;; Defence in depth: a corrupted frame on the wire (cells encoded
+    ;; against the wrong grid dims) is exactly what would freeze the
+    ;; client.  If `term` and the backend's size slot disagree, skip
+    ;; the send and let the next render catch up after the next
+    ;; backend-handle-resize! call.
+    (when (and (= (t:term-width  term) (size-width  sz))
+               (= (t:term-height term) (size-height sz)))
     (render-cmds-to-term! term cmds th)
     (let* ((t1    (%mono-ns))
            (frame (encode-frame b term placements clicks))
@@ -488,7 +496,7 @@ its render-frame just before invoking backend-draw."
           (set! (wb-send-ns-max b) send-ns))
         (set! (wb-draw-ns       b) (+ draw-ns (wb-draw-ns b)))
         (when (> draw-ns (wb-draw-ns-max b))
-          (set! (wb-draw-ns-max b) draw-ns))))))
+          (set! (wb-draw-ns-max b) draw-ns)))))))
 
 ;; Frame layout v2 (header = 16 bytes, cells unchanged):
 ;;
@@ -960,12 +968,13 @@ JSON dependency for L1; the wire schema is closed."
   (let ((tag (json-field json "type")))
     (cond
      ((string=? tag "resize")
+      ;; Just produce the msg.  All backend/term mutation happens on the
+      ;; engine fiber via `backend-handle-resize!`; doing it here would
+      ;; race with the engine's render path because this dispatch runs
+      ;; on a libwebui worker thread (CIVETweb's WS handler).
       (let ((w (json-int json "width"))
             (h (json-int json "height")))
-        (and w h
-             (begin
-               (resize-backend! b w h)
-               (resize w h)))))
+        (and w h (resize w h))))
      ((string=? tag "key")
       (let* ((sym-str (json-field json "sym"))
              (sym (and sym-str
@@ -1022,16 +1031,6 @@ JSON dependency for L1; the wire schema is closed."
       (let ((text (json-field json "text")))
         (and text (paste text))))
      (else #f))))
-
-(define (resize-backend! b w h)
-  (let ((term (webui-backend-cur-term b)))
-    (set! (webui-backend-size-slot b) (size w h))
-    ;; Drop the diff baseline.  Handles both genuine resizes (new
-    ;; dimensions invalidate per-cell offsets) and browser reconnects
-    ;; at the same size, where the client has no previous frame to
-    ;; delta against.
-    (set! (webui-backend-cells-cache b) #f)
-    (when term (t:term-resize! term w h))))
 
 ;; Minimal JSON peekers: the wire shapes are flat objects with string
 ;; or integer values, no nesting.  Sufficient for the L2 demo without
