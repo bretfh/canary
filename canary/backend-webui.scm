@@ -4,7 +4,8 @@
   #:use-module ((canary protocol) #:select (<size> size size? size-width
                                             size-height
                                             <mouse> mouse
-                                            <resize> resize))
+                                            <resize> resize
+                                            <paste> paste))
   #:use-module ((canary key) #:select (<key> key))
   #:use-module ((canary backend-ansi) #:select (render-cmds-to-term!))
   #:use-module (canary theme)
@@ -127,6 +128,77 @@
 
 (define-method (backend-size (b <webui-backend>))
   (webui-backend-size-slot b))
+
+(define-method (backend-handle-resize! (b <webui-backend>) w h)
+  (set! (webui-backend-size-slot b) (size w h))
+  (let ((term (webui-backend-cur-term b)))
+    (when term (t:term-resize! term w h))))
+
+(define (js-string-literal s)
+  "Escape S as a JavaScript double-quoted string literal."
+  (let ((out (open-output-string)))
+    (display #\" out)
+    (string-for-each
+     (lambda (c)
+       (case c
+         ((#\\) (display "\\\\" out))
+         ((#\") (display "\\\"" out))
+         ((#\newline) (display "\\n" out))
+         ((#\return)  (display "\\r" out))
+         ((#\tab)     (display "\\t" out))
+         (else
+          (let ((cp (char->integer c)))
+            (cond
+             ((< cp 32) (format out "\\u~4,'0x" cp))
+             (else      (display c out)))))))
+     s)
+    (display #\" out)
+    (get-output-string out)))
+
+(define-method (backend-handle-cmd (b <webui-backend>) eng cmd)
+  ;; Engine cmds → webui-side surface state.  Anything we don't model
+  ;; (alt-screen, mouse-mode, terminal cursor styles beyond what's in
+  ;; the frame header) is a no-op: those concepts don't exist in the
+  ;; browser-as-grid setting.
+  (let ((w (webui-backend-window b)))
+    (when w
+      (match cmd
+        (('set-title text)
+         (webui-run w (string-append "document.title = "
+                                     (js-string-literal (or text ""))
+                                     ";")))
+        ;; Browser controls cursor visibility via the frame's
+        ;; cursor_style byte (0 hidden, 1 block, 2 underline, 3 bar).
+        ;; A runtime ('cursor hidden) cmd reaches into the term so the
+        ;; next encode-frame emits the right style; same for visible /
+        ;; block / underline / bar.  No webui-run round-trip needed.
+        (('cursor mode)
+         (let ((term (webui-backend-cur-term b)))
+           (when term
+             (t:set-term-cursor-style!
+              term
+              (case mode
+                ((hidden hide)    'hidden)
+                ((visible show)   'block)
+                ((bar)            'bar)
+                ((underline)      'underline)
+                ((block)          'block)
+                (else (t:term-cursor-style term)))))))
+        ;; Browser has no alt-screen / mouse-mode concept; ignored.
+        (('alt-screen _)  #f)
+        (('mouse-mode _)  #f)
+        ;; println: surface as a log entry (visible via the log
+        ;; overlay) so it's not lost.  Stitch parts via the standard
+        ;; cmd interpreter shape (strings concatenated, non-strings
+        ;; ~aed).
+        (('println . parts)
+         (let ((line (apply string-append
+                            (map (lambda (p)
+                                   (if (string? p) p (format #f "~a" p)))
+                                 parts))))
+           ((module-ref (resolve-module '(canary engine)) 'engine-log!)
+            eng 'app 'info line)))
+        (_ #f)))))
 
 (define-method (backend-record-cycle! (b <webui-backend>) stats)
   ;; STATS is an alist supplied by canary/engine.scm's event-loop.
@@ -304,23 +376,59 @@
         (when (> draw-ns (wb-draw-ns-max b))
           (set! (wb-draw-ns-max b) draw-ns))))))
 
+;; Frame layout v2 (header = 16 bytes, cells unchanged):
+;;
+;;   u32  magic          0x59524E43  "CNRY"
+;;   u8   version        1
+;;   u8   _reserved      0
+;;   u16  width          cell columns
+;;   u16  height         cell rows
+;;   u16  cursor_col     0-based column where the cursor should paint
+;;   u16  cursor_row     0-based row
+;;   u8   cursor_style   0=hidden 1=block 2=underline 3=bar
+;;   u8   cursor_attrs   bit 0 blink
+;;
+;;   for each cell, in row-major order: u32 cp, u32 fg, u32 bg, u8 attrs.
+
+(define %frame-header-size 16)
+(define %cell-size 13)
+(define %frame-version 1)
+
+(define (term-cursor-style->code style)
+  (case style
+    ((hidden)            0)
+    ((block)             1)
+    ((underline)         2)
+    ((bar beam ibeam)    3)
+    (else                1)))
+
 (define (encode-frame term)
-  "Encode TERM's visible grid as a binary blob the browser-side
-canaryFrame() unpacks: 8 bytes header (magic, width, height) followed
-by W * H * 13 bytes of cell records (codepoint, fg-rgb, bg-rgb,
-attrs-byte)."
+  "Encode TERM's visible grid into the v1 binary frame the browser
+canaryFrame() unpacks.  Cursor coordinates come straight from
+TERM-CURSOR-X / TERM-CURSOR-Y (canary's term keeps them 1-indexed in
+the VT convention; subtract 1 to land on the cell grid)."
   (let* ((w     (t:term-width term))
          (h     (t:term-height term))
          (cells (* w h))
          (chars (t:term-chars term))
          (faces (t:term-faces term))
-         (bv    (make-bytevector (+ 8 (* cells 13)) 0)))
+         (cx    (max 0 (- (t:term-cursor-x term) 1)))
+         (cy    (max 0 (- (t:term-cursor-y term) 1)))
+         (style (term-cursor-style->code (t:term-cursor-style term)))
+         (bv    (make-bytevector
+                 (+ %frame-header-size (* cells %cell-size)) 0)))
     (bytevector-u32-set! bv 0 %frame-magic (endianness little))
-    (bytevector-u16-set! bv 4 w (endianness little))
-    (bytevector-u16-set! bv 6 h (endianness little))
+    (bytevector-u8-set!  bv 4 %frame-version)
+    (bytevector-u8-set!  bv 5 0)
+    (bytevector-u16-set! bv 6  w  (endianness little))
+    (bytevector-u16-set! bv 8  h  (endianness little))
+    (bytevector-u16-set! bv 10 cx (endianness little))
+    (bytevector-u16-set! bv 12 cy (endianness little))
+    (bytevector-u8-set!  bv 14 style)
+    (bytevector-u8-set!  bv 15 0)
     (do ((i 0 (+ i 1)))
         ((= i cells))
-      (let* ((off  (+ 8 (* i 13)))
+      (let* ((off  (+ %frame-header-size (* i %cell-size)))
              (cp   (u32vector-ref chars i))
              (face (vector-ref    faces i)))
         (bytevector-u32-set! bv off cp (endianness little))
@@ -371,15 +479,24 @@ shapes."
          (string->number h 16))))
 
 (define (face->attrs face)
-  "Pack FACE's boolean attributes into a single byte: bit 0 bold,
-1 italic, 2 underline, 3 inverse, 4 crossed-out."
+  "Pack FACE's boolean attributes into a single byte.
+
+  bit 0  bold
+  bit 1  italic
+  bit 2  underline
+  bit 3  inverse
+  bit 4  crossed-out (strikethrough)
+  bit 5  faint (dim)
+  bit 6  hyperlink (cell carries an OSC-8 URL reference -- the URL
+                   itself travels in the frame's hyperlink table)"
   (if (not face)
       0
       (logior (if (t:face-bold?    face) 1  0)
               (if (t:face-italic?  face) 2  0)
               (if (t:face-underline face) 4 0)
               (if (t:face-inverse? face) 8  0)
-              (if (t:face-crossed? face) 16 0))))
+              (if (t:face-crossed? face) 16 0)
+              (if (t:face-faint?   face) 32 0))))
 
 
 ;;;
@@ -489,12 +606,23 @@ JSON dependency for L1; the wire schema is closed."
                            (string->symbol sym-str)))))
         (and sym (apply key sym (json-mods json)))))
      ((string=? tag "mouse")
-      (let ((x      (json-int json "x"))
-            (y      (json-int json "y"))
+      ;; Action: 'press | 'release | 'move | 'scroll-up | 'scroll-down.
+      ;; Button: 'left | 'middle | 'right | 'none (for move/scroll with
+      ;; no button held).  Canary's protocol shape matches what the
+      ;; ANSI input loop produces, so the same widgets (textinput,
+      ;; viewport, menu) react identically.
+      (let ((x      (json-int   json "x"))
+            (y      (json-int   json "y"))
             (btn    (json-field json "button"))
             (action (json-field json "action")))
         (and x y btn action
              (mouse x y (string->symbol btn) (string->symbol action)))))
+     ((string=? tag "paste")
+      ;; Browser `paste` events ride this channel.  The text already
+      ;; comes through the JSON-escape from JS, so what's in the
+      ;; "text" field is the literal pasted string.
+      (let ((text (json-field json "text")))
+        (and text (paste text))))
      (else #f))))
 
 (define (resize-backend! b w h)

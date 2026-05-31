@@ -1454,15 +1454,15 @@ can't blow memory."
 (define (apply-startup-cmds! eng)
   "Run the cmds derived from ENG's initial configuration: window
 title, cursor mode, mouse-reporting mode, and alt-screen toggle if
-explicitly disabled.  These all emit terminal escapes; skip them when
-the backend doesn't use stdin."
-  (when (backend-uses-stdin? (engine-backend eng))
-    (when (engine-title eng)
-      (run-cmd! eng (set-title (engine-title eng))))
-    (run-cmd! eng (cursor (engine-cursor eng)))
-    (run-cmd! eng (mouse-mode (engine-mouse-mode eng)))
-    (unless (engine-alt-screen? eng)
-      (run-cmd! eng (alt-screen 'off)))))
+explicitly disabled.  Each routes through BACKEND-HANDLE-CMD so a
+backend that doesn't model a given concept (e.g. webui ignores
+alt-screen / mouse-mode) just returns #f for it."
+  (when (engine-title eng)
+    (run-cmd! eng (set-title (engine-title eng))))
+  (run-cmd! eng (cursor (engine-cursor eng)))
+  (run-cmd! eng (mouse-mode (engine-mouse-mode eng)))
+  (unless (engine-alt-screen? eng)
+    (run-cmd! eng (alt-screen 'off))))
 
 (define (write-crash-log eng key args)
   "Dump a crash summary for ENG to $XDG_CACHE_HOME/canary/last-crash.log

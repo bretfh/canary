@@ -12,6 +12,7 @@
   #:use-module ((canary term write) #:prefix t:)
   #:use-module ((canary term render) #:prefix t:)
   #:use-module (oop goops)
+  #:use-module (ice-9 match)
   #:use-module (rnrs bytevectors)
   #:use-module (srfi srfi-1)
   #:use-module ((srfi srfi-13) #:select (string-contains string-index))
@@ -853,3 +854,61 @@ Returns a <size> or #f."
                              (w (string->number (cadr parts))))
                          (and h w (positive? h) (positive? w)
                               (size w h))))))))))
+
+
+;;;
+;;; Backend protocol: handle-cmd / mark-dirty! / handle-resize!
+;;;
+
+(define-method (backend-mark-dirty! (b <ansi-backend>))
+  ;; Drop the diff baseline so the next backend-draw treats every cell
+  ;; as changed.  Used after operations (clear-screen, set-palette,
+  ;; println, suspend/resume) that visually invalidate the screen.
+  (set! (ansi-backend-prev-term b) #f))
+
+(define-method (backend-handle-resize! (b <ansi-backend>) w h)
+  (set! (ansi-backend-size b) (size w h))
+  (set! (ansi-backend-prev-term b) #f))
+
+(define-method (backend-handle-cmd (b <ansi-backend>) eng cmd)
+  ;; Translates engine cmds that target terminal escape sequences into
+  ;; the right SGR / OSC / DEC writes against ANSI-BACKEND-PORT.  The
+  ;; backend-independent cmds (quit, batch, focus, etc.) stay in
+  ;; engine.scm; backend-mark-dirty! handles invalidation.
+  (let ((o (ansi-backend-port b)))
+    (match cmd
+      (('set-title text)
+       (display (string-append "\x1b]0;" text "\x07") o)
+       (force-output o))
+      (('cursor mode)
+       (case mode
+         ((hidden hide)  (display "\x1b[?25l" o))
+         ((visible show) (display "\x1b[?25h" o))
+         ((bar)          (display "\x1b[5 q"  o))
+         ((underline)    (display "\x1b[3 q"  o))
+         ((block)        (display "\x1b[1 q"  o)))
+       (force-output o))
+      (('alt-screen mode)
+       (display (if (eq? mode 'on) "\x1b[?1049h" "\x1b[?1049l") o)
+       (force-output o))
+      (('mouse-mode mode)
+       (case mode
+         ((off)
+          (display "\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1003l\x1b[?1000l" o))
+         ((click)
+          (display "\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1006h" o))
+         ((cell)
+          (display "\x1b[?1003l\x1b[?1002h\x1b[?1006h" o))
+         ((all)
+          (display "\x1b[?1003h\x1b[?1006h" o)))
+       (force-output o))
+      (('println . parts)
+       (let ((line (apply string-append
+                          (map (lambda (p) (if (string? p) p (format #f "~a" p)))
+                               parts))))
+         (display "\x1b[?1049l" o)
+         (display line o)
+         (newline o)
+         (display "\x1b[?1049h" o)
+         (force-output o)))
+      (_ #f))))
