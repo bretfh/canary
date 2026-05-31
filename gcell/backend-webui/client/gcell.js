@@ -655,18 +655,34 @@ window.addEventListener('unhandledrejection', e => {
 
 function onResize(reason) {
   try {
-    // onResize only tells the server how many cells fit; it does NOT
-    // touch the canvas.  The canvas is sized in applyFrame from the
-    // arriving frame's grid dims, which guarantees canvas.width is
-    // always exactly gridW * CSS_CELL_W -- no transient where the
-    // browser holds old grid cells inside a freshly-resized big
-    // canvas with mismatched dims.
     const cssW = window.innerWidth;
     const cssH = window.innerHeight;
     const cols = Math.max(20, Math.floor(cssW / CSS_CELL_W));
     const rows = Math.max(5,  Math.floor(cssH / CSS_CELL_H));
+    const cw = cols * CSS_CELL_W;
+    const ch = rows * CSS_CELL_H;
+    canvas.style.width  = cw + 'px';
+    canvas.style.height = ch + 'px';
+    canvas.width  = cw;
+    canvas.height = ch;
+    // cellsArray still holds the OLD frame's cell data, indexed by the
+    // OLD grid width.  Drawing it onto the NEW bigger canvas would
+    // paint the old cells in the top-left and leave the rest blank
+    // until the server's new-dim frame arrives -- which reads as
+    // "cells never updated, stuck in old position".  Instead: clear
+    // the framebuffer + drop the stale cells, and let applyFrame
+    // paint the next frame from the server.  Invalidating the local
+    // grid state also forces applyFrame to treat the next frame as a
+    // dim change (full repaint guaranteed).
+    cellCount = 0;
+    cellsArray = new Float32Array(0);
+    gridW = 0;
+    gridH = 0;
+    gl.viewport(0, 0, cw, ch);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
     shipLog('info', `onResize(${reason||'?'}) inner=${cssW}x${cssH}`
-                   +` request grid=${cols}x${rows}`);
+                   +` canvas=${cw}x${ch} grid=${cols}x${rows}`);
     send('resize', { width: cols, height: rows });
   } catch (e) {
     shipLog('error', `onResize threw: ${e && e.message ? e.message : e}`);
