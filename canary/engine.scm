@@ -1440,34 +1440,46 @@ Returns ('msg . resize), 'stop, or 'flush.  TIMEOUT in seconds, or
 drains the queue on wake, calls process-one on each msg, and
 re-renders if any handler reported a state change.  Renders use a
 fresh view cache per frame so widget subtrees don't leak across
-frames."
+frames.
+
+  Per-cycle timing is reported to the backend via
+  BACKEND-RECORD-CYCLE!; instrumented backends accumulate it for
+  telemetry."
   (let ((rd (car (engine-msg-bell eng))))
     (let loop ()
       (when (engine-running? eng)
         (perform-operation (wait-until-port-readable-operation rd))
-        (drain-bell! (engine-msg-bell eng))
-        ;; Cascade runs WITHOUT memoization — it descends into widgets
-        ;; at the backend size to find nested instances, which would
-        ;; pollute the cache and force render to see a backend-size
-        ;; tree instead of the rect-size tree it needs. render-frame
-        ;; gets its own cache below.
-        (let* ((msgs (drain-msgs! eng))
-               (dispatched?
-                (let lp ((ms msgs) (any? #f))
-                  (cond
-                   ((null? ms) any?)
-                   ((not (engine-running? eng)) any?)
-                   (else
-                    (let ((d? (process-one eng (car ms))))
-                      (lp (cdr ms) (or any? d?))))))))
-          (when (and (engine-running? eng) dispatched?)
-            (refresh-live-widgets! eng)
-            (with-view-cache (make-hash-table)
-              (lambda ()
-               (catch #t
-                 (lambda () (render-frame eng))
-                 (lambda (key . args)
-                   (engine-log! eng 'render 'error (format #f "~a ~a" key args))))))))
+        (let ((t-wake (get-internal-real-time)))
+          (drain-bell! (engine-msg-bell eng))
+          (let* ((msgs (drain-msgs! eng))
+                 (t-drain (get-internal-real-time))
+                 (dispatched?
+                  (let lp ((ms msgs) (any? #f))
+                    (cond
+                     ((null? ms) any?)
+                     ((not (engine-running? eng)) any?)
+                     (else
+                      (let ((d? (process-one eng (car ms))))
+                        (lp (cdr ms) (or any? d?)))))))
+                 (t-process (get-internal-real-time)))
+            (when (and (engine-running? eng) dispatched?)
+              (refresh-live-widgets! eng)
+              (with-view-cache (make-hash-table)
+                (lambda ()
+                 (catch #t
+                   (lambda () (render-frame eng))
+                   (lambda (key . args)
+                     (engine-log! eng 'render 'error (format #f "~a ~a" key args)))))))
+            (let ((t-end (get-internal-real-time)))
+              (backend-record-cycle!
+               (engine-backend eng)
+               `((t-wake     . ,t-wake)
+                 (drain-ns   . ,(- t-drain t-wake))
+                 (process-ns . ,(- t-process t-drain))
+                 (render-ns  . ,(- t-end t-process))
+                 (cycle-ns   . ,(- t-end t-wake))
+                 (msg-count  . ,(length msgs))
+                 (dispatched? . ,dispatched?))))))
         (when (engine-running? eng) (loop))))))
 
 ;;; ── stderr capture (engine-owned, surfaces in log overlay) ─────────
@@ -1512,13 +1524,15 @@ can't blow memory."
 (define (apply-startup-cmds! eng)
   "Run the cmds derived from ENG's initial configuration: window
 title, cursor mode, mouse-reporting mode, and alt-screen toggle if
-explicitly disabled."
-  (when (engine-title eng)
-    (run-cmd! eng (set-title (engine-title eng))))
-  (run-cmd! eng (cursor (engine-cursor eng)))
-  (run-cmd! eng (mouse-mode (engine-mouse-mode eng)))
-  (unless (engine-alt-screen? eng)
-    (run-cmd! eng (alt-screen 'off))))
+explicitly disabled.  These all emit terminal escapes; skip them when
+the backend doesn't use stdin."
+  (when (backend-uses-stdin? (engine-backend eng))
+    (when (engine-title eng)
+      (run-cmd! eng (set-title (engine-title eng))))
+    (run-cmd! eng (cursor (engine-cursor eng)))
+    (run-cmd! eng (mouse-mode (engine-mouse-mode eng)))
+    (unless (engine-alt-screen? eng)
+      (run-cmd! eng (alt-screen 'off)))))
 
 (define (write-crash-log eng key args)
   "Dump a crash summary for ENG to $XDG_CACHE_HOME/canary/last-crash.log
@@ -1549,17 +1563,24 @@ false-if-exception so crash logging itself can't escalate."
   "Start ENG inside an existing fibers scheduler. Returns when stopped.
 Does NOT touch global state (signals, stderr) — caller (e.g. a multi-
 session server) owns those."
-  (backend-init (engine-backend eng))
-  (apply-startup-cmds! eng)
-  (let ((guarded (lambda (name thunk)
-                   (lambda ()
-                     (catch #t thunk
-                       (lambda (key . args)
-                         (engine-log! eng name 'error (format #f "~a ~a" key args))
-                         (stop-engine! eng)))))))
-    (spawn-fiber (guarded 'event-loop     (lambda () (event-loop eng))))
-    (spawn-fiber (guarded 'input-loop     (lambda () (input-loop eng))))
-    (spawn-fiber (guarded 'resize-debounce (lambda () (resize-debounce-loop eng)))))
+  (let ((b (engine-backend eng)))
+    (backend-set-engine! b eng)
+    (backend-init b)
+    (apply-startup-cmds! eng)
+    (let ((guarded (lambda (name thunk)
+                     (lambda ()
+                       (catch #t thunk
+                         (lambda (key . args)
+                           (engine-log! eng name 'error
+                                        (format #f "~a ~a" key args))
+                           (stop-engine! eng)))))))
+      (spawn-fiber (guarded 'event-loop
+                            (lambda () (event-loop eng))))
+      (when (backend-uses-stdin? b)
+        (spawn-fiber (guarded 'input-loop
+                              (lambda () (input-loop eng)))))
+      (spawn-fiber (guarded 'resize-debounce
+                            (lambda () (resize-debounce-loop eng))))))
   ;; Send <init> first so root react can return startup cmds (timers,
   ;; subscriptions, etc.) before any user input arrives. Then a resize
   ;; with the current backend size so the first render lays out
@@ -1605,25 +1626,29 @@ backend, plus log-overlay config."
       (lambda ()
         (dynamic-wind
           (lambda ()
-            (set! saved-stderr-fd (%dup2 2 100))
-            (%dup2 (port->fdes (cdr stderr-pipe)) 2)
+            (when (backend-uses-stdin? b)
+              (set! saved-stderr-fd (%dup2 2 100))
+              (%dup2 (port->fdes (cdr stderr-pipe)) 2))
+            (backend-set-engine! (engine-backend eng) eng)
             (backend-init (engine-backend eng))
             (apply-startup-cmds! eng)
-            (setup-signal-handlers do-cleanup)
-            (setup-resize-handler
-             (lambda ()
-               ;; Goes through send eng (mutex + pipe-write, signal-safe)
-               ;; rather than put-message on resize-channel directly:
-               ;; put-message suspends on unbuffered channels, and Guile
-               ;; signal handlers must not block.  process-one forwards
-               ;; the <resize> onto the channel where debounce sees it.
-               (catch #t
-                 (lambda ()
-                   (let ((sz (get-terminal-size)))
-                     (when sz
-                       (send eng (resize (size-width sz)
-                                         (size-height sz))))))
-                 (lambda _ #f)))))
+            (when (backend-uses-stdin? b)
+              (setup-signal-handlers do-cleanup)
+              (setup-resize-handler
+               (lambda ()
+                 ;; Goes through send eng (mutex + pipe-write,
+                 ;; signal-safe) rather than put-message on
+                 ;; resize-channel directly: put-message suspends on
+                 ;; unbuffered channels, and Guile signal handlers must
+                 ;; not block.  process-one forwards the <resize> onto
+                 ;; the channel where debounce sees it.
+                 (catch #t
+                   (lambda ()
+                     (let ((sz (get-terminal-size)))
+                       (when sz
+                         (send eng (resize (size-width sz)
+                                           (size-height sz))))))
+                   (lambda _ #f))))))
           (lambda ()
             (define (guarded name thunk)
               (lambda ()
@@ -1634,14 +1659,16 @@ backend, plus log-overlay config."
             (run-fibers
              (lambda ()
                (spawn-fiber (guarded 'event-loop     (lambda () (event-loop eng))))
-               (spawn-fiber (guarded 'input-loop     (lambda () (input-loop eng))))
+               (when (backend-uses-stdin? b)
+                 (spawn-fiber (guarded 'input-loop   (lambda () (input-loop eng)))))
                (spawn-fiber (guarded 'resize-debounce (lambda () (resize-debounce-loop eng))))
                (send eng (make <init>))
                (let ((sz (backend-size (engine-backend eng))))
                  (send eng (cons 'resize-flushed
                                  (resize (size-width sz) (size-height sz)))))
-               (spawn-fiber
-                (lambda () (drain-stderr-pipe eng (car stderr-pipe))))
+               (when (backend-uses-stdin? b)
+                 (spawn-fiber
+                  (lambda () (drain-stderr-pipe eng (car stderr-pipe)))))
                (perform-operation
                 (wait-until-port-readable-operation (car (engine-stop-ch eng)))))
              #:hz 100))
