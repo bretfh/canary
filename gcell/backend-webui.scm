@@ -333,6 +333,34 @@
                 (lambda (event)
                   (handle-window-event! b event)))
     (webui-show w (client-html))
+    ;; On sway, `-new-window` firefox gets tiled into whatever slot
+    ;; the current layout leaves -- often a sliver six rows tall.
+    ;; webui's `-width`/`-height` flags are size hints firefox passes
+    ;; to the WM, and sway ignores size hints by default.  When we
+    ;; can see sway's IPC socket, ask it to float our window and
+    ;; place it at a sensible default; this only affects the freshly
+    ;; opened firefox window matching our HTML title.  Silent if
+    ;; swaymsg isn't on PATH or the user isn't on sway.
+    (when (getenv "SWAYSOCK")
+      (call-with-new-thread
+       (lambda ()
+         (catch #t
+           (lambda ()
+             ;; Give firefox a moment to actually map the window and
+             ;; for the HTML title to render.
+             (sleep 1)
+             ;; No criteria → affects the focused window.  Firefox
+             ;; is typically focused right after open under sway's
+             ;; focus-follows-new default.  Title matching is fragile
+             ;; (the app's engine-title cmd overwrites the HTML title
+             ;; before swaymsg fires); focusing-window is the most
+             ;; reliable approach for the just-launched window.
+             (system* "swaymsg"
+                      "floating enable, resize set 1280 800, move position center"))
+           (lambda args
+             (format (current-error-port)
+                     "[gcell backend-webui] swaymsg float failed: ~s~%"
+                     args))))))
     ;; webui's worker threads need its main event loop running for
     ;; HTTP and WS state to stay alive; without webui-wait the server
     ;; tears down as soon as the first client connects.  Run it on a
