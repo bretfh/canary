@@ -342,17 +342,51 @@ materialised through GOOPS at most once per class."
                     (cons* kw new-val overrides)
                     new-cmds))))))))))
 
+(define (widget-handles? widget mcls)
+  "Return #t if WIDGET's class has a specialised `update` method
+applicable to msgs of class MCLS (or any ancestor of MCLS).  The
+default fallthrough method, specialised on `<top>` for both
+arguments, is not counted: a widget with no specialisations returns
+#f and the engine skips its update call entirely.
+
+Walks `(generic-function-methods update)` fresh on every call.  No
+cache.  Live re-evaluation of `update` methods or `define-class`
+forms is picked up on the next dispatch with no extra plumbing."
+  (let ((wprec (class-precedence-list (class-of widget)))
+        (mprec (class-precedence-list mcls)))
+    (let lp ((ms (generic-function-methods update)))
+      (cond
+       ((null? ms) #f)
+       (else
+        (let* ((m     (car ms))
+               (specs (method-specializers m)))
+          (cond
+           ((and (pair? specs) (pair? (cdr specs))
+                 (not (eq? (car specs) <top>))
+                 (memq (car specs) wprec)
+                 (memq (cadr specs) mprec))
+            #t)
+           (else (lp (cdr ms))))))))))
+
 (define (dispatch-update! eng node msg)
   "Dispatch MSG to NODE: first cascade into any sub-nodes held in
 NODE's slots, then call update on NODE with those sub-nodes already
 updated.  Returns (cons new-node cmd-or-#f).  Errors are caught and
-logged; on error, returns NODE unchanged."
+logged; on error, returns NODE unchanged.
+
+`(update threaded msg)` is gated on `widget-handles?` so widgets
+whose class lacks a specialised update for MSG's class never enter
+the generic dispatch path.  The default fallthrough method in
+view.scm has both specialisers on `<top>`; gating excludes it
+explicitly, turning idle ticks into true no-ops for any widget that
+does not subscribe to `<tick>`."
   (catch #t
     (lambda ()
       (match (cascade-into-slots eng node msg)
         ((threaded . child-cmds)
          (parameterize ((%current-update-widget threaded))
-           (let ((result (update threaded msg)))
+           (let* ((result (and (widget-handles? threaded (class-of msg))
+                               (update threaded msg))))
              (match (if (pair? result) result (cons threaded #f))
                ((new-node . own-cmd)
                 (unless (eq? new-node node)
@@ -436,12 +470,15 @@ the batched cmd."
 
 (define (plain-update eng node msg)
   "Call update on NODE without cascading into its sub-nodes.  Returns
-(cons new-node cmd-or-#f).  Errors are logged; on error the input
-node is returned unchanged."
+(cons new-node cmd-or-#f).  Gated on `widget-handles?`: nodes without
+a specialised update method for MSG's class never enter generic
+dispatch.  Errors are logged; on error the input node is returned
+unchanged."
   (catch #t
     (lambda ()
       (parameterize ((%current-update-widget node))
-        (let ((result (update node msg)))
+        (let ((result (and (widget-handles? node (class-of msg))
+                           (update node msg))))
           (if (pair? result) result (cons node #f)))))
     (lambda (key . args)
       (engine-log! eng 'update 'error (format #f "~a ~a" key args))
