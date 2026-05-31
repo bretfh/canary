@@ -6,13 +6,18 @@
                                             <mouse> mouse
                                             <resize> resize
                                             <paste> paste))
-  #:use-module ((gcell key) #:select (<key> key))
+  #:use-module ((gcell key) #:select (<key> key normalize-key))
   #:use-module ((gcell backend-ansi) #:select (render-cmds-to-term!))
+  #:use-module ((gcell engine-types) #:select (engine-click-regions))
+  #:use-module ((gcell draw) #:select (clickable-cmd? clickable-col
+                                        clickable-row clickable-w
+                                        clickable-h))
   #:use-module ((gcell draw) #:select (image-cmd? image-col image-row
                                         image-w image-h
                                         image-src image-src-x image-src-y
                                         image-src-w image-src-h))
   #:use-module ((gcell image) #:select (image-registered? image-bytes))
+  #:use-module ((gcell term color) #:select (color-index->rgb))
   #:use-module (gcell theme)
   #:use-module ((gcell term types) #:prefix t:)
   #:use-module (webui)
@@ -318,6 +323,15 @@
     (webui-bind w %input-bind-id
                 (lambda (event)
                   (dispatch-browser-event! b event)))
+    ;; Empty element id catches every event the bind protocol surfaces,
+    ;; including WEBUI_EVENT_CONNECTED / DISCONNECTED.  Without this we
+    ;; only see calls from webui.call('input', ...), which means the
+    ;; very first frame (sent from backend-draw before the browser's
+    ;; WebSocket comes up) goes into the void and the pane never paints
+    ;; until the user manually generates a state change.
+    (webui-bind w ""
+                (lambda (event)
+                  (handle-window-event! b event)))
     (webui-show w (client-html))
     ;; webui's worker threads need its main event loop running for
     ;; HTTP and WS state to stay alive; without webui-wait the server
@@ -427,14 +441,36 @@ preserved so later placements paint over earlier ones."
      cmds)
     (reverse out)))
 
+(define (engine-click-rects b)
+  "Pull click regions off the backend's engine, return list of
+(col row w h).  The engine partitioned them out of the draw cmds in
+its render-frame just before invoking backend-draw."
+  (let ((eng (webui-backend-engine b)))
+    (cond
+     ((not eng) '())
+     (else
+      (let loop ((regions (engine-click-regions eng)) (out '()))
+        (cond
+         ((null? regions) (reverse out))
+         (else
+          (let ((r (car regions)))
+            (cond
+             ((clickable-cmd? r)
+              (loop (cdr regions)
+                    (cons (list (clickable-col r) (clickable-row r)
+                                (clickable-w   r) (clickable-h   r))
+                          out)))
+             (else (loop (cdr regions) out)))))))))))
+
 (define-method (backend-draw (b <webui-backend>) cmds)
   (let* ((term (webui-backend-cur-term b))
          (th   (webui-backend-theme    b))
          (t0   (%mono-ns))
-         (placements (collect-image-placements b cmds)))
+         (placements (collect-image-placements b cmds))
+         (clicks     (engine-click-rects b)))
     (render-cmds-to-term! term cmds th)
     (let* ((t1    (%mono-ns))
-           (frame (encode-frame b term placements))
+           (frame (encode-frame b term placements clicks))
            (t2    (%mono-ns)))
       (webui-send-raw (webui-backend-window b) %frame-js-fn frame)
       (let* ((t3        (%mono-ns))
@@ -471,7 +507,8 @@ preserved so later placements paint over earlier ones."
 (define %frame-header-size 16)
 (define %cell-size 13)
 (define %delta-cell-size 17)  ; u32 index + 13-byte cell record
-(define %frame-version 4)  ; v4: byte 5 is frame_type (0 full, 1 delta)
+(define %frame-version 5)  ; v5 appends a click-region overlay
+(define %click-rect-bytes 8) ; u16 col, u16 row, u16 w, u16 h
 
 ;; Frame v3 layout, after the v2 hyperlink overlay:
 ;;   u16 image_count
@@ -565,13 +602,18 @@ independently."
            (else
             (set! out (cons i out)))))))))
 
-(define (encode-frame b term placements)
-  "Encode TERM's visible state as a v4 binary frame.
+(define (encode-frame b term placements clicks)
+  "Encode TERM's visible state as a v5 binary frame.
+
+term-cursor-x / term-cursor-y are already stored 0-indexed (term-goto!
+in gcell/term/ops.scm subtracts 1 from the 1-indexed VT input).
 
 Layout: 16-byte header (magic, version, frame_type, width, height,
 cursor_col, cursor_row, cursor_style, cursor_attrs) then a cell
-section followed by a hyperlink overlay and an image-placement
-overlay.
+section followed by overlays: hyperlinks (v2), image placements (v3),
+click regions (v5).  CLICKS is a list of (col row w h) rectangles
+copied from the engine's click regions so the client can show a
+pointer cursor over them.
 
 The cell section is either a full grid copy (W*H * %cell-size
 bytes) or a delta (u32 count + count entries of (u32 index,
@@ -582,8 +624,8 @@ the cache."
   (let* ((w     (t:term-width term))
          (h     (t:term-height term))
          (cells (* w h))
-         (cx    (max 0 (- (t:term-cursor-x term) 1)))
-         (cy    (max 0 (- (t:term-cursor-y term) 1)))
+         (cx    (max 0 (t:term-cursor-x term)))
+         (cy    (max 0 (t:term-cursor-y term)))
          (style (term-cursor-style->code (t:term-cursor-style term)))
          (links (collect-hyperlinks term))
          (link-utf8s (map (lambda (l) (string->utf8 (caddr l))) links))
@@ -591,6 +633,7 @@ the cache."
                                        (+ 6 (bytevector-length u)))
                                      link-utf8s)))
          (n-placements (length placements))
+         (n-clicks     (length clicks))
          (new-cells (build-cells-bv term))
          (full-cell-bytes (* cells %cell-size))
          (cache (webui-backend-cells-cache b))
@@ -606,7 +649,8 @@ the cache."
               (+ %frame-header-size
                  cell-region-size
                  2 link-bytes
-                 2 (* n-placements %image-placement-bytes))
+                 2 (* n-placements %image-placement-bytes)
+                 2 (* n-clicks %click-rect-bytes))
               0)))
     ;; Header.
     (bytevector-u32-set! bv 0 %frame-magic (endianness little))
@@ -618,6 +662,11 @@ the cache."
     (bytevector-u16-set! bv 12 cy (endianness little))
     (bytevector-u8-set!  bv 14 style)
     (bytevector-u8-set!  bv 15 0)
+    (format (current-error-port)
+            "[encode-frame] w=~a h=~a delta=~a cells=~a~%"
+            w h do-delta? (if do-delta? delta-count cells))
+    (force-output (current-error-port))
+    (%reset-colour-sample!)
     ;; Cell section.
     (cond
      (do-delta?
@@ -681,6 +730,21 @@ the cache."
             (bytevector-u16-set! bv (+ off 4) ulen (endianness little))
             (bytevector-copy!    utf8 0 bv (+ off 6) ulen)
             (loop (cdr entries) (cdr utf8s) (+ off 6 ulen)))))))
+    ;; Click-region overlay (v5).  Lives at the very end of the
+    ;; bytevector; we computed its offset from the total size.
+    (let* ((click-start (- (bytevector-length bv)
+                           2 (* n-clicks %click-rect-bytes))))
+      (bytevector-u16-set! bv click-start n-clicks (endianness little))
+      (let cloop ((rs clicks) (coff (+ click-start 2)))
+        (cond
+         ((null? rs) #f)
+         (else
+          (let ((r (car rs)))
+            (bytevector-u16-set! bv coff       (car r)   (endianness little))
+            (bytevector-u16-set! bv (+ coff 2) (cadr r)  (endianness little))
+            (bytevector-u16-set! bv (+ coff 4) (caddr r) (endianness little))
+            (bytevector-u16-set! bv (+ coff 6) (cadddr r) (endianness little))
+            (cloop (cdr rs) (+ coff %click-rect-bytes)))))))
     ;; Update cache so the next frame can diff against the bytes the
     ;; browser is now displaying.
     (set! (webui-backend-cells-cache b) new-cells)
@@ -696,10 +760,27 @@ the cache."
 (define %default-fg #xFFFFFFFF)
 (define %default-bg #xFFFFFFFF)
 
+;; One-shot per draw: log the first non-default colour we see, so we
+;; can confirm SGR is producing coloured faces and color->rgb is
+;; resolving them.  Reset by encode-frame each new frame.
+(define %colour-sample-logged? #f)
+(define (%reset-colour-sample!) (set! %colour-sample-logged? #f))
+(define (%log-colour-sample! slot raw resolved)
+  (unless %colour-sample-logged?
+    (set! %colour-sample-logged? #t)
+    (format (current-error-port)
+            "[face->rgb] slot=~a raw=~s resolved=~a~%"
+            slot raw (if resolved (number->string resolved 16) "default"))
+    (force-output (current-error-port))))
+
 (define (face-fg->rgb face)
   (cond
    ((not face) %default-fg)
-   (else (or (color->rgb (t:face-fg face)) %default-fg))))
+   (else
+    (let* ((raw (t:face-fg face))
+           (resolved (and raw (color->rgb raw))))
+      (when raw (%log-colour-sample! 'fg raw resolved))
+      (or resolved %default-fg)))))
 
 (define (face-bg->rgb face)
   (cond
@@ -707,14 +788,30 @@ the cache."
    (else (or (color->rgb (t:face-bg face)) %default-bg))))
 
 (define (color->rgb c)
-  "Resolve C (a hex string like \"#ff00aa\", an (R G B) list, or #f)
-to a u32 with byte layout 0x00RRGGBB.  Returns #f for unrecognised
-shapes."
+  "Resolve C to a u32 with byte layout 0x00RRGGBB, or #f if unrecognised.
+Accepts:
+ - #f → #f (caller falls back to the default sentinel)
+ - integer 0..255 → ANSI / 256-colour palette index, resolved via
+   (gcell term color)'s color-index->rgb; this is what canary's SGR
+   parser stores for `\\e[31m`-style codes
+ - 3-element list / vector → literal (R G B) from true-colour
+   (`\\e[38;2;R;G;Bm`)
+ - hex string like \"#ff00aa\" → parsed direct."
   (cond
    ((not c) #f)
+   ((and (integer? c) (>= c 0) (< c 256))
+    (let ((rgb (color-index->rgb c)))
+      (and rgb
+           (+ (* 256 256 (vector-ref rgb 0))
+              (* 256       (vector-ref rgb 1))
+              (vector-ref  rgb 2)))))
    ((string? c) (hex-string->rgb c))
    ((and (list? c) (= 3 (length c)))
     (+ (* 256 256 (car c)) (* 256 (cadr c)) (caddr c)))
+   ((and (vector? c) (= 3 (vector-length c)))
+    (+ (* 256 256 (vector-ref c 0))
+       (* 256       (vector-ref c 1))
+       (vector-ref  c 2)))
    (else #f)))
 
 (define (hex-string->rgb s)
@@ -754,6 +851,29 @@ shapes."
   "Unix-epoch wall-clock millis; shared with client-side Date.now()."
   (let ((tv (gettimeofday)))
     (+ (* 1000 (car tv)) (quotient (cdr tv) 1000))))
+
+(define (handle-window-event! b event)
+  "Handle window-level webui events (connect / disconnect / etc.).
+On a fresh connection we drop the diff cache and nudge the engine to
+re-render so the browser sees a full frame even though backend-draw
+already fired before the WebSocket came up."
+  (let ((type (webui-event-type event))
+        (eng  (webui-backend-engine b)))
+    (format (current-error-port)
+            "[gcell backend-webui] window event type=~a~%" type)
+    (force-output (current-error-port))
+    (cond
+     ((= type +webui-event-connected+)
+      (set! (webui-backend-cells-cache b) #f)
+      (hash-clear! (webui-backend-image-ids b))
+      (set! (webui-backend-next-image-id b) 1)
+      (when eng
+        (let ((sz (webui-backend-size-slot b)))
+          (send-to-engine
+           eng
+           ((module-ref (resolve-module '(gcell protocol)) 'resize)
+            (size-width sz) (size-height sz))))))
+     (else #f))))
 
 (define (dispatch-browser-event! b event)
   "Read the JSON payload from EVENT, decode it, and forward the
@@ -820,6 +940,11 @@ entry on the next frame."
                   (else 'info))))
     ((module-ref (resolve-module '(gcell engine)) 'engine-log!)
      eng 'browser level text)
+    ;; Mirror to stderr for external visibility during the demo /
+    ;; diagnostic phase -- the in-grid log overlay is often disabled.
+    (format (current-error-port)
+            "[gcell client log ~a] ~a~%" level text)
+    (force-output (current-error-port))
     ;; Force a render: cascade! treats <tick> as a broadcast, and the
     ;; render-frame call inside event-loop happens whenever ANY msg
     ;; reports a state change.  A bare tick gives every widget a
@@ -845,25 +970,51 @@ JSON dependency for L1; the wire schema is closed."
       (let* ((sym-str (json-field json "sym"))
              (sym (and sym-str
                        (if (= 1 (string-length sym-str))
-                           ;; Printable single characters travel as
-                           ;; chars to match what gcell's ANSI input
-                           ;; loop produces; widgets test with
-                           ;; (eqv? k #\+).
+                           ;; Single-char keys travel as chars to match
+                           ;; what gcell's ANSI input loop produces;
+                           ;; widgets test with (eqv? k #\+).
                            (string-ref sym-str 0)
-                           (string->symbol sym-str)))))
-        (and sym (apply key sym (json-mods json)))))
+                           (string->symbol sym-str))))
+             (ev-str (json-field json "event"))
+             (event (case (and ev-str (string->symbol ev-str))
+                      ((release) 'release)
+                      ((repeat)  'repeat)
+                      ;; "press" or missing field both mean a fresh
+                      ;; press.  Matches gcell <key>'s default.
+                      (else      'press))))
+        (and sym
+             ;; Build via normalize-key + override the event slot.
+             ;; normalize-key handles mod canonicalisation; we set the
+             ;; event after because gcell's `key' constructor always
+             ;; produces 'press.
+             (let ((k (normalize-key (cons sym (json-mods json)))))
+               (slot-set! k 'event event)
+               k))))
      ((string=? tag "mouse")
-      ;; Action: 'press | 'release | 'move | 'scroll-up | 'scroll-down.
-      ;; Button: 'left | 'middle | 'right | 'none (for move/scroll with
-      ;; no button held).  Gcell's protocol shape matches what the
-      ;; ANSI input loop produces, so the same widgets (textinput,
-      ;; viewport, menu) react identically.
-      (let ((x      (json-int   json "x"))
-            (y      (json-int   json "y"))
-            (btn    (json-field json "button"))
-            (action (json-field json "action")))
-        (and x y btn action
-             (mouse x y (string->symbol btn) (string->symbol action)))))
+      ;; gcell/input.scm encodes buttons as small ints (0 left, 1
+      ;; middle, 2 right, 3 no-button held for drag-less motion) and
+      ;; actions as one of 'press 'release 'motion 'scroll-up
+      ;; 'scroll-down.  The client sends button names and "move"; map
+      ;; both onto gcell's vocabulary so the same widgets fire as
+      ;; under the ANSI loop.
+      (let* ((x       (json-int   json "x"))
+             (y       (json-int   json "y"))
+             (btn-str (json-field json "button"))
+             (act-str (json-field json "action"))
+             (btn (case (and btn-str (string->symbol btn-str))
+                    ((left)   0)
+                    ((middle) 1)
+                    ((right)  2)
+                    ((none)   3)
+                    (else     3)))
+             (action (case (and act-str (string->symbol act-str))
+                       ((press)        'press)
+                       ((release)      'release)
+                       ((move motion)  'motion)
+                       ((scroll-up)    'scroll-up)
+                       ((scroll-down)  'scroll-down)
+                       (else #f))))
+        (and x y action (mouse x y btn action))))
      ((string=? tag "paste")
       ;; Browser `paste` events ride this channel.  The text already
       ;; comes through the JSON-escape from JS, so what's in the
@@ -1054,15 +1205,21 @@ suffixed `-ns'; cumulative + max + mean for each timing channel."
 
 (define (client-html)
   "Return the complete HTML document that boots the browser-side
-WebGL2 renderer.  Reads its JavaScript pieces from
-gcell/backend-webui/client/ via the load path."
+WebGL2 renderer.  Stamps cache-busting meta tags so the browser
+never serves a stale copy of the HTML or its inlined JS after the
+server restarts -- restart, reload, see the new code, no manual
+Ctrl-Shift-R needed."
   (string-append
    "<!doctype html><html><head>"
    "<meta charset=\"utf-8\">"
+   "<meta http-equiv=\"Cache-Control\""
+   " content=\"no-store, no-cache, must-revalidate, max-age=0\">"
+   "<meta http-equiv=\"Pragma\" content=\"no-cache\">"
+   "<meta http-equiv=\"Expires\" content=\"0\">"
    "<title>gcell</title>"
    "<style>"
    "html,body{margin:0;height:100%;background:#000;overflow:hidden;}"
-   "canvas{display:block;width:100vw;height:100vh;background:#000;}"
+   "canvas{display:block;background:#000;}"
    "</style>"
    "<script src=\"webui.js\"></script>"
    "</head><body>"

@@ -29,13 +29,32 @@ const CELL_SIZE   = 13;
 //
 // Hyperlink overlay (v2+) and image-placement overlay (v3+) follow.
 
-const FONT_PX = 16;
-const CELL_W  = 9;
-const CELL_H  = 18;
+// One coordinate system everywhere: CSS pixels.  Canvas backing
+// equals canvas display equals window inner size.  No DPR
+// multiplication anywhere -- DPR drifts between window states on
+// some compositors and any place that touched it would silently
+// rescale.  The atlas is rasterised at a 2x oversampling so glyphs
+// have enough source resolution; LINEAR atlas filter downsamples
+// to the shader's CSS-pixel cell size with no aliasing.
+const __qs = new URLSearchParams(window.location.search);
+const CSS_CELL_W = parseInt(__qs.get('cw'),   10) || 10;
+const CSS_CELL_H = parseInt(__qs.get('ch'),   10) || 20;
+const FONT_CSS_PX = parseInt(__qs.get('font'), 10) || 16;
+const ATLAS_OVERSAMPLE = 2;
+// Atlas slot size in pixels (only used to rasterise the texture).
+const CELL_W  = CSS_CELL_W  * ATLAS_OVERSAMPLE;
+const CELL_H  = CSS_CELL_H  * ATLAS_OVERSAMPLE;
+const FONT_PX = FONT_CSS_PX * ATLAS_OVERSAMPLE;
 const ATLAS_COLS = 16;
 const ATLAS_ROWS = 16;
 
 const canvas = document.getElementById('cv');
+// Make the canvas focusable so click + keyboard events route here
+// reliably; without tabindex the canvas can't take focus, and on
+// some browsers that drops keydown events for non-textual keys when
+// the page is loaded inside a popup-style window like webui's.
+canvas.setAttribute('tabindex', '0');
+canvas.style.outline = 'none';
 const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
 if (!gl) throw new Error('webgl2 required');
 
@@ -66,17 +85,34 @@ const atlasMap = new Map(); // codepoint -> slot (shared across layers)
 let nextSlot = 0;
 let atlasDirty = true;
 
+// Family with deliberate, broad coverage of box-drawing / block
+// characters.  "ui-monospace" picks the system's terminal-grade font
+// on Mac+modern Linux; the fallbacks cover X11 minimal envs.
+const ATLAS_FONT_FAMILY =
+  'ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace';
+
 function rasteriseGlyph(cp, slot) {
   const x = (slot % ATLAS_COLS) * CELL_W;
   const y = Math.floor(slot / ATLAS_COLS) * CELL_H;
+  const s = String.fromCodePoint(cp || 32);
   for (let i = 0; i < ATLAS_LAYERS; i++) {
     const actx = atlasCtxs[i];
+    actx.save();
     actx.fillStyle = '#000';
     actx.fillRect(x, y, CELL_W, CELL_H);
+    // Clip strictly to the cell so AA bleed from this glyph cannot
+    // touch neighbouring slots in the atlas -- NEAREST sampling would
+    // otherwise show those stray pixels as "random dots" under and
+    // around tall/wide glyphs (r, t, j, comma, etc.).
+    actx.beginPath();
+    actx.rect(x, y, CELL_W, CELL_H);
+    actx.clip();
     actx.fillStyle = '#fff';
-    actx.font = `${LAYER_FONTS[i]}${FONT_PX}px monospace`;
-    actx.textBaseline = 'top';
-    actx.fillText(String.fromCodePoint(cp || 32), x, y);
+    actx.font = `${LAYER_FONTS[i]}${FONT_PX}px ${ATLAS_FONT_FAMILY}`;
+    actx.textAlign = 'center';
+    actx.textBaseline = 'middle';
+    actx.fillText(s, x + CELL_W / 2, y + CELL_H / 2);
+    actx.restore();
   }
 }
 
@@ -98,8 +134,12 @@ for (let cp = 32; cp < 127; cp++) atlasIndexFor(cp);
 const atlasTex = gl.createTexture();
 gl.activeTexture(gl.TEXTURE0);
 gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
-gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+// LINEAR: atlas is oversampled (2x); shader's per-frame cell size
+// is in device pixels via current DPR, which is usually < atlas
+// resolution.  LINEAR downscale keeps glyphs crisp; NEAREST would
+// alias when downscaling.
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 // Immutable storage so we don't keep allocating per upload.
@@ -363,6 +403,21 @@ function unpackColor(packed, out, off, fallback) {
 const hyperlinks = new Map();
 function linkKey(col, row) { return (row << 16) | col; }
 
+// Per-frame list of clickable rectangles (from gcell's on-click /
+// on-hover wrappers).  Cells inside these rects get a pointer cursor
+// affordance so the user knows interactive surfaces at a glance.
+let clickRects = [];
+function pointInRect(x, y, r) {
+  return x >= r.col && x < r.col + r.w &&
+         y >= r.row && y < r.row + r.h;
+}
+function anyClickableAt(x, y) {
+  for (let i = 0; i < clickRects.length; i++) {
+    if (pointInRect(x, y, clickRects[i])) return true;
+  }
+  return false;
+}
+
 const utf8Decoder = new TextDecoder('utf-8');
 
 function writeCellSlot(idx, w, cp, fg, bg, attrs) {
@@ -393,6 +448,17 @@ function applyFrame(buf) {
   cursorStyle = dv.getUint8(14);
   cursorBlink = (dv.getUint8(15) & 1) !== 0;
   const total = w * h;
+  if (w !== gridW || h !== gridH) {
+    shipLog('info', `frame newdim ${gridW}x${gridH} -> ${w}x${h} type=${frameType}`);
+    // Snap canvas display + backing to exactly grid * CSS_CELL.
+    // canvas.width / gridW is now always == CSS_CELL_W exactly.
+    const cw = w * CSS_CELL_W;
+    const ch = h * CSS_CELL_H;
+    canvas.style.width  = cw + 'px';
+    canvas.style.height = ch + 'px';
+    canvas.width  = cw;
+    canvas.height = ch;
+  }
   if (cellsArray.length !== total * FLOATS_PER_CELL) {
     // Grid resized: any cells we had are stale and the delta we just
     // received (if any) can't be applied to a fresh array.  The server
@@ -467,6 +533,25 @@ function applyFrame(buf) {
       });
       off += 20;
     }
+    overlayOff = off;
+  }
+
+  // Click-region overlay (v5+).  Entry: u16 col, u16 row, u16 w, u16 h.
+  // Stored as rectangles; we keep them as a flat list and hit-test on
+  // mousemove for the cursor=pointer affordance.
+  clickRects = [];
+  if (version >= 5 && u8.byteLength >= overlayOff + 2) {
+    const n = dv.getUint16(overlayOff, true);
+    let off = overlayOff + 2;
+    for (let i = 0; i < n; i++) {
+      clickRects.push({
+        col: dv.getUint16(off,     true),
+        row: dv.getUint16(off + 2, true),
+        w:   dv.getUint16(off + 4, true),
+        h:   dv.getUint16(off + 6, true),
+      });
+      off += 8;
+    }
   }
 
   if (atlasDirty) syncAtlas();
@@ -483,20 +568,24 @@ function cursorAlpha() {
 }
 
 function draw() {
+  // Cells are always CSS_CELL_W x CSS_CELL_H *CSS pixels* in size.
+  // Canvas backing equals the window in CSS pixels (no DPR).  Shader
+  // paints at the same CSS-pixel scale -- one source of truth.
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.uniform2f(uViewport, canvas.width, canvas.height);
+  gl.useProgram(program);
+  gl.uniform2f(uCellSize, CSS_CELL_W, CSS_CELL_H);
   gl.clearColor(0, 0, 0, 1);
   gl.clear(gl.COLOR_BUFFER_BIT);
   if (cellCount > 0) {
-    gl.useProgram(program);
     gl.bindVertexArray(vao);
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, cellCount);
   }
-  drawImagePlacements();
+  drawImagePlacements(CSS_CELL_W, CSS_CELL_H);
   if (cursorStyle !== 0) {
     gl.useProgram(cursorProgram);
     gl.bindVertexArray(cursorVao);
-    gl.uniform2f(cuCellSize, CELL_W, CELL_H);
+    gl.uniform2f(cuCellSize, CSS_CELL_W, CSS_CELL_H);
     gl.uniform2f(cuViewport, canvas.width, canvas.height);
     gl.uniform2f(cuCell, cursorCol, cursorRow);
     gl.uniform1i(cuStyle, cursorStyle);
@@ -564,17 +653,69 @@ window.addEventListener('unhandledrejection', e => {
   console.info  = wrap(console.info .bind(console), 'info');
 })();
 
-function onResize() {
-  const dpr = window.devicePixelRatio || 1;
-  canvas.width  = Math.floor(window.innerWidth  * dpr);
-  canvas.height = Math.floor(window.innerHeight * dpr);
-  const cols = Math.max(20, Math.floor(canvas.width  / CELL_W));
-  const rows = Math.max(5,  Math.floor(canvas.height / CELL_H));
-  send('resize', { width: cols, height: rows });
-  draw();
+function onResize(reason) {
+  try {
+    // onResize only tells the server how many cells fit; it does NOT
+    // touch the canvas.  The canvas is sized in applyFrame from the
+    // arriving frame's grid dims, which guarantees canvas.width is
+    // always exactly gridW * CSS_CELL_W -- no transient where the
+    // browser holds old grid cells inside a freshly-resized big
+    // canvas with mismatched dims.
+    const cssW = window.innerWidth;
+    const cssH = window.innerHeight;
+    const cols = Math.max(20, Math.floor(cssW / CSS_CELL_W));
+    const rows = Math.max(5,  Math.floor(cssH / CSS_CELL_H));
+    shipLog('info', `onResize(${reason||'?'}) inner=${cssW}x${cssH}`
+                   +` request grid=${cols}x${rows}`);
+    send('resize', { width: cols, height: rows });
+  } catch (e) {
+    shipLog('error', `onResize threw: ${e && e.message ? e.message : e}`);
+  }
 }
 
-window.addEventListener('resize', onResize);
+window.addEventListener('resize',  () => { shipLog('info','evt=window.resize'); onResize('window.resize'); });
+window.addEventListener('orientationchange', () => { shipLog('info','evt=orientationchange'); onResize('orientationchange'); });
+document.addEventListener('fullscreenchange', () => { shipLog('info','evt=fullscreenchange'); onResize('fullscreenchange'); });
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => { shipLog('info','evt=resizeObserver'); onResize('resizeObserver'); }).observe(document.documentElement);
+}
+let __lastW = window.innerWidth, __lastH = window.innerHeight;
+setInterval(() => {
+  if (window.innerWidth !== __lastW || window.innerHeight !== __lastH) {
+    shipLog('info', `evt=poll innerChanged ${__lastW}x${__lastH} -> ${window.innerWidth}x${window.innerHeight}`);
+    __lastW = window.innerWidth;
+    __lastH = window.innerHeight;
+    onResize('poll');
+  }
+}, 250);
+// Heartbeat: ships current dims every 2s.  If these stop, JS is
+// frozen / page died.  If canvas backing diverges from style * DPR,
+// onResize is not effectively taking hold.
+setInterval(() => {
+  // Get the actual rendered rect (post-layout, post any browser
+  // scaling).  If this differs from canvas.style.* the browser is
+  // scaling the canvas behind our backs.
+  const r = canvas.getBoundingClientRect();
+  const vv = window.visualViewport;
+  const vvScale = vv ? vv.scale : '?';
+  const vvW = vv ? Math.round(vv.width) : '?';
+  shipLog('info', `hb inner=${window.innerWidth}x${window.innerHeight}`
+                 +` outer=${window.outerWidth}x${window.outerHeight}`
+                 +` screen=${screen.width}x${screen.height}`
+                 +` dpr=${window.devicePixelRatio}`
+                 +` vv=${vvW}@${vvScale}`
+                 +` canvas=${canvas.width}x${canvas.height}`
+                 +` style=${canvas.style.width || '?'}x${canvas.style.height || '?'}`
+                 +` rect=${Math.round(r.width)}x${Math.round(r.height)}`
+                 +` cellPx=${(r.width / Math.max(1, gridW)).toFixed(2)}`
+                 +` gridW=${gridW} gridH=${gridH}`);
+}, 2000);
+// Make sure clicks land focus -- some webui-launched windows boot
+// without document focus and then keydown events miss the document.
+canvas.addEventListener('mousedown', () => canvas.focus());
+window.addEventListener('load',      () => canvas.focus());
+document.addEventListener('visibilitychange',
+  () => { if (document.visibilityState === 'visible') canvas.focus(); });
 
 // ---- Input
 
@@ -591,26 +732,63 @@ function keySym(e) {
   return k;
 }
 
-document.addEventListener('keydown', (e) => {
+// Modifier-only events from `e.key` are useless on the gcell side --
+// the next non-modifier key will carry the mod flags.
+const MODIFIER_KEYS = new Set([
+  'Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'NumLock', 'ScrollLock',
+  'OS', 'AltGraph', 'ContextMenu',
+]);
+
+// Keys whose browser default has to be suppressed so they reach the
+// app: Backspace (back-nav in some browsers), Tab (focus jump), space
+// (page scroll on body), arrows / page nav (scroll), function keys
+// (some are reserved), Enter (form submit).  We send them all to the
+// engine, then preventDefault.
+function shouldPreventDefault(e) {
+  if (e.key === 'Tab' || e.key === 'Backspace' || e.key === 'Enter' ||
+      e.key === ' '   || e.key === 'Delete'    || e.key === 'Home'  ||
+      e.key === 'End' || e.key.startsWith('Arrow') ||
+      e.key.startsWith('Page') || /^F\d/.test(e.key)) {
+    return true;
+  }
+  return false;
+}
+
+function keyEventOf(e) {
+  // Browser auto-repeat: e.repeat=true.  gcell's engine has a
+  // held-set timeout of several seconds, so without 'repeat / 'release
+  // bookkeeping the second tap of the same key (backspace, etc.)
+  // would be re-classified as a held-key repeat by the engine and
+  // dropped by widgets that only listen to 'press (e.g. textinput).
+  if (e.type === 'keyup') return 'release';
+  return e.repeat ? 'repeat' : 'press';
+}
+
+function dispatchKey(e) {
+  if (MODIFIER_KEYS.has(e.key)) return;
   const mods = [];
   if (e.ctrlKey)  mods.push('control');
   if (e.shiftKey) mods.push('shift');
   if (e.altKey)   mods.push('alt');
   if (e.metaKey)  mods.push('meta');
-  send('key', { sym: keySym(e), mods: mods.join(',') });
-  // Block browser-default shortcuts that interfere with the app
-  // (Tab, arrow scroll, etc.).
-  if (e.key === 'Tab' || e.key.startsWith('Arrow')) e.preventDefault();
-});
+  send('key', {
+    sym:   keySym(e),
+    mods:  mods.join(','),
+    event: keyEventOf(e),
+  });
+  if (shouldPreventDefault(e)) e.preventDefault();
+}
+
+document.addEventListener('keydown', dispatchKey);
+document.addEventListener('keyup',   dispatchKey);
 
 function cellPosFromMouseEvent(e) {
   const rect = canvas.getBoundingClientRect();
-  const cssX = e.clientX - rect.left;
-  const cssY = e.clientY - rect.top;
-  const dpr = window.devicePixelRatio || 1;
+  // CSS-pixel offsets / CSS cell size yields the same grid coords the
+  // server sees from the resize event.
   return {
-    x: Math.floor((cssX * dpr) / CELL_W),
-    y: Math.floor((cssY * dpr) / CELL_H),
+    x: Math.floor((e.clientX - rect.left) / CSS_CELL_W),
+    y: Math.floor((e.clientY - rect.top)  / CSS_CELL_H),
   };
 }
 
@@ -646,15 +824,18 @@ canvas.addEventListener('mouseup', (e) => {
 
 canvas.addEventListener('mousemove', (e) => {
   const { x, y } = cellPosFromMouseEvent(e);
-  // Hover affordance for hyperlinks: switch the cursor to pointer
-  // when over a linked cell, default otherwise.
-  canvas.style.cursor = hyperlinks.has(linkKey(x, y)) ? 'pointer' : 'default';
-  const now = performance.now();
-  // Coalesce moves to ~60 Hz AND to actual cell-position changes.
-  // gcell's input loop does the same throttle for ANSI mouse events.
+  // Hover affordance: pointer cursor over any clickable region (or
+  // OSC-8 hyperlink), default otherwise.  Tells the user at a glance
+  // which cells are interactive without the widget itself having to
+  // add a visual hover style.
+  const overClickable = hyperlinks.has(linkKey(x, y)) || anyClickableAt(x, y);
+  canvas.style.cursor = overClickable ? 'pointer' : 'default';
+  // Same-cell movement is invisible to a cell grid; only emit on a
+  // real cell change.  No time throttle: the cell granularity bounds
+  // the rate by mouse speed already, and dropping any cell-cross
+  // makes hover affordances flicker / stick.
   if (x === lastMove.x && y === lastMove.y) return;
-  if (now - lastMove.ts < 16) return;
-  lastMove = { x, y, ts: now };
+  lastMove = { x, y, ts: 0 };
   send('mouse', { x, y, button: mouseHeld, action: 'move' });
 });
 
@@ -768,11 +949,11 @@ gl.vertexAttribPointer(iaQuadLoc, 2, gl.FLOAT, false, 0, 0);
 
 gl.bindVertexArray(vao);
 
-function drawImagePlacements() {
+function drawImagePlacements(cellW, cellH) {
   if (imagesPlaced.length === 0) return;
   gl.useProgram(imageProgram);
   gl.bindVertexArray(imageVao);
-  gl.uniform2f(iuCellSize, CELL_W, CELL_H);
+  gl.uniform2f(iuCellSize, cellW || CELL_W, cellH || CELL_H);
   gl.uniform2f(iuViewport, canvas.width, canvas.height);
   gl.uniform1i(iuImg, 1);
   gl.activeTexture(gl.TEXTURE1);
