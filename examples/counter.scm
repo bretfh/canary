@@ -6,7 +6,9 @@
 (use-modules (canary) (oop goops))
 
 (define-class <counter> (<focusable>)
-  (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
+  (n #:init-keyword #:n
+     #:init-value   0
+     #:getter       counter-n))
 
 (define-method (view (c <counter>))
   (vbox (txt "  press + or - (q to quit)" #:fg 'muted)
