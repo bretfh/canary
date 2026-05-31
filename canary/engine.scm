@@ -354,8 +354,9 @@ logged; on error, returns NODE unchanged."
            (let ((result (update threaded msg)))
              (match (if (pair? result) result (cons threaded #f))
                ((new-node . own-cmd)
-                (invalidate-size! new-node)
-                (invalidate-cached-view! new-node)
+                (unless (eq? new-node node)
+                  (invalidate-size! new-node)
+                  (invalidate-cached-view! new-node))
                 (cons new-node
                       (cmds->batched
                        (if own-cmd (cons own-cmd child-cmds) child-cmds))))))))))
@@ -1078,66 +1079,35 @@ are the catch payload."
   "Interpret one cmd CMD on engine ENG.  Dispatches on the cmd's
 shape: bare symbols, tagged lists, and bare thunks.  Handles batch
 fan-out, sequence (in-order async), every/after sub installation,
-cancel, plus all screen and app cmds.  Unknown cmds are dropped."
-  (let ((out (lambda () (ansi-backend-port (engine-backend eng))))
-        (mark-dirty! (lambda ()
-                       (set! (ansi-backend-prev-term (engine-backend eng)) #f))))
+cancel, plus all screen and app cmds.  Backend-specific output
+cmds (set-title, cursor, alt-screen, mouse-mode, println) are
+delegated to BACKEND-HANDLE-CMD so each backend translates them
+onto its own surface.  Unknown cmds are dropped."
+  (let ((b (engine-backend eng)))
     (match cmd
       (#f #f)
       ('quit (stop-engine! eng))
-      ('clear-screen (mark-dirty!))
+      ('clear-screen (backend-mark-dirty! b))
       ('cycle-palette
        (theme-cycle! (engine-theme eng))
-       (mark-dirty!))
+       (backend-mark-dirty! b))
       ('clear-log
        (set-engine-log-entries! eng '()))
       ('suspend
-       (backend-shutdown (engine-backend eng))
+       (backend-shutdown b)
        (kill (getpid) 20)                                ; Linux SIGTSTP
-       (backend-init (engine-backend eng))
+       (backend-init b)
        (send eng (resumed)))
-      (('set-title text)
-       (let ((o (out)))
-         (display (string-append "\x1b]0;" text "\x07") o)
-         (force-output o)))
-      (('cursor mode)
-       (let ((o (out)))
-         (case mode
-           ((hidden hide)  (display "\x1b[?25l" o))
-           ((visible show) (display "\x1b[?25h" o))
-           ((bar)          (display "\x1b[5 q"  o))
-           ((underline)    (display "\x1b[3 q"  o))
-           ((block)        (display "\x1b[1 q"  o)))
-         (force-output o)))
-      (('alt-screen mode)
-       (let ((o (out)))
-         (display (if (eq? mode 'on) "\x1b[?1049h" "\x1b[?1049l") o)
-         (force-output o)))
-      (('mouse-mode mode)
-       (let ((o (out)))
-         (case mode
-           ((off)
-            (display "\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1003l\x1b[?1000l" o))
-           ((click)
-            (display "\x1b[?1003l\x1b[?1002l\x1b[?1000h\x1b[?1006h" o))
-           ((cell)
-            (display "\x1b[?1003l\x1b[?1002h\x1b[?1006h" o))
-           ((all)
-            (display "\x1b[?1003h\x1b[?1006h" o)))
-         (force-output o)))
-      (('println . parts)
-       (let ((o (out))
-             (line (apply string-append
-                          (map (lambda (p) (if (string? p) p (format #f "~a" p)))
-                               parts))))
-         (display "\x1b[?1049l" o)
-         (display line o)
-         (newline o)
-         (display "\x1b[?1049h" o)
-         (mark-dirty!)
-         (force-output o)))
+      (('set-title _)   (backend-handle-cmd b eng cmd))
+      (('cursor _)      (backend-handle-cmd b eng cmd))
+      (('alt-screen _)  (backend-handle-cmd b eng cmd))
+      (('mouse-mode _)  (backend-handle-cmd b eng cmd))
+      (('println . _)
+       (backend-handle-cmd b eng cmd)
+       (backend-mark-dirty! b))
       (('set-palette name)
-       (when (theme-set! (engine-theme eng) name) (mark-dirty!)))
+       (when (theme-set! (engine-theme eng) name)
+         (backend-mark-dirty! b)))
       (('focus widget)
        (let* ((sz   (backend-size (engine-backend eng)))
               (path (find-focus-path (engine-root eng) sz widget))
@@ -1225,14 +1195,12 @@ cancel, plus all screen and app cmds.  Unknown cmds are dropped."
       (_ #f))))
 
 (define (handle-resize! eng msg)
-  "Apply a flushed <resize> MSG: cache new dims on the backend,
-invalidate the diff baseline, cascade to user code.  Called by the
-debounce fiber after quiescence, and directly during bootstrap."
+  "Apply a flushed <resize> MSG: cache new dims on the backend (via
+BACKEND-HANDLE-RESIZE!), invalidate the diff baseline, cascade to
+user code.  Called by the debounce fiber after quiescence, and
+directly during bootstrap."
   (let ((b (engine-backend eng)))
-    (when (ansi-backend? b)
-      (set! (ansi-backend-size b)
-            (size (resize-width msg) (resize-height msg)))
-      (set! (ansi-backend-prev-term b) #f)))
+    (backend-handle-resize! b (resize-width msg) (resize-height msg)))
   (let ((cmd (cascade! eng msg)))
     (run-cmd! eng cmd)))
 
