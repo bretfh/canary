@@ -20,7 +20,8 @@
              (gnu packages libunistring)
              (gnu packages autotools)
              (gnu packages pkg-config)
-             (gnu packages zig))
+             (gnu packages zig)
+             (canary deps webui))
 
 (define (with-static pkg)
   "Return PKG with --enable-static added (and any upstream
@@ -115,4 +116,9 @@
        guile-3.0-static
        libgc-static libffi-static gmp-static libtool-static
        libunistring `(,libunistring "static")
-       guile-fibers-static))
+       guile-fibers-static
+       ;; libwebui-2-static.a — present whether or not a given build
+       ;; uses the webui backend.  build.zig only links it when
+       ;; -Dbackend=webui; the dead cost otherwise is a manifest
+       ;; entry, not bytes in the produced binary.
+       webui))

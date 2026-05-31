@@ -125,7 +125,9 @@ Returns the path to a tar of staging."
     ;; may or may not be inside `guix shell`; ask it explicitly.
     (let* ((tool-guix (string-append %tool-dir "/guix.scm"))
            (p (open-input-pipe
-               (string-append "guix shell -m " tool-guix
+               (string-append "guix shell -L "
+                              (canary-repo-root) "/guix"
+                              " -m " tool-guix
                               " -- bash -c 'echo $GUIX_ENVIRONMENT'")))
            (env (read-line p)))
       (close-pipe p)
@@ -156,15 +158,35 @@ Returns the path to a tar of staging."
     ;; via -Dpayload-dir and embeds every file individually, no tar.
     staging))
 
-(define (cmd-ship)
+(define (cmd-ship . args)
   ;; zig is pulled via `guix shell -m guix.scm` so we only require guix
   ;; on the outside.
   (need-tool "guix")
+  ;; --backend BACKEND : 'ansi (default) or 'webui.  Webui adds the
+  ;; canary backend-webui native bits (libwebui-2-static.a + the
+  ;; guile-webui bounce shim) so an app that runs (run-app root
+  ;; #:backend (webui-backend)) actually has the symbols at runtime.
+  (define backend
+    (let loop ((rest args))
+      (match rest
+        ((or () ("--backend"))      "ansi")
+        (("--backend" v . _)        v)
+        ((_ . tail)                 (loop tail)))))
+  (define guile-webui-src
+    (or (getenv "GUILE_WEBUI_ROOT")
+        (let ((d (string-append (or (getenv "HOME") "/home")
+                                "/git/guile/guile-webui")))
+          (and (file-exists? d) d))
+        ;; Sibling of canary's repo root: ../guile-webui.
+        (let ((d (string-append (canary-repo-root) "/../guile-webui")))
+          (and (file-exists? d) d))))
+  (when (and (string=? backend "webui") (not guile-webui-src))
+    (format (current-error-port)
+            "canary-build: --backend=webui needs a guile-webui checkout; \
+set GUILE_WEBUI_ROOT or pass --guile-webui PATH.~%")
+    (exit 2))
   (let* ((spec (read-canary-app "canary-app.scm"))
          (name (car (alist-get 'name spec)))
-         ;; By default the module is (name) and the proc is 'main.
-         ;; Override module via (entry-module x y z), proc via
-         ;; (entry-proc some-symbol).  Common case: just (entry-proc main).
          (entry-mod (string-join
                      (map symbol->string
                           (or (alist-get 'entry-module spec)
@@ -175,11 +197,26 @@ Returns the path to a tar of staging."
                                '(main)))))
          (staging (string-append "/tmp/canary-stage-" name "-"
                                  (number->string (current-time))))
-         (tool-guix (string-append %tool-dir "/guix.scm")))
+         (tool-guix (string-append %tool-dir "/guix.scm"))
+         (backend-arg (string-append " -Dbackend=" backend))
+         (gw-arg (if (string=? backend "webui")
+                     (string-append " -Dguile-webui-src=" guile-webui-src)
+                     "")))
     (let ((payload (stage-payload spec staging)))
+      ;; When -Dbackend=webui, also stage guile-webui's webui.scm + .go
+      ;; into the embed table so (use-modules (webui)) resolves from
+      ;; the embedded copy at runtime.
+      (when (string=? backend "webui")
+        (let ((gw guile-webui-src))
+          (run (string-append "cp -r " gw "/webui.scm " payload "/site/3.0/"))
+          (when (file-exists? (string-append gw "/build/webui.go"))
+            (run (string-append "cp -r " gw "/build/webui.go "
+                                payload "/site-ccache/")))))
       (run (format #f
-                   "guix shell -m ~a gcc-toolchain -- bash -c 'cd ~a && zig build -Dpayload-dir=~a -Dentry-module=\"~a\" -Dentry-proc=~a -Dapp-name=~a'"
-                   tool-guix %tool-dir payload entry-mod entry-proc name))
+                   "guix shell -L ~a/guix -m ~a gcc-toolchain -- bash -c 'cd ~a && zig build -Dpayload-dir=~a -Dentry-module=\"~a\" -Dentry-proc=~a -Dapp-name=~a~a~a'"
+                   (canary-repo-root)
+                   tool-guix %tool-dir payload entry-mod entry-proc name
+                   backend-arg gw-arg))
       (run (format #f "mkdir -p dist && cp ~a/zig-out/bin/~a dist/~a"
                    %tool-dir name name))
       (format #t "built dist/~a~%" name))))
@@ -202,6 +239,18 @@ commands:
            guile-fibers (epoll backend), canary, and the app's .scm.
            runs without a guile install on the target.  see
            SHIPPING.md in canary's repo for the full model.
+
+           ship accepts:
+             --backend ansi|webui    (default: ansi)
+
+           with --backend=webui, libwebui-2-static.a and the
+           guile-webui bounce shim are linked in so an app that
+           passes #:backend (webui-backend) to run-app has its
+           runtime symbols available.  the bounce source comes
+           from a guile-webui checkout located via
+           GUILE_WEBUI_ROOT, ~/git/guile/guile-webui, or
+           ../guile-webui (sibling of the canary repo), in that
+           order.
 
   help     show this text.
 
@@ -239,7 +288,7 @@ requirements: guile + guix on PATH.  zig + gcc come from `guix shell`.
 (match (command-line)
   ((_ "dev")     (cmd-dev))
   ((_ "compile") (cmd-compile))
-  ((_ "ship")    (cmd-ship))
+  ((_ "ship" . rest) (apply cmd-ship rest))
   ((_ "help")    (help))
   ((_ "-h")      (help))
   ((_ "--help")  (help))

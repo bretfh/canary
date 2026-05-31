@@ -687,14 +687,37 @@ canary/backend-webui/client/ via the load path."
    "</script>"
    "</body></html>"))
 
+(define (%resolve-canary-find)
+  "Return canary-build's runtime embed-table accessor (%canary-find)
+if it has been registered (static-shipped binary), else #f.  The
+symbol is defined as a gsubr in (guile-user) by main.zig before
+user Scheme runs."
+  (or (false-if-exception
+       (let ((v (module-variable (resolve-module '(guile-user))
+                                 '%canary-find)))
+         (and v (variable-ref v))))
+      (false-if-exception
+       (let ((v (module-variable (current-module) '%canary-find)))
+         (and v (variable-ref v))))))
+
 (define (load-client-script relname)
-  "Locate canary/backend-webui/client/RELNAME on %load-path and
-return its contents as a string."
-  (let ((p (search-path %load-path
-                        (string-append "canary/backend-webui/client/"
-                                       relname))))
+  "Locate canary/backend-webui/client/RELNAME and return its
+contents as a string.  Looks on disk via %load-path first (dev), then
+falls back to the static-binary embed table that canary-build's
+runtime installs (the bytes live at site/3.0/canary/backend-webui/
+client/RELNAME under the canonical embed-path layout)."
+  (let* ((rel (string-append "canary/backend-webui/client/" relname))
+         (disk (search-path %load-path rel)))
     (cond
-     ((and p (file-exists? p))
-      (call-with-input-file p get-string-all))
+     ((and disk (file-exists? disk))
+      (call-with-input-file disk get-string-all))
      (else
-      (error "canary backend-webui: client asset not found" relname)))))
+      (let* ((find (%resolve-canary-find))
+             (key (string-append "site/3.0/" rel))
+             (bytes (and find (find key))))
+        (cond
+         ((and bytes (bytevector? bytes))
+          (utf8->string bytes))
+         (else
+          (error "canary backend-webui: client asset not found"
+                 relname))))))))

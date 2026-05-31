@@ -88,6 +88,12 @@ var entry_proc_z: [256:0]u8 = undefined;
 fn inner(_: ?*anyopaque, _: c_int, _: [*c][*c]u8) callconv(.c) void {
     guile.scm_c_register_extension(null, "init_fibers_epoll", fibers_epoll_init, null);
 
+    // No explicit init_guile_webui_bounce() call: the bounce object
+    // (linked in when -Dbackend=webui) exports the symbol, and
+    // (webui)'s module body resolves it via (dynamic-func ... (dynamic-link))
+    // and invokes it itself.  That keeps the gsubrs registered in the
+    // (webui) module rather than (guile-user).
+
     // Expose %canary-find then install the autoload override.
     _ = guile.scm_c_define_gsubr("%canary-find", 1, 0, 0, @constCast(@ptrCast(&canary_find)));
     _ = guile.scm_c_eval_string(override_glue.ptr);
