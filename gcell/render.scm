@@ -117,11 +117,15 @@ RECT-W/H; they only need RECT-COL/ROW to position the caret."
    ((cells-node? node)
     ;; Pre-rendered block.  Hand the chars/faces buffers straight to
     ;; the backend via one cells-cmd — no per-cell text-cmd allocation.
+    ;; Pass cells-node-w as src-w so the backend reads each row at the
+    ;; node's native stride even when the destination rect is narrower
+    ;; (PTY widget whose term-width briefly exceeds the resized grid).
     (list (make-cells (rect-col rect) (rect-row rect)
                       (min (cells-node-w node) (rect-w rect))
                       (min (cells-node-h node) (rect-h rect))
                       (cells-node-chars node)
-                      (cells-node-faces node))))
+                      (cells-node-faces node)
+                      (cells-node-w node))))
    ((fill-node? node)
     (let* ((w (min (fill-node-w node) (rect-w rect)))
            (h (min (fill-node-h node) (rect-h rect))))

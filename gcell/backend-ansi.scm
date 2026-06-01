@@ -168,20 +168,19 @@ slot is taken from FACE directly."
          ((overline) (t:set-face-overline! tattrs #t))))
      (append (or (face-attrs face) '()) (or extra-attrs '())))))
 
-(define (blit-cells-to-term! term col row w h src-chars src-faces)
-  "Copy a W×H block from SRC-CHARS / SRC-FACES (row-major, length
-W*H) into TERM starting at (COL, ROW).  Bulk version of
-set-term-cell-at! avoiding per-cell goto/write overhead — used by
-cells-cmd."
+(define (blit-cells-to-term! term col row w h src-w src-chars src-faces)
+  "Copy a W×H block from SRC-CHARS / SRC-FACES (row-major, row stride
+SRC-W) into TERM starting at (COL, ROW).  SRC-W can exceed W when
+the source buffer is wider than the rect being blitted (PTY widget
+whose term-width briefly differs from the destination grid)."
   (let* ((tw         (t:term-width term))
          (th         (t:term-height term))
          (dst-chars  (t:term-chars term))
          (dst-faces  (t:term-faces term))
-         ;; Clip to term bounds in case the block doesn't fit.
          (clipped-w  (min w (max 0 (- tw col))))
          (clipped-h  (min h (max 0 (- th row)))))
     (do ((dy 0 (+ dy 1))) ((>= dy clipped-h))
-      (let ((src-base (* dy w))
+      (let ((src-base (* dy src-w))
             (dst-base (+ (* (+ row dy) tw) col)))
         (do ((dx 0 (+ dx 1))) ((>= dx clipped-w))
           (u32vector-set! dst-chars (+ dst-base dx)
@@ -215,6 +214,7 @@ cmds use the registered fallback if graphics support is off."
        (blit-cells-to-term! term
                             (cells-col cmd) (cells-row cmd)
                             (cells-w cmd)   (cells-h cmd)
+                            (cells-src-w cmd)
                             (cells-chars cmd) (cells-faces cmd)))
       ((fill-cmd? cmd)
        (let* ((w (fill-w cmd))
@@ -637,10 +637,14 @@ counting m-terminated and H-terminated sequences respectively."
 
 (define (ensure-term-size! b w h)
   "Ensure the backend's cur and prev terms exist at WxH. Resize or
-allocate as needed. On resize, also clears the physical terminal so
-diff-emitted cells overwrite a known blank state — without this the
-old frame's bytes at coordinates the new frame doesn't paint remain
-on screen as ghosts.
+allocate as needed. Returns #t when the caller must emit a full
+clear (\\e[2J\\e[H) for the physical terminal so diff-emitted cells
+overwrite a known blank state; otherwise #f.
+
+The clear is the caller's job because it must land inside the same
+mode-2026 sync envelope as the diff. Flushing it here as a separate
+write blanks the screen for the duration of diff computation —
+visible as a flash on every resize.
 
 `prev` may be #f independently of `cur`: process-one's resize branch
 nulls it to force a full repaint, so we have to handle the case where
@@ -650,22 +654,21 @@ cur exists at the wrong size and prev needs (re)allocation."
     (cond
      ((not cur)
       (set! (ansi-backend-cur-term b)  (t:make-term #:width w #:height h))
-      (set! (ansi-backend-prev-term b) (t:make-term #:width w #:height h)))
+      (set! (ansi-backend-prev-term b) (t:make-term #:width w #:height h))
+      #f)
      ((or (not (= (t:term-width cur) w))
           (not (= (t:term-height cur) h)))
-      (let ((out (ansi-backend-port b)))
-        (display "\x1b[2J\x1b[H" out)
-        (force-output out))
       (t:term-resize! cur w h)
       (cond
        (prev (t:term-resize! prev w h) (t:term-clear! prev))
        (else (set! (ansi-backend-prev-term b)
-                   (t:make-term #:width w #:height h)))))
+                   (t:make-term #:width w #:height h))))
+      #t)
      ((not prev)
-      ;; cur was already at the right size but prev got nulled (e.g.
-      ;; by a no-op-sized resize msg) — give it a fresh blank term.
       (set! (ansi-backend-prev-term b)
-            (t:make-term #:width w #:height h))))))
+            (t:make-term #:width w #:height h))
+      #f)
+     (else #f))))
 
 (define %profile-frames?
   (let ((v (getenv "CANARY_PROFILE_FRAMES")))
@@ -689,8 +692,8 @@ the next frame diffs against this one."
          (w    (if sz (size-width sz)  (size-width cur-sz)))
          (h    (if sz (size-height sz) (size-height cur-sz)))
          (out  (ansi-backend-port b))
-         (t-compose-start (and %profile-frames? (now-ms))))
-    (ensure-term-size! b w h)
+         (t-compose-start (and %profile-frames? (now-ms)))
+         (needs-clear? (ensure-term-size! b w h)))
     (let ((cur  (ansi-backend-cur-term b))
           (prev (ansi-backend-prev-term b)))
       (call-with-values (lambda () (split-cmds-for-graphics b cmds))
@@ -721,6 +724,7 @@ the next frame diffs against this one."
             ;; to frame. Visually that's "an underline glyph drawn
             ;; everywhere" as the cursor flickered through positions.
             (display +sync-begin+ buf)
+            (when needs-clear? (display "\x1b[2J\x1b[H" buf))
             (display diff buf)
             (when (pair? gfx-cmds) (emit-images! b buf gfx-cmds))
             (display +sync-end+ buf)

@@ -58,6 +58,7 @@
             start-engine!
             send
             stop-engine!
+            force-render!
             refresh-live-widgets!
             handle-resize!
             resize-flushed?
@@ -118,6 +119,15 @@ wakeup so the next ring! actually triggers a wait."
     (with-mutex (engine-queue-mutex eng)
       (set-engine-msg-queue! eng (cons msg (engine-msg-queue eng))))
     (ring! (engine-msg-bell eng))))
+
+(define (force-render! eng)
+  "Request an unconditional re-render on the next event-loop cycle.
+For widgets that mutate buffers in place (PTY terms, image scratch
+surfaces) where the engine's eq?-based identity check would otherwise
+report `no state change' and skip the frame.  Cheaper than the
+update-slots identity bump trick and doesn't require a sentinel slot
+on every such widget."
+  (send eng 'force-render))
 
 (define (drain-msgs! eng)
   "Atomically take all enqueued msgs off ENG and return them in
@@ -1236,7 +1246,15 @@ onto its own surface.  Unknown cmds are dropped."
   "Apply a flushed <resize> MSG: cache new dims on the backend (via
 BACKEND-HANDLE-RESIZE!), invalidate the diff baseline, cascade to
 user code.  Called by the debounce fiber after quiescence, and
-directly during bootstrap."
+directly during bootstrap.
+
+Invariant: after this returns, BACKEND-SIZE and every widget-held
+size-tracking object reachable from the engine root agree on
+(width, height).  The cascade is what enforces this: widgets that
+own a <term> (or other size-bearing buffer) must specialise
+`(update X <resize>)' to apply the new dims; the dispatch-skip
+optimisation in dispatch-update! is what makes that contract
+detectable -- widgets without that method silently ignore the resize."
   (let ((b (engine-backend eng)))
     (backend-handle-resize! b (resize-width msg) (resize-height msg)))
   (let ((cmd (cascade! eng msg)))
@@ -1270,6 +1288,7 @@ Routing policy:
 - everything else (<init>, <tick>, <resize>, user msgs) → cascade!"
   (cond
    ((eq? msg 'quit) (stop-engine! eng) #t)
+   ((eq? msg 'force-render) #t)
    ((resize-flushed? msg)
     (handle-resize! eng (cdr msg)) #t)
    ((resize? msg)

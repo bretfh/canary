@@ -16,6 +16,7 @@
             cells-row
             cells-w
             cells-h
+            cells-src-w
             cells-chars
             cells-faces
 
@@ -83,14 +84,27 @@
 ;; region (e.g. a roguelike map viewport) and would otherwise pay
 ;; for one text-cmd allocation per cell.
 (define-record-type <cells-cmd>
-  (make-cells col row w h chars faces)
+  (%make-cells col row w h src-w chars faces)
   cells-cmd?
   (col   cells-col)
   (row   cells-row)
   (w     cells-w)
   (h     cells-h)
+  ;; Source buffer's row stride.  Distinct from W: W is the
+  ;; (clamped) blit rect's width; SRC-W is how wide each row of CHARS
+  ;; / FACES actually is.  Without this, blitting a cells-node whose
+  ;; intrinsic size exceeds the destination rect (PTY emulators
+  ;; whose term-width hasn't caught up to a shrunk window) would read
+  ;; rows at the wrong offsets and produce diagonal-shear garbage.
+  (src-w cells-src-w)
   (chars cells-chars)
   (faces cells-faces))
+
+(define* (make-cells col row w h chars faces #:optional (src-w #f))
+  "Construct a cells-cmd.  SRC-W defaults to W (i.e. the source
+buffer is exactly the size of the rect being drawn); pass the
+source buffer's actual row stride when it differs."
+  (%make-cells col row w h (or src-w w) chars faces))
 
 (define-record-type <fill-cmd>
   (make-fill col row w h face)

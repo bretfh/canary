@@ -20,7 +20,7 @@
 ;;; gcell-shipped feature.
 
 (use-modules (gcell)
-             ((gcell engine) #:select (start-engine! send))
+             ((gcell engine) #:select (start-engine! send force-render!))
              ((gcell engine-types) #:select (engine))
              ((gcell backend-webui) #:select (webui-backend))
              ((gcell view) #:select (make-cells-node))
@@ -207,12 +207,30 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
   (term    #:init-keyword #:term #:getter pty-term)
   (fd      #:init-keyword #:fd   #:getter pty-fd)
   (pid     #:init-keyword #:pid  #:getter pty-pid)
-  (engine  #:init-value #f       #:accessor pty-engine))
+  (engine  #:init-value #f       #:accessor pty-engine)
+  ;; Debounced TIOCSWINSZ.  Browser drags fire a resize msg every few
+  ;; ms; SIGWINCHing bash on each one reflows mid-line and produces
+  ;; prompt-spam scrollback.  These slots buffer the latest requested
+  ;; grid; the pump thread pushes it to the PTY once the burst has been
+  ;; quiet long enough that the user has actually let go of the edge.
+  (pending-cols   #:init-value #f #:accessor pty-pending-cols)
+  (pending-rows   #:init-value #f #:accessor pty-pending-rows)
+  (last-resize    #:init-value 0  #:accessor pty-last-resize)
+  (winsize-mutex  #:init-form (make-mutex) #:getter pty-winsize-mutex))
+
+(define %resize-debounce-its
+  ;; 200ms in this Guile's internal time units.  Long enough to swallow
+  ;; a continuous drag, short enough that bash sees the new size before
+  ;; the user starts typing into the resized window.
+  (quotient (* internal-time-units-per-second 200) 1000))
 
 (define-method (view (e <pty-emulator>))
   (let ((t (pty-term e)))
-    (make-cells-node (term-chars t) (term-faces t)
-                     (term-width t) (term-height t))))
+    (overlay
+     (make-cells-node (term-chars t) (term-faces t)
+                      (term-width t) (term-height t))
+     (pin (term-cursor-x t) (term-cursor-y t)
+          (place-cursor 0 0 #:style 'block)))))
 
 (define-method (update (e <pty-emulator>) (msg <key>))
   (let ((bv (key->bytes (key-sym msg) (key-mods msg))))
@@ -227,8 +245,41 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
   (let ((w (resize-width msg))
         (h (resize-height msg)))
     (term-resize! (pty-term e) w h)
-    (push-winsize! (pty-fd e) h w)
+    (with-mutex (pty-winsize-mutex e)
+      (set! (pty-pending-cols e) w)
+      (set! (pty-pending-rows e) h)
+      (set! (pty-last-resize e) (get-internal-real-time)))
     (cons e #f)))
+
+(define (spawn-winsize-pump! e)
+  "Flush the debounced TIOCSWINSZ once the incoming resize stream has
+been quiet for %resize-debounce-its.  Polls every 50ms; cheap, and
+survives transient errors so a single failed ioctl can't kill it."
+  (call-with-new-thread
+   (lambda ()
+     (let loop ()
+       (catch #t
+         (lambda ()
+           (usleep 50000)
+           (let ((cols #f) (rows #f))
+             (with-mutex (pty-winsize-mutex e)
+               (let ((c (pty-pending-cols e))
+                     (r (pty-pending-rows e))
+                     (last (pty-last-resize e)))
+                 (when (and c r (positive? last)
+                            (> (- (get-internal-real-time) last)
+                               %resize-debounce-its))
+                   (set! cols c)
+                   (set! rows r)
+                   (set! (pty-pending-cols e) #f)
+                   (set! (pty-pending-rows e) #f)
+                   (set! (pty-last-resize e) 0))))
+             (when (and cols rows)
+               (push-winsize! (pty-fd e) rows cols))))
+         (lambda args
+           (format (current-error-port)
+                   "winsize-pump error: ~s~%" args)))
+       (loop)))))
 
 
 ;;;
@@ -244,10 +295,10 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
   (bytes #:init-keyword #:bytes #:getter pty-data-bytes))
 
 (define-method (update (e <pty-emulator>) (msg <pty-data>))
-  ;; The reader thread already term-write!'d the bytes; this msg
-  ;; exists purely to wake the event loop and force a re-render by
-  ;; returning a non-eq? widget.
-  (cons (update-slots e) #f))
+  ;; Reader thread already term-write!'d the bytes AND already kicked
+  ;; the engine via force-render!.  This method exists only to satisfy
+  ;; widget-handles? so the cascade doesn't no-op the msg.
+  (cons e #f))
 
 (define (spawn-reader! e eng)
   (call-with-new-thread
@@ -273,7 +324,10 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
                    ;; print the raw escape bytes as literal chars.
                    (term-process-output! t (utf8->string chunk)))
                  (lambda _ #f)))
-             (send eng (make <pty-data> #:bytes #f))
+             ;; Drive the engine from the eng we were handed, not via
+             ;; pty-engine on the widget -- removes the possibility of
+             ;; the slot being #f at the moment the first chunk lands.
+             (force-render! eng)
              (loop)))))))))
 
 
@@ -318,6 +372,7 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
                          #:msg-bell    (bell-pipe)
                          #:stop-ch     (bell-pipe))))
     (set! (pty-engine widget) eng)
+    (spawn-winsize-pump! widget)
     (run-fibers
      (lambda ()
        (spawn-reader! widget eng)

@@ -161,19 +161,21 @@
 (define-method (backend-size (b <webui-backend>))
   (webui-backend-size-slot b))
 
-(define-method (backend-handle-resize! (b <webui-backend>) w h)
+(define (apply-resize! b w h)
+  "Atomic resize on B: bring the size slot, the cur-term, and the
+delta cache into agreement at WxH.  Caller is responsible for
+ordering this before any subsequent BACKEND-DRAW so the frame goes
+out at the new dims.  The three writes are not protected by a
+mutex; callers are in the engine event-loop fiber and the only
+foreign-thread writers are webui callbacks which only enqueue
+msgs.  Single owner of these three slots."
   (set! (webui-backend-size-slot b) (size w h))
-  ;; Grid dimensions just changed: any cached cell block has the wrong
-  ;; shape, so the next frame must be full.
   (set! (webui-backend-cells-cache b) #f)
   (let ((term (webui-backend-cur-term b)))
-    (when term (t:term-resize! term w h)))
-  (let ((eng (webui-backend-engine b)))
-    (when eng
-      (false-if-exception
-       ((module-ref (resolve-module '(gcell engine)) 'engine-log!)
-        eng 'webui 'info
-        (format #f "resize accepted: grid=~ax~a" w h))))))
+    (when term (t:term-resize! term w h))))
+
+(define-method (backend-handle-resize! (b <webui-backend>) w h)
+  (apply-resize! b w h))
 
 (define-method (backend-mark-dirty! (b <webui-backend>))
   ;; Drop the diff baseline so the next encode-frame emits a full frame
@@ -313,30 +315,27 @@
 
 
 ;;;
-;;; Firefox profile prefs (Wayland font-scale lock).
+;;; Firefox profile prefs.
 ;;;
-;;; webui's _webui_browser_create_new_profile (webui.c:6010-6219) creates
-;;; a Firefox profile under $HOME/.WebUI/WebUIFirefoxProfile-NoHC and writes
-;;; a prefs.js with `browser.tabs.inTitlebar=0`, plus a userChrome.css that
-;;; collapses every toolbar.  On Wayland (sway, etc.) that combination
-;;; makes Firefox decide whether to draw its own CSD titlebar based on
-;;; window dimensions; the titlebar shows/hides as the window is resized,
-;;; which silently shifts inner viewport height while devicePixelRatio
-;;; stays at 1.  Combined with Firefox's default
-;;; `layout.css.devPixelsPerPx=-1.0` ("auto") and Wayland fractional
-;;; scaling, the rendered glyph size drifts at certain window dims while
-;;; JS still reads dpr=1 and CSS px stays constant.  That's the
-;;; "font is literal pixels tall at certain window sizes" report.
+;;; webui's _webui_browser_create_new_profile (webui.c:6010-6219) writes
+;;; its own prefs.js into $HOME/.WebUI/WebUIFirefoxProfile-NoHC the first
+;;; time the profile is created -- including `browser.tabs.inTitlebar=0`,
+;;; which on sway hides the titlebar and causes the inner viewport
+;;; height to oscillate as the window is moved between tiles.
 ;;;
-;;; The fix is to pre-create the profile ourselves with prefs that lock
-;;; both: `layout.css.devPixelsPerPx=1.0` pins 1 CSS px = 1 device px, and
-;;; `browser.tabs.inTitlebar=1` keeps the system titlebar so the inner
-;;; viewport stops jumping.  We also disable Wayland fractional scale
-;;; support entirely to remove the underlying drift source.
+;;; We pre-create the profile ourselves with our own prefs to skip
+;;; webui's create-profile branch.  Both the profile folder AND a
+;;; profiles.ini entry exist after we run, so webui.c:6147 short-
+;;; circuits and our prefs.js stays untouched.
 ;;;
-;;; Since both the profile folder AND a profiles.ini entry exist after we
-;;; create them, webui's create-profile branch (webui.c:6147) short-
-;;; circuits and our prefs survive every subsequent webui_show.
+;;; We deliberately do NOT pin `layout.css.devPixelsPerPx` or
+;;; `widget.wayland.fractional-scale.enabled`.  Letting Firefox
+;;; negotiate the real compositor scale gives the browser a buffer at
+;;; the same scale as the output, so cells render at constant
+;;; physical-pixel size regardless of which sway tile the window is in.
+;;; Forcing 1x defeats Firefox's scale negotiation and lets sway
+;;; linearly rescale the buffer to fit the tile, which makes cells
+;;; visibly grow and shrink with window size.
 
 (define %gcell-firefox-profile-name "WebUIFirefoxProfile-NoHC")
 
@@ -384,21 +383,30 @@ decide whether the profile already exists (webui.c:6103-6108)."
     (close-port p)))
 
 (define %gcell-firefox-prefs
-  ;; Pin the CSS-to-device pixel ratio (kills Wayland fractional drift).
-  ;; Force the system titlebar so the inner viewport stops oscillating.
-  ;; Disable Wayland fractional scale negotiation entirely; we want
-  ;; integer-only DPR for predictable rendering.
-  ;; Keep the webui defaults we still want: legacy stylesheets enabled
-  ;; (so userChrome.css loads), skip default-browser nag, don't warn on
-  ;; close.  Last-write-wins inside prefs.js, so listing inTitlebar=1
-  ;; after webui would have written =0 makes ours stick.
+  ;; Force the system titlebar so the inner viewport stops oscillating
+  ;; when sway shows/hides CSD.  Keep the webui defaults we still want:
+  ;; legacy stylesheets enabled (so userChrome.css loads), skip default-
+  ;; browser nag, don't warn on close.  Last-write-wins inside prefs.js,
+  ;; so listing inTitlebar=1 after webui would have written =0 makes
+  ;; ours stick.
+  ;;
+  ;; widget.wayland.fractional-scale.enabled=true tells Firefox to
+  ;; negotiate the wp_fractional_scale_v1 protocol with sway, so
+  ;; Firefox renders its buffer at the EXACT per-window scale the
+  ;; compositor wants instead of rendering at 1x and letting sway
+  ;; linearly rescale the buffer to fit the on-screen tile.  Without
+  ;; this, every browser drag goes through a transient where sway
+  ;; bilinearly stretches a stale 1x buffer to the new tile dims and
+  ;; the canvas cells visibly grow or shrink even though the JS-side
+  ;; backing/style numbers all agree.  The default in modern Firefox
+  ;; is already true, but we set it explicitly so our profile is not
+  ;; subject to per-version drift.
   (string-append
    "user_pref(\"toolkit.legacyUserProfileCustomizations.stylesheets\", true);\n"
    "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n"
    "user_pref(\"browser.tabs.warnOnClose\", false);\n"
    "user_pref(\"browser.tabs.inTitlebar\", 1);\n"
-   "user_pref(\"layout.css.devPixelsPerPx\", \"1.0\");\n"
-   "user_pref(\"widget.wayland.fractional-scale.enabled\", false);\n"))
+   "user_pref(\"widget.wayland.fractional-scale.enabled\", true);\n"))
 
 (define %gcell-firefox-user-chrome
   ;; Same chrome-collapse rules webui ships at webui.c:6210-6215.  We
@@ -478,9 +486,17 @@ without the user having to delete the profile dir."
     ;; on requests without the auth cookie, which makes the demo
     ;; fragile against curl-based probes; disable it for the dev demo.
     (webui-set-config +webui-config-use-cookies+ #f)
-    (let ((px-w (max 320 (* (size-width  sz) %css-cell-w)))
-          (px-h (max 240 (* (size-height sz) %css-cell-h))))
-      (webui-set-size w px-w px-h))
+    ;; No webui-set-size: the browser-side recompute reports the live
+    ;; window dims on connection, which drives apply-resize! through
+    ;; the engine.  Pre-seeding a server-picked window size only causes
+    ;; a brief two-step transient where the WM places the window,
+    ;; libwebui resizes it, the browser fires resize, then we resize
+    ;; again on the JSON event.  Skip the dance.
+    ;; Chromium-class browsers need GPU process init for WebGL2 (the
+    ;; cell renderer aborts at `getContext('webgl2')` otherwise);
+    ;; webui's stock flag set suppresses it on fresh profiles.  No-op
+    ;; for Firefox.
+    (webui-set-chromium-defaults w)
     ;; Pre-seed the Firefox profile with locked prefs BEFORE webui-show.
     ;; Once both the profile dir and the profiles.ini entry exist, webui
     ;; skips its own profile-creation branch (webui.c:6147) and our
@@ -678,13 +694,21 @@ its render-frame just before invoking backend-draw."
          (t0   (%mono-ns))
          (placements (collect-image-placements b cmds))
          (clicks     (engine-click-rects b)))
-    ;; Defence in depth: a corrupted frame on the wire (cells encoded
-    ;; against the wrong grid dims) is exactly what would freeze the
-    ;; client.  If `term` and the backend's size slot disagree, skip
-    ;; the send and let the next render catch up after the next
-    ;; backend-handle-resize! call.
-    (when (and (= (t:term-width  term) (size-width  sz))
-               (= (t:term-height term) (size-height sz)))
+    ;; Invariant: apply-resize! brings term and size-slot into agreement
+    ;; before any backend-draw can run on them.  If they disagree here,
+    ;; that's a real bug somewhere -- log it loudly and continue with
+    ;; `term' as the truth (the frame header reads its dims, so the
+    ;; client will adapt to whatever we send).
+    (unless (and (= (t:term-width  term) (size-width  sz))
+                 (= (t:term-height term) (size-height sz)))
+      (let ((eng (webui-backend-engine b)))
+        (when eng
+          (false-if-exception
+           ((module-ref (resolve-module '(gcell engine)) 'engine-log!)
+            eng 'webui 'error
+            (format #f "dim mismatch: term=~ax~a slot=~ax~a"
+                    (t:term-width term) (t:term-height term)
+                    (size-width sz)     (size-height sz)))))))
     (render-cmds-to-term! term cmds th)
     (let* ((t1    (%mono-ns))
            (frame (encode-frame b term placements clicks))
@@ -705,7 +729,7 @@ its render-frame just before invoking backend-draw."
           (set! (wb-send-ns-max b) send-ns))
         (set! (wb-draw-ns       b) (+ draw-ns (wb-draw-ns b)))
         (when (> draw-ns (wb-draw-ns-max b))
-          (set! (wb-draw-ns-max b) draw-ns)))))))
+          (set! (wb-draw-ns-max b) draw-ns))))))
 
 ;; Frame layout v2 (header = 16 bytes, cells unchanged):
 ;;
@@ -1089,12 +1113,12 @@ already fired before the WebSocket came up."
       (set! (webui-backend-cells-cache b) #f)
       (hash-clear! (webui-backend-image-ids b))
       (set! (webui-backend-next-image-id b) 1)
-      (when eng
-        (let ((sz (webui-backend-size-slot b)))
-          (send-to-engine
-           eng
-           ((module-ref (resolve-module '(gcell protocol)) 'resize)
-            (size-width sz) (size-height sz))))))
+      ;; Push a fresh frame now that the WS is up.  Anything backend-draw
+      ;; wrote into the void before the handshake is gone; the client
+      ;; needs the current term state to paint.  send-to-engine 'force-
+      ;; render asks the event-loop to run render-frame on the next
+      ;; cycle without going through the resize-debounce 10 ms delay.
+      (when eng (send-to-engine eng 'force-render)))
      (else #f))))
 
 (define (dispatch-browser-event! b event)
@@ -1132,6 +1156,13 @@ bind, tagged type=\"log\", and gets surfaced via ENGINE-LOG!."
          ((not tag) (set! (wb-parse-errors b) (+ 1 (wb-parse-errors b))))
          ((string=? tag "log")
           (forward-log! eng json))
+         ((string=? tag "ready")
+          ;; Client finished loading: GL programs built, canvas sized,
+          ;; gcellFrame wired up to applyFrame.  Any frame we sent
+          ;; before this point may have raced the WS handshake / module
+          ;; load.  Push a fresh one now from the live term state.
+          (set! (webui-backend-cells-cache b) #f)
+          (send-to-engine eng 'force-render))
          (else
           (let ((msg (json->protocol-msg b json)))
             (cond
@@ -1438,6 +1469,17 @@ Ctrl-Shift-R needed."
    "canvas{display:block;background:#000;}"
    "</style>"
    "<script src=\"webui.js\"></script>"
+   ;; Stub queue installed before the deferred module loads.  webui's
+   ;; bridge dispatches incoming raw_send straight to window[name], and
+   ;; type=\"module\" defers gcell.js execution by enough that a frame
+   ;; can arrive during the WS handshake and find gcellFrame undefined.
+   ;; Stash bytes here; the module's applyFrame definition will replay.
+   "<script>"
+   "window.__gcellFrameQueue=[];"
+   "window.gcellFrame=function(b){window.__gcellFrameQueue.push(b);};"
+   "window.__gcellImageQueue=[];"
+   "window.gcellImage=function(b){window.__gcellImageQueue.push(b);};"
+   "</script>"
    "</head><body>"
    "<canvas id=\"cv\"></canvas>"
    "<script type=\"module\">"

@@ -1,62 +1,38 @@
 // gcell WebGL2 client.
 //
-// Mounts a fullscreen canvas, builds a font atlas in a hidden 2D
-// canvas, uploads it as a texture, and renders the server-pushed cell
-// grid as a single instanced draw call per frame.  Input events are
-// shipped back through webui.call('input', json).
+// One state object, one resize path, one paint function.  Cell pixel
+// size is a constant; cell count is a function of the window.  The
+// server is told the count whenever the window changes; the server
+// adapts.  No defensive re-syncs, no animation-frame polling for
+// drift, no identity hacks -- everything routes through the same
+// recompute -> applyCanvas -> tellServer -> paint sequence regardless
+// of which event source fired (window.resize, visualViewport,
+// matchMedia DPR cross, ResizeObserver).
 //
-// The server pushes binary frames via webui_send_raw, which webui's
-// bridge delivers as a call to window.gcellFrame with a Uint8Array.
-
-const MAGIC = 0x4C454347; // "GCEL" little-endian.
-const HEADER_SIZE = 16;
-const CELL_SIZE   = 13;
-
 // Frame layout (matches encode-frame in gcell/backend-webui.scm):
-//   u32 magic 0..3
-//   u8  version 4   (v4 adds delta frames)
-//   u8  frame_type 5  (0=full grid, 1=delta from previous frame)
+//   u32 magic 0..3       0x4C454347 "GCEL" little-endian
+//   u8  version 4        v5 carries click overlay; v4 added delta
+//   u8  frame_type 5     0=full grid, 1=delta-from-previous
 //   u16 width 6..7
 //   u16 height 8..9
 //   u16 cursor_col 10..11
 //   u16 cursor_row 12..13
-//   u8  cursor_style (0=hidden, 1=block, 2=underline, 3=bar) 14
-//   u8  cursor_attrs (bit 0 blink) 15
-//
-// Cell section depends on frame_type:
-//   full:  width*height * 13 bytes (u32 cp, u32 fg, u32 bg, u8 attrs)
-//   delta: u32 count + count entries of (u32 cell_index, 13 bytes)
-//
-// Hyperlink overlay (v2+) and image-placement overlay (v3+) follow.
+//   u8  cursor_style 14  (0 hidden, 1 block, 2 underline, 3 bar)
+//   u8  cursor_attrs 15  (bit 0 blink)
+//   ... cells (full or delta) ...
+//   ... hyperlink overlay (v2+) ...
+//   ... image-placement overlay (v3+) ...
+//   ... click-region overlay (v5+) ...
 
-// One coordinate system everywhere: CSS pixels.  Canvas backing
-// equals canvas display equals window inner size.  No DPR
-// multiplication anywhere -- DPR drifts between window states on
-// some compositors and any place that touched it would silently
-// rescale.  The atlas is rasterised at a 2x oversampling so glyphs
-// have enough source resolution; LINEAR atlas filter downsamples
-// to the shader's CSS-pixel cell size with no aliasing.
-// Cell + font sizing — interpreted as DEVICE pixels, not CSS pixels.
-// CSS-pixel sizing was the previous approach and it broke on Wayland
-// Firefox at certain window dims: the browser fractionally scales
-// CSS->device behind our back, and a glyph rasterised at "16 CSS px"
-// ends up rendered at a varying number of physical pixels depending
-// on the inner-viewport size. Anchoring to device pixels makes the
-// chosen font px equal to that many actual pixels on screen, full
-// stop, regardless of compositor scaling, fractional DPR, or which
-// window dimension Firefox decides to redraw chrome at.
-//
-// URL overrides: ?cell-w=N&cell-h=M&font=K (all device px).
+const MAGIC       = 0x4C454347;
+const HEADER_SIZE = 16;
+const CELL_SIZE   = 13;
+
 const __qs = new URLSearchParams(window.location.search);
+const DEBUG       = __qs.get('debug') === '1';
 const CELL_W_DEV  = parseInt(__qs.get('cell-w'), 10) || 10;
 const CELL_H_DEV  = parseInt(__qs.get('cell-h'), 10) || 20;
 const FONT_PX_DEV = parseInt(__qs.get('font'),   10) || 16;
-// Legacy names retained because the shader / atlas pipeline references
-// them by these identifiers. Read as "this many device px per cell /
-// per glyph", oversampled 2x for atlas rasterisation quality.
-const CSS_CELL_W = CELL_W_DEV;
-const CSS_CELL_H = CELL_H_DEV;
-const FONT_CSS_PX = FONT_PX_DEV;
 const ATLAS_OVERSAMPLE = 2;
 const CELL_W  = CELL_W_DEV  * ATLAS_OVERSAMPLE;
 const CELL_H  = CELL_H_DEV  * ATLAS_OVERSAMPLE;
@@ -65,24 +41,56 @@ const ATLAS_COLS = 16;
 const ATLAS_ROWS = 16;
 
 const canvas = document.getElementById('cv');
-// Make the canvas focusable so click + keyboard events route here
-// reliably; without tabindex the canvas can't take focus, and on
-// some browsers that drops keydown events for non-textual keys when
-// the page is loaded inside a popup-style window like webui's.
+// tabindex so the canvas can take focus and receive keydowns reliably
+// across browsers and webui's app-mode window flavours.
 canvas.setAttribute('tabindex', '0');
 canvas.style.outline = 'none';
 const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
 if (!gl) throw new Error('webgl2 required');
 
-// ---- Atlas: three font weights (regular / bold / italic) rasterised
-// into separate hidden 2D canvases, uploaded together as a WebGL 2
-// sampler2DArray texture.  The shader picks a layer per cell based on
-// the bold/italic attr bits.
+// ---- State ---------------------------------------------------------
+//
+// Everything mutable lives here.  recompute() reads window dims and
+// fills the derived fields.  applyCanvas() writes them to canvas.
+// paint() reads them and draws.  No other code touches these.
+
+const state = {
+  // input from browser
+  cssW: 0, cssH: 0, dpr: 1,
+
+  // derived: invariants 2 + 3
+  backingW: 0, backingH: 0,
+  cols: 0, rows: 0,
+
+  // server-pushed cells (one record per cell, FLOATS_PER_CELL each)
+  cellsArray: new Float32Array(0),
+  cellCount:  0,
+
+  // server-side authoritative grid (echoed back in frame headers).
+  // serverCols/Rows == 0 means we haven't been told yet; serverGen
+  // bumps every time we ship a 'resize' so we can detect echoes.
+  serverCols: 0, serverRows: 0,
+
+  cursorCol:   0,
+  cursorRow:   0,
+  cursorStyle: 1,
+  cursorBlink: false,
+
+  // overlays: rebuilt from each frame
+  hyperlinks:   new Map(),    // (row<<16|col) -> url
+  clickRects:   [],           // [{col,row,w,h}]
+  imagesPlaced: [],           // [{id,col,row,w,h,sx,sy,sw,sh}]
+};
+
+const FLOATS_PER_CELL = 12;
+const cellStride = FLOATS_PER_CELL * 4;
+
+// ---- Atlas: three font weights rasterised into 2D canvases, uploaded
+// as a sampler2DArray.  Identity layout: codepoint -> slot (shared
+// across layers), shader picks layer per cell from attr bits.
 
 const ATLAS_LAYERS = 3;
-const LAYER_REGULAR = 0;
-const LAYER_BOLD    = 1;
-const LAYER_ITALIC  = 2;
+const LAYER_REGULAR = 0, LAYER_BOLD = 1, LAYER_ITALIC = 2;
 const LAYER_FONTS = ['', 'bold ', 'italic '];
 
 const atlasCanvases = [];
@@ -97,13 +105,10 @@ for (let i = 0; i < ATLAS_LAYERS; i++) {
   atlasCtxs.push(ctx);
 }
 
-const atlasMap = new Map(); // codepoint -> slot (shared across layers)
+const atlasMap = new Map();
 let nextSlot = 0;
 let atlasDirty = true;
 
-// Family with deliberate, broad coverage of box-drawing / block
-// characters.  "ui-monospace" picks the system's terminal-grade font
-// on Mac+modern Linux; the fallbacks cover X11 minimal envs.
 const ATLAS_FONT_FAMILY =
   'ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace';
 
@@ -116,10 +121,9 @@ function rasteriseGlyph(cp, slot) {
     actx.save();
     actx.fillStyle = '#000';
     actx.fillRect(x, y, CELL_W, CELL_H);
-    // Clip strictly to the cell so AA bleed from this glyph cannot
-    // touch neighbouring slots in the atlas -- NEAREST sampling would
-    // otherwise show those stray pixels as "random dots" under and
-    // around tall/wide glyphs (r, t, j, comma, etc.).
+    // Clip per cell so AA bleed from this glyph can't touch neighbour
+    // slots in the atlas; otherwise NEAREST sampling would show stray
+    // pixels around tall/wide glyphs (r, t, j, comma, ...).
     actx.beginPath();
     actx.rect(x, y, CELL_W, CELL_H);
     actx.clip();
@@ -136,7 +140,7 @@ function atlasIndexFor(cp) {
   const safe = cp || 32;
   let slot = atlasMap.get(safe);
   if (slot !== undefined) return slot;
-  if (nextSlot >= ATLAS_COLS * ATLAS_ROWS) return atlasMap.get(63) || 0; // '?'
+  if (nextSlot >= ATLAS_COLS * ATLAS_ROWS) return atlasMap.get(63) || 0;
   slot = nextSlot++;
   atlasMap.set(safe, slot);
   rasteriseGlyph(safe, slot);
@@ -144,31 +148,21 @@ function atlasIndexFor(cp) {
   return slot;
 }
 
-// Pre-rasterise printable ASCII into every layer.
 for (let cp = 32; cp < 127; cp++) atlasIndexFor(cp);
 
-// Every GPU-side resource lives in a `let` so the context-restore
-// path can re-create them after a `webglcontextlost` event.  The
-// CPU-side atlas canvases survive the loss; only the texture has to
-// be rebuilt + re-uploaded.
 let atlasTex;
 function buildAtlasTexture() {
   atlasTex = gl.createTexture();
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D_ARRAY, atlasTex);
-  // LINEAR: atlas is oversampled (2x); shader's per-frame cell size
-  // is in device pixels via current DPR, which is usually < atlas
-  // resolution.  LINEAR downscale keeps glyphs crisp; NEAREST would
-  // alias when downscaling.
+  // LINEAR downscale: atlas is oversampled 2x, shader paints at
+  // device-pixel cell size which is usually < atlas resolution.
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  // Immutable storage so we don't keep allocating per upload.
   gl.texStorage3D(gl.TEXTURE_2D_ARRAY, 1, gl.RGBA8,
                   ATLAS_COLS * CELL_W, ATLAS_ROWS * CELL_H, ATLAS_LAYERS);
-  // Force the next syncAtlas to re-upload from the (still alive) 2D
-  // canvases.
   atlasDirty = true;
 }
 
@@ -184,12 +178,12 @@ function syncAtlas() {
   atlasDirty = false;
 }
 
-// ---- Cell shaders + program.
+// ---- Cell shader + program ----------------------------------------
 //
-// Vertex stage maps gl_InstanceID to grid (col, row).  Fragment stage
-// samples the atlas, mixes fg/bg by alpha, and applies the per-cell
-// attribute bits: inverse swaps fg/bg, faint dims fg, underline /
-// strikethrough draw a band in the cell's lower or middle strip.
+// Vertex stage maps (a_cell.x, a_cell.y) to grid (col, row).  Fragment
+// stage samples the atlas, mixes fg/bg by alpha, then applies attr
+// bits: inverse swaps fg/bg, faint dims fg, underline / strikethrough
+// draw a band in the cell's lower or middle strip.
 
 const VS = `#version 300 es
 in vec2 a_quad;
@@ -197,85 +191,63 @@ in vec2 a_cell;
 in float a_glyph;
 in vec4 a_fg;
 in vec4 a_bg;
-in float a_attrs;       // float because gl.vertexAttribPointer wants float types
+in float a_attrs;
 uniform vec2 u_cellSize;
 uniform vec2 u_viewport;
 uniform vec2 u_atlasCells;
 out vec2 v_uv;
-out vec2 v_cellUv;       // 0..1 within the cell, for underline/strikethrough bands
+out vec2 v_cellUv;
 out vec4 v_fg;
 out vec4 v_bg;
-flat out float v_attrs;
+flat out int  v_attrs;
 void main() {
   vec2 px = (a_cell + a_quad) * u_cellSize;
   vec2 ndc = (px / u_viewport) * 2.0 - 1.0;
   ndc.y = -ndc.y;
   gl_Position = vec4(ndc, 0.0, 1.0);
   float slot = a_glyph;
-  vec2 atlasIdx = vec2(mod(slot, u_atlasCells.x), floor(slot / u_atlasCells.x));
-  v_uv = (atlasIdx + a_quad) / u_atlasCells;
+  vec2 atlasCell = vec2(mod(slot, u_atlasCells.x),
+                        floor(slot / u_atlasCells.x));
+  v_uv = (atlasCell + a_quad) / u_atlasCells;
   v_cellUv = a_quad;
   v_fg = a_fg;
   v_bg = a_bg;
-  v_attrs = a_attrs;
+  v_attrs = int(a_attrs);
 }`;
 
 const FS = `#version 300 es
 precision mediump float;
-uniform mediump sampler2DArray u_atlas;
 in vec2 v_uv;
 in vec2 v_cellUv;
 in vec4 v_fg;
 in vec4 v_bg;
-flat in float v_attrs;
+flat in int  v_attrs;
+uniform mediump sampler2DArray u_atlas;
 out vec4 fragColor;
-
-bool hasAttr(float attrs, float bit) {
-  float v = floor(attrs / bit);
-  return mod(v, 2.0) >= 1.0;
-}
-
 void main() {
-  bool bold    = hasAttr(v_attrs, 1.0);
-  bool italic  = hasAttr(v_attrs, 2.0);
-  bool ulined  = hasAttr(v_attrs, 4.0);
-  bool inverse = hasAttr(v_attrs, 8.0);
-  bool struck  = hasAttr(v_attrs, 16.0);
-  bool faint   = hasAttr(v_attrs, 32.0);
-
-  // Atlas layer: 0 regular, 1 bold, 2 italic.  Bold wins over italic
-  // when both flags are set; we don't carry a bold-italic layer yet.
-  float layer = bold ? 1.0 : (italic ? 2.0 : 0.0);
-
+  int layer = 0;
+  if ((v_attrs & 2) != 0) layer = 1;
+  else if ((v_attrs & 4) != 0) layer = 2;
+  float a = texture(u_atlas, vec3(v_uv, float(layer))).r;
   vec4 fg = v_fg;
   vec4 bg = v_bg;
-  if (inverse) { vec4 t = fg; fg = bg; bg = t; }
-  if (faint)   { fg = vec4(fg.rgb * 0.6, fg.a); }
-
-  float a = texture(u_atlas, vec3(v_uv, layer)).r;
+  if ((v_attrs & 8)  != 0) { vec4 t = fg; fg = bg; bg = t; }
+  if ((v_attrs & 1)  != 0) fg.rgb *= 0.5;
   vec4 col = mix(bg, fg, a);
-
-  // Underline: lower ~12% of cell.
-  if (ulined && v_cellUv.y > 0.88) col = fg;
-  // Strikethrough: middle ~8% band.
-  if (struck && v_cellUv.y > 0.46 && v_cellUv.y < 0.54) col = fg;
-
+  if ((v_attrs & 16) != 0 && v_cellUv.y > 0.86) col = fg;
+  if ((v_attrs & 32) != 0 && v_cellUv.y > 0.46 && v_cellUv.y < 0.54) col = fg;
   fragColor = col;
 }`;
 
 function compile(type, src) {
-  const s = gl.createShader(type);
-  gl.shaderSource(s, src);
-  gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    throw new Error(gl.getShaderInfoLog(s) || 'shader compile failed');
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(sh) || 'shader compile failed');
   }
-  return s;
+  return sh;
 }
-
-// Per cell: 2 cell + 1 glyph + 4 fg + 4 bg + 1 attrs = 12 floats.
-const FLOATS_PER_CELL = 12;
-const cellStride = FLOATS_PER_CELL * 4;
 
 let program, uCellSize, uViewport, uAtlasCells, uAtlas;
 let aQuad, aCell, aGlyph, aFg, aBg, aAttrs;
@@ -287,20 +259,18 @@ function buildCellProgram() {
   gl.attachShader(program, compile(gl.FRAGMENT_SHADER, FS));
   gl.linkProgram(program);
   if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    throw new Error(gl.getProgramInfoLog(program) || 'program link failed');
+    throw new Error(gl.getProgramInfoLog(program) || 'cell link failed');
   }
-  gl.useProgram(program);
 
   uCellSize   = gl.getUniformLocation(program, 'u_cellSize');
   uViewport   = gl.getUniformLocation(program, 'u_viewport');
   uAtlasCells = gl.getUniformLocation(program, 'u_atlasCells');
   uAtlas      = gl.getUniformLocation(program, 'u_atlas');
 
-  gl.uniform2f(uCellSize,   CELL_W, CELL_H);
+  gl.useProgram(program);
   gl.uniform2f(uAtlasCells, ATLAS_COLS, ATLAS_ROWS);
   gl.uniform1i(uAtlas, 0);
 
-  // ---- Geometry: one quad, instanced per cell.
   quadBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
   gl.bufferData(gl.ARRAY_BUFFER,
@@ -341,10 +311,6 @@ function buildCellProgram() {
 }
 
 // ---- Cursor pass: one quad, no instancing, driven by uniforms.
-//
-// Shares the atlas-shader's uniform block (cellSize, viewport) but
-// uses its own program that paints a solid colour with a style mask
-// (block, underline, bar).  Drawn after the cells so it overlays.
 
 const cursorVS = `#version 300 es
 in vec2 a_quad;
@@ -362,8 +328,8 @@ void main() {
 
 const cursorFS = `#version 300 es
 precision mediump float;
-uniform int u_cursorStyle;     // 1 block, 2 underline, 3 bar
-uniform float u_cursorAlpha;   // 0..1; client animates for blink
+uniform int u_cursorStyle;
+uniform float u_cursorAlpha;
 uniform vec4 u_cursorColor;
 in vec2 v_q;
 out vec4 fragColor;
@@ -388,13 +354,13 @@ function buildCursorProgram() {
     throw new Error(gl.getProgramInfoLog(cursorProgram) || 'cursor link failed');
   }
 
-  cuCell      = gl.getUniformLocation(cursorProgram, 'u_cursorCell');
-  cuCellSize  = gl.getUniformLocation(cursorProgram, 'u_cellSize');
-  cuViewport  = gl.getUniformLocation(cursorProgram, 'u_viewport');
-  cuStyle     = gl.getUniformLocation(cursorProgram, 'u_cursorStyle');
-  cuAlpha     = gl.getUniformLocation(cursorProgram, 'u_cursorAlpha');
-  cuColor     = gl.getUniformLocation(cursorProgram, 'u_cursorColor');
-  cuQuadLoc   = gl.getAttribLocation(cursorProgram, 'a_quad');
+  cuCell     = gl.getUniformLocation(cursorProgram, 'u_cursorCell');
+  cuCellSize = gl.getUniformLocation(cursorProgram, 'u_cellSize');
+  cuViewport = gl.getUniformLocation(cursorProgram, 'u_viewport');
+  cuStyle    = gl.getUniformLocation(cursorProgram, 'u_cursorStyle');
+  cuAlpha    = gl.getUniformLocation(cursorProgram, 'u_cursorAlpha');
+  cuColor    = gl.getUniformLocation(cursorProgram, 'u_cursorColor');
+  cuQuadLoc  = gl.getAttribLocation(cursorProgram,  'a_quad');
 
   cursorVao = gl.createVertexArray();
   gl.bindVertexArray(cursorVao);
@@ -405,19 +371,130 @@ function buildCursorProgram() {
   gl.bindVertexArray(vao);
 }
 
-// ---- Frame application
+// ---- Image overlay --------------------------------------------------
+//
+// gcellImage receives PNG/JPEG bytes:  u32 image_id  u32 length  bytes.
+// createImageBitmap decodes off-thread; we upload as a 2D texture and
+// the image-program draws placements over the cell grid.
 
-let cellsArray = new Float32Array(0);
-let cellCount = 0;
-let gridW = 0;
-let gridH = 0;
-let cursorCol = 0;
-let cursorRow = 0;
-let cursorStyle = 1;
-let cursorBlink = false;
+const imageCache = new Map();   // id -> { tex, w, h }
+
+const imageVS = `#version 300 es
+in vec2 a_quad;
+uniform vec2 a_pos;
+uniform vec2 a_size;
+uniform vec4 a_uvRect;
+uniform vec2 u_cellSize;
+uniform vec2 u_viewport;
+out vec2 v_uv;
+void main() {
+  vec2 px = (a_pos + a_quad * a_size) * u_cellSize;
+  vec2 ndc = (px / u_viewport) * 2.0 - 1.0;
+  ndc.y = -ndc.y;
+  gl_Position = vec4(ndc, 0.0, 1.0);
+  v_uv = a_uvRect.xy + a_quad * a_uvRect.zw;
+}`;
+
+const imageFS = `#version 300 es
+precision mediump float;
+uniform sampler2D u_img;
+in vec2 v_uv;
+out vec4 fragColor;
+void main() { fragColor = texture(u_img, v_uv); }`;
+
+let imageProgram, iuPos, iuSize, iuUv, iuCellSize, iuViewport, iuImg, iaQuadLoc;
+let imageVao;
+
+function buildImageProgram() {
+  imageProgram = gl.createProgram();
+  gl.attachShader(imageProgram, compile(gl.VERTEX_SHADER,   imageVS));
+  gl.attachShader(imageProgram, compile(gl.FRAGMENT_SHADER, imageFS));
+  gl.linkProgram(imageProgram);
+  if (!gl.getProgramParameter(imageProgram, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(imageProgram) || 'image link failed');
+  }
+  iuPos      = gl.getUniformLocation(imageProgram, 'a_pos');
+  iuSize     = gl.getUniformLocation(imageProgram, 'a_size');
+  iuUv       = gl.getUniformLocation(imageProgram, 'a_uvRect');
+  iuCellSize = gl.getUniformLocation(imageProgram, 'u_cellSize');
+  iuViewport = gl.getUniformLocation(imageProgram, 'u_viewport');
+  iuImg      = gl.getUniformLocation(imageProgram, 'u_img');
+  iaQuadLoc  = gl.getAttribLocation(imageProgram,  'a_quad');
+
+  imageVao = gl.createVertexArray();
+  gl.bindVertexArray(imageVao);
+  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+  gl.enableVertexAttribArray(iaQuadLoc);
+  gl.vertexAttribPointer(iaQuadLoc, 2, gl.FLOAT, false, 0, 0);
+
+  gl.bindVertexArray(vao);
+}
+
+function uploadImageBitmap(id, bitmap) {
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+  imageCache.set(id, { tex, w: bitmap.width, h: bitmap.height });
+  paint();
+}
+
+function handleImage(buf) {
+  const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
+  if (u8.byteLength < 8) return;
+  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
+  const id = dv.getUint32(0, true);
+  const len = dv.getUint32(4, true);
+  if (u8.byteLength < 8 + len) return;
+  const blob = new Blob([u8.subarray(8, 8 + len)]);
+  createImageBitmap(blob)
+    .then(bitmap => uploadImageBitmap(id, bitmap))
+    .catch(err => shipLog('error', `image ${id} decode: ${err}`));
+}
+
+function drawImagePlacements() {
+  if (state.imagesPlaced.length === 0) return;
+  gl.useProgram(imageProgram);
+  gl.bindVertexArray(imageVao);
+  gl.uniform2f(iuCellSize, CELL_W_DEV, CELL_H_DEV);
+  gl.uniform2f(iuViewport, state.backingW, state.backingH);
+  gl.uniform1i(iuImg, 1);
+  gl.activeTexture(gl.TEXTURE1);
+  for (const p of state.imagesPlaced) {
+    const entry = imageCache.get(p.id);
+    if (!entry) continue;
+    gl.bindTexture(gl.TEXTURE_2D, entry.tex);
+    gl.uniform2f(iuPos,  p.col, p.row);
+    gl.uniform2f(iuSize, p.w,   p.h);
+    gl.uniform4f(iuUv,
+                 p.sx / entry.w, p.sy / entry.h,
+                 p.sw / entry.w, p.sh / entry.h);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  }
+  gl.bindVertexArray(vao);
+}
+
+function buildAllGl() {
+  buildAtlasTexture();
+  buildCellProgram();
+  buildCursorProgram();
+  buildImageProgram();
+  syncAtlas();
+  // GPU image textures are gone on context loss; cache entries point
+  // at dead handles.  Drop them so the next placement re-decodes.
+  imageCache.clear();
+  state.imagesPlaced = [];
+}
+
+// ---- Frame parsing --------------------------------------------------
 
 const DEFAULT_FG = [0.9, 0.9, 0.9, 1.0];
 const DEFAULT_BG = [0.0, 0.0, 0.0, 1.0];
+const utf8Decoder = new TextDecoder('utf-8');
 
 function unpackColor(packed, out, off, fallback) {
   if (packed === 0xFFFFFFFF) {
@@ -433,84 +510,41 @@ function unpackColor(packed, out, off, fallback) {
   }
 }
 
-// Per-frame (col,row) → URL hit-test map for OSC-8 hyperlinks.
-// Rebuilt from the trailing overlay section each frame; rare to be
-// large.
-const hyperlinks = new Map();
 function linkKey(col, row) { return (row << 16) | col; }
-
-// Per-frame list of clickable rectangles (from gcell's on-click /
-// on-hover wrappers).  Cells inside these rects get a pointer cursor
-// affordance so the user knows interactive surfaces at a glance.
-let clickRects = [];
-function pointInRect(x, y, r) {
-  return x >= r.col && x < r.col + r.w &&
-         y >= r.row && y < r.row + r.h;
-}
-function anyClickableAt(x, y) {
-  for (let i = 0; i < clickRects.length; i++) {
-    if (pointInRect(x, y, clickRects[i])) return true;
-  }
-  return false;
-}
-
-const utf8Decoder = new TextDecoder('utf-8');
 
 function writeCellSlot(idx, w, cp, fg, bg, attrs) {
   const col = idx % w;
   const row = (idx - col) / w;
   let p = idx * FLOATS_PER_CELL;
-  cellsArray[p++] = col;
-  cellsArray[p++] = row;
-  cellsArray[p++] = atlasIndexFor(cp);
-  unpackColor(fg, cellsArray, p, DEFAULT_FG); p += 4;
-  unpackColor(bg, cellsArray, p, DEFAULT_BG); p += 4;
-  cellsArray[p++] = attrs;
+  state.cellsArray[p++] = col;
+  state.cellsArray[p++] = row;
+  state.cellsArray[p++] = atlasIndexFor(cp);
+  unpackColor(fg, state.cellsArray, p, DEFAULT_FG); p += 4;
+  unpackColor(bg, state.cellsArray, p, DEFAULT_BG); p += 4;
+  state.cellsArray[p++] = attrs;
 }
 
 function applyFrame(buf) {
   if (gl.isContextLost()) return;
-  // Defence: a server frame can land before onResize has run (initial
-  // boot) or after window.innerWidth has drifted (Wayland fractional
-  // scaling settles a bit after page load). Re-snap before drawing
-  // so canvas dims always match the live window.
-  syncCanvasToWindow();
   const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
   const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
   if (dv.getUint32(0, true) !== MAGIC) return;
-  // version & frame_type.  v1 cells only; v2 hyperlinks overlay;
-  // v3 image-placement overlay; v4 byte 5 carries frame_type
-  // (0 full, 1 delta).
   const version   = dv.getUint8(4);
   const frameType = (version >= 4) ? dv.getUint8(5) : 0;
   const w = dv.getUint16(6, true);
   const h = dv.getUint16(8, true);
-  cursorCol   = dv.getUint16(10, true);
-  cursorRow   = dv.getUint16(12, true);
-  cursorStyle = dv.getUint8(14);
-  cursorBlink = (dv.getUint8(15) & 1) !== 0;
+  state.cursorCol   = dv.getUint16(10, true);
+  state.cursorRow   = dv.getUint16(12, true);
+  state.cursorStyle = dv.getUint8(14);
+  state.cursorBlink = (dv.getUint8(15) & 1) !== 0;
+
   const total = w * h;
-  if (w !== gridW || h !== gridH) {
-    if (gridW !== 0 || gridH !== 0) {
-      shipLog('info', `frame grid ${gridW}x${gridH} -> ${w}x${h} type=${frameType}`);
-    }
-    // Don't touch canvas backing/style from here -- syncCanvasToWindow
-    // owns it and runs on every onResize. If we resized backing to
-    // w * CSS_CELL_W here, a server frame at stale dims could land
-    // after the user shrank the window and stretch the backing far
-    // beyond the viewport while style stayed at the new (smaller)
-    // value, making the shader's cells render at sub-pixel scale.
-    // Keep the backing pinned to the window and let extra grid cells
-    // clip; the next server frame at the new dims will fix the count.
+  if (state.cellsArray.length !== total * FLOATS_PER_CELL) {
+    state.cellsArray = new Float32Array(total * FLOATS_PER_CELL);
   }
-  if (cellsArray.length !== total * FLOATS_PER_CELL) {
-    // Grid resized: any cells we had are stale and the delta we just
-    // received (if any) can't be applied to a fresh array.  The server
-    // clears its cache on resize so the next frame should be full --
-    // until then we paint what we can.
-    cellsArray = new Float32Array(total * FLOATS_PER_CELL);
-  }
-  gridW = w; gridH = h;
+  state.serverCols = w;
+  state.serverRows = h;
+
   let cellsEnd;
   if (frameType === 1) {
     const deltaCount = dv.getUint32(HEADER_SIZE, true);
@@ -536,35 +570,32 @@ function applyFrame(buf) {
     }
     cellsEnd = HEADER_SIZE + total * CELL_SIZE;
   }
-  cellCount = total;
+  state.cellCount = total;
 
-  // Hyperlink overlay (v2+).  Each entry: u16 col, u16 row, u16 len,
-  // <len> utf-8 bytes.  Clear the previous map so links that left the
-  // frame stop hit-testing.
-  hyperlinks.clear();
+  // Hyperlink overlay (v2+).
+  state.hyperlinks.clear();
   let overlayOff = cellsEnd;
   if (version >= 2 && u8.byteLength >= overlayOff + 2) {
     const linkCount = dv.getUint16(overlayOff, true);
     let off = overlayOff + 2;
     for (let i = 0; i < linkCount; i++) {
-      const col  = dv.getUint16(off, true);
-      const row  = dv.getUint16(off + 2, true);
-      const len  = dv.getUint16(off + 4, true);
-      const url  = utf8Decoder.decode(u8.subarray(off + 6, off + 6 + len));
-      hyperlinks.set(linkKey(col, row), url);
+      const col = dv.getUint16(off, true);
+      const row = dv.getUint16(off + 2, true);
+      const len = dv.getUint16(off + 4, true);
+      const url = utf8Decoder.decode(u8.subarray(off + 6, off + 6 + len));
+      state.hyperlinks.set(linkKey(col, row), url);
       off += 6 + len;
     }
     overlayOff = off;
   }
 
-  // Image-placement overlay (v3+).  Entry: u32 id, u16 col, u16 row,
-  // u16 w, u16 h, u16 sx, u16 sy, u16 sw, u16 sh.  20 bytes each.
-  imagesPlaced = [];
+  // Image-placement overlay (v3+).
+  state.imagesPlaced = [];
   if (version >= 3 && u8.byteLength >= overlayOff + 2) {
     const imgCount = dv.getUint16(overlayOff, true);
     let off = overlayOff + 2;
     for (let i = 0; i < imgCount; i++) {
-      imagesPlaced.push({
+      state.imagesPlaced.push({
         id:  dv.getUint32(off,       true),
         col: dv.getUint16(off +  4,  true),
         row: dv.getUint16(off +  6,  true),
@@ -580,15 +611,13 @@ function applyFrame(buf) {
     overlayOff = off;
   }
 
-  // Click-region overlay (v5+).  Entry: u16 col, u16 row, u16 w, u16 h.
-  // Stored as rectangles; we keep them as a flat list and hit-test on
-  // mousemove for the cursor=pointer affordance.
-  clickRects = [];
+  // Click-region overlay (v5+).
+  state.clickRects = [];
   if (version >= 5 && u8.byteLength >= overlayOff + 2) {
     const n = dv.getUint16(overlayOff, true);
     let off = overlayOff + 2;
     for (let i = 0; i < n; i++) {
-      clickRects.push({
+      state.clickRects.push({
         col: dv.getUint16(off,     true),
         row: dv.getUint16(off + 2, true),
         w:   dv.getUint16(off + 4, true),
@@ -600,108 +629,174 @@ function applyFrame(buf) {
 
   if (atlasDirty) syncAtlas();
   gl.bindBuffer(gl.ARRAY_BUFFER, cellsBuf);
-  gl.bufferData(gl.ARRAY_BUFFER, cellsArray, gl.STREAM_DRAW);
-  draw();
+  gl.bufferData(gl.ARRAY_BUFFER, state.cellsArray, gl.STREAM_DRAW);
+  paint();
+}
+
+// gcellFrame/gcellImage are wired up at boot below, after buildAllGl
+// has created the GL resources that applyFrame writes into.  The HTML
+// installs queueing stubs that capture any frames arriving during the
+// WS handshake; boot replays the queue once the GL state is alive.
+
+// ---- The four single-source-of-truth functions --------------------
+
+function recompute() {
+  const cssW = Math.max(1, window.innerWidth);
+  const cssH = Math.max(1, window.innerHeight);
+  const dpr  = window.devicePixelRatio || 1;
+  const backingW = Math.max(1, Math.round(cssW * dpr));
+  const backingH = Math.max(1, Math.round(cssH * dpr));
+  const cols = Math.max(20, Math.floor(backingW / CELL_W_DEV));
+  const rows = Math.max(5,  Math.floor(backingH / CELL_H_DEV));
+  const changed = (state.cssW !== cssW || state.cssH !== cssH
+                || state.dpr !== dpr
+                || state.backingW !== backingW || state.backingH !== backingH
+                || state.cols !== cols || state.rows !== rows);
+  state.cssW = cssW;
+  state.cssH = cssH;
+  state.dpr  = dpr;
+  state.backingW = backingW;
+  state.backingH = backingH;
+  state.cols = cols;
+  state.rows = rows;
+  return changed;
+}
+
+function applyCanvas() {
+  // Unconditional writes.  Browsers no-op same-value assignments, but
+  // we don't gate on them -- guard branches are what hid the resize
+  // bug behind layers of "if it looks fine, don't fix it".  Note:
+  // setting canvas.width clears the backing; the next paint() repaints.
+  canvas.width  = state.backingW;
+  canvas.height = state.backingH;
+  canvas.style.width  = state.cssW + 'px';
+  canvas.style.height = state.cssH + 'px';
+}
+
+function tellServer() {
+  if (state.serverCols === state.cols && state.serverRows === state.rows) return;
+  send('resize', { width: state.cols, height: state.rows });
+}
+
+function paint() {
+  if (gl.isContextLost()) return;
+  gl.viewport(0, 0, state.backingW, state.backingH);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  if (state.cellCount > 0) {
+    gl.useProgram(program);
+    gl.bindVertexArray(vao);
+    gl.uniform2f(uViewport, state.backingW, state.backingH);
+    gl.uniform2f(uCellSize, CELL_W_DEV, CELL_H_DEV);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, state.cellCount);
+  }
+  drawImagePlacements();
+  if (state.cursorStyle !== 0) {
+    gl.useProgram(cursorProgram);
+    gl.bindVertexArray(cursorVao);
+    gl.uniform2f(cuCell, state.cursorCol, state.cursorRow);
+    gl.uniform2f(cuCellSize, CELL_W_DEV, CELL_H_DEV);
+    gl.uniform2f(cuViewport, state.backingW, state.backingH);
+    gl.uniform1i(cuStyle, state.cursorStyle);
+    gl.uniform1f(cuAlpha, cursorAlpha());
+    gl.uniform4f(cuColor, DEFAULT_FG[0], DEFAULT_FG[1], DEFAULT_FG[2], 1.0);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+    gl.bindVertexArray(vao);
+  }
+  if (DEBUG) paintHud();
 }
 
 function cursorAlpha() {
-  // Solid by default; clients with blink hint pulse via sin().
-  if (!cursorBlink) return 1.0;
+  if (!state.cursorBlink) return 1.0;
   const t = (performance.now() % 1000) / 1000;
   return 0.5 + 0.5 * Math.cos(t * 2 * Math.PI);
 }
 
-function draw() {
-  if (gl.isContextLost()) return;
-  // Cells are always CSS_CELL_W x CSS_CELL_H *CSS pixels* in size.
-  // Canvas backing equals the window in CSS pixels (no DPR).  Shader
-  // paints at the same CSS-pixel scale -- one source of truth.
-  gl.viewport(0, 0, canvas.width, canvas.height);
-  gl.uniform2f(uViewport, canvas.width, canvas.height);
-  gl.useProgram(program);
-  gl.uniform2f(uCellSize, CSS_CELL_W, CSS_CELL_H);
-  gl.clearColor(0, 0, 0, 1);
-  gl.clear(gl.COLOR_BUFFER_BIT);
-  if (cellCount > 0) {
-    gl.bindVertexArray(vao);
-    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, cellCount);
-  }
-  drawImagePlacements(CSS_CELL_W, CSS_CELL_H);
-  if (cursorStyle !== 0) {
-    gl.useProgram(cursorProgram);
-    gl.bindVertexArray(cursorVao);
-    gl.uniform2f(cuCellSize, CSS_CELL_W, CSS_CELL_H);
-    gl.uniform2f(cuViewport, canvas.width, canvas.height);
-    gl.uniform2f(cuCell, cursorCol, cursorRow);
-    gl.uniform1i(cuStyle, cursorStyle);
-    gl.uniform1f(cuAlpha, cursorAlpha());
-    gl.uniform4f(cuColor, 0.9, 0.9, 0.9, 0.5);
-    gl.enable(gl.BLEND);
-    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-    gl.disable(gl.BLEND);
-    gl.bindVertexArray(vao);
-  }
+// One handler for every event source.  Order is fixed: read the
+// window, write the canvas, tell the server (only when grid changed),
+// repaint.  Single shape, no branches per event source.
+
+function onWindow(reason) {
+  const changed = recompute();
+  if (!changed) return;
+  applyCanvas();
+  tellServer();
+  paint();
+  if (DEBUG) shipLog('info',
+    `resize[${reason}] inner=${state.cssW}x${state.cssH} dpr=${state.dpr}`
+    + ` backing=${state.backingW}x${state.backingH}`
+    + ` grid=${state.cols}x${state.rows}`);
 }
 
-// Keep the cursor blink animation going even when the server hasn't
-// pushed a new frame.  Cheap (single quad), harmless.
-//
-// Also: enforce canvas-tracks-window every animation frame. Firefox
-// on Wayland sometimes does not fire window.resize during a drag --
-// only at release, or fires it for the wrong values. If canvas
-// backing stays at the old size while canvas.style follows window
-// (or vice versa), the browser stretches the fixed-pixel backing
-// into the new viewport and cells visibly scale with the window.
-// That's the "font is literal pixels tall after drag, fixed only by
-// reload" symptom: backing stayed at e.g. 1200 while style shrank
-// to "600px", so each backing pixel rendered as half a CSS pixel.
-//
-// Fix: every animation frame, if window inner changed, re-sync
-// canvas backing + style to the live window AND repaint the cells
-// we already have. Cells are positioned in backing pixels by the
-// shader (a_cell * u_cellSize), so existing cells render at constant
-// 10x20 backing px = 10x20 CSS px regardless of window size --
-// what's off the new canvas just clips, and the next server frame
-// will fix the count. No flicker, no clear, no resize round-trip
-// needed for visual stability.
-let __lastSyncW = 0, __lastSyncH = 0, __lastSyncDpr = 0;
-function tickCursor() {
-  const iw = window.innerWidth, ih = window.innerHeight;
-  const dpr = window.devicePixelRatio || 1;
-  if (iw !== __lastSyncW || ih !== __lastSyncH || dpr !== __lastSyncDpr) {
-    __lastSyncW = iw;
-    __lastSyncH = ih;
-    __lastSyncDpr = dpr;
-    syncCanvasToWindow();
-    if (cellCount > 0) draw();
-    // Grid in DEVICE pixels (cells are device-px now).
-    const devW = Math.max(1, Math.round(iw * dpr));
-    const devH = Math.max(1, Math.round(ih * dpr));
-    const cols = Math.max(20, Math.floor(devW / CSS_CELL_W));
-    const rows = Math.max(5,  Math.floor(devH / CSS_CELL_H));
-    send('resize', { width: cols, height: rows });
-  }
-  if (cursorBlink && cursorStyle !== 0) draw();
-  requestAnimationFrame(tickCursor);
+window.addEventListener('resize', () => onWindow('window.resize'));
+window.addEventListener('orientationchange', () => onWindow('orientation'));
+document.addEventListener('fullscreenchange', () => onWindow('fullscreen'));
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', () => onWindow('vv.resize'));
+  window.visualViewport.addEventListener('scroll', () => onWindow('vv.scroll'));
 }
-requestAnimationFrame(tickCursor);
+if (typeof ResizeObserver !== 'undefined') {
+  new ResizeObserver(() => onWindow('ro')).observe(document.documentElement);
+}
+// matchMedia at DPR thresholds catches Wayland fractional-scale flips
+// that don't fire window.resize.
+for (const t of [1.0, 1.25, 1.5, 1.75, 2.0, 3.0]) {
+  try {
+    window.matchMedia(`(resolution: ${t}dppx)`)
+      .addEventListener('change', () => onWindow(`dpr=${t}`));
+  } catch (_) { /* old browsers */ }
+}
 
-// ---- Outbound shape.
+// Cursor blink: one rAF loop that only repaints the cursor pass.
+// State and grid are unchanged between blink frames, so we don't go
+// through onWindow -- just redraw with the current state.
+function blinkLoop() {
+  if (state.cursorBlink && state.cursorStyle !== 0) paint();
+  requestAnimationFrame(blinkLoop);
+}
+requestAnimationFrame(blinkLoop);
+
+// ---- Debug HUD ----------------------------------------------------
+//
+// Painted directly on the canvas via Canvas2D in a separate offscreen
+// layer that we composite as a textured quad would be overkill -- just
+// overlay a DOM div instead.  Cheap, always on top, doesn't fight the
+// WebGL state machine.
+
+let hudEl = null;
+if (DEBUG) {
+  hudEl = document.createElement('div');
+  hudEl.style.cssText =
+    'position:fixed;top:4px;left:4px;z-index:1000;'
+    + 'font:11px/1.3 ui-monospace,monospace;color:#0f0;background:rgba(0,0,0,0.7);'
+    + 'padding:4px 6px;border:1px solid #0f0;pointer-events:none;white-space:pre';
+  document.body.appendChild(hudEl);
+}
+function paintHud() {
+  if (!hudEl) return;
+  hudEl.textContent =
+      `inner    = ${state.cssW}x${state.cssH}\n`
+    + `dpr      = ${state.dpr}\n`
+    + `backing  = ${state.backingW}x${state.backingH}\n`
+    + `canvas   = ${canvas.width}x${canvas.height}\n`
+    + `style    = ${canvas.style.width}x${canvas.style.height}\n`
+    + `grid     = ${state.cols}x${state.rows}\n`
+    + `server   = ${state.serverCols}x${state.serverRows}\n`
+    + `cell     = ${CELL_W_DEV}x${CELL_H_DEV}\n`
+    + `cells    = ${state.cellCount}\n`
+    + `cursor   = ${state.cursorCol},${state.cursorRow} style=${state.cursorStyle}`;
+}
+
+// ---- Outbound shape -----------------------------------------------
 
 function send(type, extra) {
   if (!window.webui) return;
-  // sent_ms is Date.now() (unix epoch ms) so the server's gettimeofday
-  // sees the same epoch; otherwise the comparison is meaningless.
-  // performance.now() is monotonic-from-navigation, do NOT use it here.
+  // sent_ms: client-side Date.now() in unix-epoch ms so the server's
+  // gettimeofday sees the same epoch.  performance.now() would be
+  // monotonic-from-navigation and meaningless to the server.
   const payload = Object.assign({ type, sent_ms: Date.now() }, extra);
   webui.call('input', JSON.stringify(payload));
 }
-
-// Browser-side diagnostics travel through the same input bind tagged
-// type="log".  The server routes them into gcell's engine-log!, and
-// the existing log overlay surfaces them on the cell grid -- no F12
-// required, no parallel debug channel.
 
 function shipLog(level, text) {
   send('log', { level, text });
@@ -711,13 +806,11 @@ window.addEventListener('error', e => {
   const where = e.filename ? `${e.filename}:${e.lineno}:${e.colno} ` : '';
   shipLog('error', `${where}${e.message || e.error || 'unknown error'}`);
 });
-
 window.addEventListener('unhandledrejection', e => {
   const r = e.reason;
   const text = r && r.stack ? r.stack : (r && r.message ? r.message : String(r));
   shipLog('error', `unhandled rejection: ${text}`);
 });
-
 (function wrapConsole() {
   const wrap = (orig, level) => function (...args) {
     try {
@@ -733,250 +826,11 @@ window.addEventListener('unhandledrejection', e => {
   console.info  = wrap(console.info .bind(console), 'info');
 })();
 
-// Canvas is the window viewport. Both backing and style track
-// window.innerWidth / innerHeight in CSS pixels, 1:1. The shader
-// positions cells at CSS_CELL_W x CSS_CELL_H in this coord system,
-// so cells always render at exactly that pixel size regardless of
-// what the server says the grid dims are. If the server hasn't
-// caught up with a resize yet, extra cells just clip at the right /
-// bottom edge -- they never get squished, and a single source (the
-// real window inner size) owns canvas dims so applyFrame and
-// onResize can't fight over them.
-function syncCanvasToWindow() {
-  const cssW = Math.max(1, window.innerWidth);
-  const cssH = Math.max(1, window.innerHeight);
-  // Backing is in DEVICE pixels (CSS px * DPR). Display is in CSS px,
-  // sized to the actual window viewport. Browser maps 1 backing px to
-  // 1 device px on screen; shader paints cells at u_cellSize device px
-  // each, so a "24 px" glyph is always 24 actual pixels regardless of
-  // window dimension or Wayland fractional scale.
-  const dpr  = window.devicePixelRatio || 1;
-  const devW = Math.max(1, Math.round(cssW * dpr));
-  const devH = Math.max(1, Math.round(cssH * dpr));
-  if (canvas.width  !== devW) canvas.width  = devW;
-  if (canvas.height !== devH) canvas.height = devH;
-  if (canvas.style.width  !== cssW + 'px') canvas.style.width  = cssW + 'px';
-  if (canvas.style.height !== cssH + 'px') canvas.style.height = cssH + 'px';
-}
-
-let __lastResizeKey = '';
-function onResize(reason) {
-  try {
-    const cssW = window.innerWidth;
-    const cssH = window.innerHeight;
-    const dpr  = window.devicePixelRatio || 1;
-    const devW = Math.max(1, Math.round(cssW * dpr));
-    const devH = Math.max(1, Math.round(cssH * dpr));
-    const cols = Math.max(20, Math.floor(devW / CSS_CELL_W));
-    const rows = Math.max(5,  Math.floor(devH / CSS_CELL_H));
-    syncCanvasToWindow();
-    cellCount = 0;
-    cellsArray = new Float32Array(0);
-    gridW = 0;
-    gridH = 0;
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.clearColor(0, 0, 0, 1);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    const key = `${cssW}x${cssH}|${cols}x${rows}|${dpr}`;
-    if (key !== __lastResizeKey) {
-      shipLog('info', `resize(${reason||'?'}) inner=${cssW}x${cssH} dpr=${dpr}`
-                     +` canvas=${canvas.width}x${canvas.height} grid=${cols}x${rows}`);
-      __lastResizeKey = key;
-    }
-    send('resize', { width: cols, height: rows });
-  } catch (e) {
-    shipLog('error', `onResize threw: ${e && e.message ? e.message : e}`);
-  }
-}
-
-window.addEventListener('resize', () => onResize('window.resize'));
-window.addEventListener('orientationchange', () => onResize('orientationchange'));
-document.addEventListener('fullscreenchange', () => onResize('fullscreenchange'));
-if (typeof ResizeObserver !== 'undefined') {
-  new ResizeObserver(() => onResize('resizeObserver')).observe(document.documentElement);
-}
-let __lastW = window.innerWidth, __lastH = window.innerHeight;
-setInterval(() => {
-  if (window.innerWidth !== __lastW || window.innerHeight !== __lastH) {
-    __lastW = window.innerWidth;
-    __lastH = window.innerHeight;
-    onResize('poll');
-  }
-}, 250);
-// ---- Deep instrumentation ----
-//
-// The user has reported "font is literal pixels tall at certain window
-// dims" / glyph size drift that JS-level numbers (DPR=1, cells=16x32
-// dev px, canvas backing == style * DPR) don't visibly explain.  The
-// surface metrics above are stable but the rendered glyph isn't.  The
-// instrumentation below measures the things that can still drift even
-// when those numbers don't move:
-//
-//   * actualBoundingBoxAscent/Descent + advance width of 'M' in the
-//     SAME font config the atlas uses -- these come from the browser's
-//     font hinter and can move with HiDPI / system font cache changes
-//     even if FONT_PX hasn't changed.
-//   * matchMedia at DPR thresholds (1, 1.5, 2, 3) -- the only fully
-//     reliable way to detect Wayland fractional-scale flips in real
-//     time; the polled window.devicePixelRatio sometimes lies.
-//   * getComputedStyle(canvas) -- catches CSS transforms / zoom that
-//     downstream pages or extensions might inject.
-//   * focus / blur / visibility -- these can re-trigger Firefox font
-//     rendering pipelines on Wayland.
-//   * a derived "drift" line that fires only when one of the tracked
-//     metrics changed since the previous heartbeat, so the user can
-//     spot the transition without scrolling through identical hbs.
-//
-// All output funnels through shipLog -> server engine-log! -> the
-// in-grid log overlay.
-
-const __probeCanvas = document.createElement('canvas');
-__probeCanvas.width  = Math.max(64, FONT_PX_DEV * 4);
-__probeCanvas.height = Math.max(64, FONT_PX_DEV * 4);
-const __probeCtx = __probeCanvas.getContext('2d');
-
-function measureGlyphFootprint() {
-  // Mirror exactly what rasteriseGlyph does for the atlas: same font
-  // family, same px size, same weight.  We measure 'M' (canonical wide
-  // glyph) plus the textMetrics bounding box so any browser-side
-  // hinting / sub-pixel decisions show up here.
-  try {
-    __probeCtx.font = `${FONT_PX}px ${ATLAS_FONT_FAMILY}`;
-    const m = __probeCtx.measureText('M');
-    const ascent  = m.actualBoundingBoxAscent  || 0;
-    const descent = m.actualBoundingBoxDescent || 0;
-    return {
-      advance: +m.width.toFixed(2),
-      ascent:  +ascent.toFixed(2),
-      descent: +descent.toFixed(2),
-      height:  +(ascent + descent).toFixed(2),
-      fontEm:  +(m.fontBoundingBoxAscent || 0).toFixed(2)
-              + +(m.fontBoundingBoxDescent || 0).toFixed(2),
-    };
-  } catch (e) {
-    return { error: String(e) };
-  }
-}
-
-// DPR threshold mediaqueries: register one listener per breakpoint so
-// any fractional-scale transition logs immediately, not just on the
-// next 2s tick.  Thresholds chosen to bracket every common Wayland
-// fractional ratio (1.0, 1.25, 1.5, 1.75, 2.0, 3.0).
-const __DPR_THRESHOLDS = [1.0, 1.25, 1.5, 1.75, 2.0, 3.0];
-for (const t of __DPR_THRESHOLDS) {
-  try {
-    const mql = window.matchMedia(`(resolution: ${t}dppx)`);
-    mql.addEventListener('change', e => {
-      shipLog('info', `evt=dpr-cross threshold=${t}dppx matches=${e.matches}`
-                     +` reported=${window.devicePixelRatio}`);
-      onResize('dpr-cross');
-    });
-  } catch (_) { /* old browsers */ }
-}
-
-// Catch font readiness / re-rendering.  When the system serves a
-// fallback first and the proper font lands a few ms later, glyph
-// rasterisation needs to redo the atlas; we ship the event so any
-// post-load drift is attributable.
-if (document.fonts && document.fonts.ready) {
-  document.fonts.ready.then(() => {
-    shipLog('info', `evt=fonts.ready status=${document.fonts.status}`);
-  }).catch(() => {});
-  document.fonts.addEventListener &&
-    document.fonts.addEventListener('loadingdone', () => {
-      shipLog('info', `evt=fonts.loadingdone status=${document.fonts.status}`);
-    });
-}
-
-// Focus/blur/visibility/orientation don't get their own log lines —
-// the sampler will surface any actual rendering effect they cause.
-
-// Ctrl+Shift+D = one-shot deep dump.  Bypasses preventDefault chain
-// because we attach BEFORE the existing keydown handler in capture
-// phase; the engine never sees the chord, so it doesn't conflict with
-// app key bindings.
-window.addEventListener('keydown', (e) => {
-  if (e.ctrlKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) {
-    e.preventDefault();
-    e.stopPropagation();
-    dumpDeepProbe('user');
-  }
-}, true);
-
-function dumpDeepProbe(reason) {
-  const cs = window.getComputedStyle(canvas);
-  const gm = measureGlyphFootprint();
-  const r  = canvas.getBoundingClientRect();
-  shipLog('info', `probe[${reason}] css={w:${cs.width},h:${cs.height},`
-                 +`transform:${cs.transform},zoom:${cs.zoom||''},`
-                 +`imgRendering:${cs.imageRendering}}`
-                 +` glyph=${JSON.stringify(gm)}`
-                 +` rect={x:${r.x.toFixed(1)},y:${r.y.toFixed(1)},`
-                 +`w:${r.width.toFixed(2)},h:${r.height.toFixed(2)}}`
-                 +` screenXY=${window.screenX},${window.screenY}`
-                 +` dprMatches=${__DPR_THRESHOLDS
-                       .filter(t => window.matchMedia(`(resolution: ${t}dppx)`).matches)
-                       .join(',') || 'none'}`);
-}
-
-// Change-only sampler: every 1s, snapshot the values that affect what
-// the user sees, and emit a single line ONLY when one changed. No
-// 2s-heartbeat spam. If the page is frozen the absence of any DRIFT
-// line for a long time during a known window resize is the signal.
-// The first sample emits as `BASELINE` so there's exactly one
-// reference point per session.
-let __hbPrev = null;
-setInterval(() => {
-  const r = canvas.getBoundingClientRect();
-  const vv = window.visualViewport;
-  const vvScale = vv ? Math.round(vv.scale * 1000) / 1000 : '?';
-  const dpr = window.devicePixelRatio;
-  const gm = measureGlyphFootprint();
-  const backingExpected = Math.round(window.innerWidth * dpr);
-  const cur = {
-    dpr,
-    inner:  `${window.innerWidth}x${window.innerHeight}`,
-    outer:  `${window.outerWidth}x${window.outerHeight}`,
-    canvas: `${canvas.width}x${canvas.height}`,
-    style:  `${canvas.style.width || '?'}x${canvas.style.height || '?'}`,
-    rect:   `${Math.round(r.width)}x${Math.round(r.height)}`,
-    grid:   `${gridW}x${gridH}`,
-    glyph:  `${gm.advance}x${gm.height}`,
-    vv:     `${vvScale}`,
-    backing: Math.abs(canvas.width - backingExpected) > 1
-             ? `MISMATCH(${canvas.width}!=${backingExpected})` : 'ok',
-  };
-  if (!__hbPrev) {
-    shipLog('info',
-      `BASELINE ${Object.entries(cur).map(([k,v])=>`${k}=${v}`).join(' ')}`);
-  } else {
-    const changed = Object.keys(cur).filter(k => cur[k] !== __hbPrev[k]);
-    if (changed.length) {
-      const parts = changed.map(k =>
-        `${k}:${__hbPrev[k]}->${cur[k]}`).join(' ');
-      shipLog('info', `DRIFT ${parts}`);
-    }
-  }
-  __hbPrev = cur;
-}, 1000);
-
-// Initial deep probe so the first connection captures a baseline.
-setTimeout(() => dumpDeepProbe('init'), 500);
-// Make sure clicks land focus -- some webui-launched windows boot
-// without document focus and then keydown events miss the document.
-canvas.addEventListener('mousedown', () => canvas.focus());
-window.addEventListener('load',      () => canvas.focus());
-document.addEventListener('visibilitychange',
-  () => { if (document.visibilityState === 'visible') canvas.focus(); });
-
-// ---- Input
+// ---- Input --------------------------------------------------------
 
 function keySym(e) {
-  // Single-char printables go through as their own symbol; longer
-  // names (Enter, ArrowLeft, ...) come back lowercased.
   if (e.key.length === 1) return e.key;
   const k = e.key.toLowerCase();
-  // Map a few DOM names to gcell's conventions.
   if (k === 'arrowleft')  return 'left';
   if (k === 'arrowright') return 'right';
   if (k === 'arrowup')    return 'up';
@@ -984,18 +838,11 @@ function keySym(e) {
   return k;
 }
 
-// Modifier-only events from `e.key` are useless on the gcell side --
-// the next non-modifier key will carry the mod flags.
 const MODIFIER_KEYS = new Set([
   'Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'NumLock', 'ScrollLock',
   'OS', 'AltGraph', 'ContextMenu',
 ]);
 
-// Keys whose browser default has to be suppressed so they reach the
-// app: Backspace (back-nav in some browsers), Tab (focus jump), space
-// (page scroll on body), arrows / page nav (scroll), function keys
-// (some are reserved), Enter (form submit).  We send them all to the
-// engine, then preventDefault.
 function shouldPreventDefault(e) {
   if (e.key === 'Tab' || e.key === 'Backspace' || e.key === 'Enter' ||
       e.key === ' '   || e.key === 'Delete'    || e.key === 'Home'  ||
@@ -1007,11 +854,9 @@ function shouldPreventDefault(e) {
 }
 
 function keyEventOf(e) {
-  // Browser auto-repeat: e.repeat=true.  gcell's engine has a
-  // held-set timeout of several seconds, so without 'repeat / 'release
-  // bookkeeping the second tap of the same key (backspace, etc.)
-  // would be re-classified as a held-key repeat by the engine and
-  // dropped by widgets that only listen to 'press (e.g. textinput).
+  // Browser auto-repeat sets e.repeat; engine's held-set timeout would
+  // otherwise classify the second tap of the same key as a held
+  // repeat and drop it.
   if (e.type === 'keyup') return 'release';
   return e.repeat ? 'repeat' : 'press';
 }
@@ -1036,30 +881,29 @@ document.addEventListener('keyup',   dispatchKey);
 
 function cellPosFromMouseEvent(e) {
   const rect = canvas.getBoundingClientRect();
-  // Cells are sized in device pixels; mouse events come in CSS pixels.
-  // Multiply offsets by DPR before dividing by the device-px cell size
-  // so cell coords match the grid the server is rendering.
-  const dpr = window.devicePixelRatio || 1;
   return {
-    x: Math.floor(((e.clientX - rect.left) * dpr) / CSS_CELL_W),
-    y: Math.floor(((e.clientY - rect.top)  * dpr) / CSS_CELL_H),
+    x: Math.floor(((e.clientX - rect.left) * state.dpr) / CELL_W_DEV),
+    y: Math.floor(((e.clientY - rect.top)  * state.dpr) / CELL_H_DEV),
   };
 }
 
 const MOUSE_BTNS = ['left', 'middle', 'right'];
+let mouseHeld = 'none';
+let lastMove = { x: -1, y: -1 };
 
-let mouseHeld = 'none';   // currently-held button for drag tracking.
-let lastMove = { x: -1, y: -1, ts: 0 };
+function anyClickableAt(x, y) {
+  for (const r of state.clickRects) {
+    if (x >= r.col && x < r.col + r.w &&
+        y >= r.row && y < r.row + r.h) return true;
+  }
+  return false;
+}
 
 canvas.addEventListener('mousedown', (e) => {
   const { x, y } = cellPosFromMouseEvent(e);
   mouseHeld = MOUSE_BTNS[e.button] || 'left';
-  // OSC-8 hyperlinks: a left-click on a linked cell opens the URL
-  // in a new tab and skips the gcell input shipment, matching the
-  // behaviour terminals adopt for OSC-8 (clicks are claimed by the
-  // link layer).
   if (mouseHeld === 'left') {
-    const url = hyperlinks.get(linkKey(x, y));
+    const url = state.hyperlinks.get(linkKey(x, y));
     if (url) {
       window.open(url, '_blank', 'noopener,noreferrer');
       mouseHeld = 'none';
@@ -1078,18 +922,10 @@ canvas.addEventListener('mouseup', (e) => {
 
 canvas.addEventListener('mousemove', (e) => {
   const { x, y } = cellPosFromMouseEvent(e);
-  // Hover affordance: pointer cursor over any clickable region (or
-  // OSC-8 hyperlink), default otherwise.  Tells the user at a glance
-  // which cells are interactive without the widget itself having to
-  // add a visual hover style.
-  const overClickable = hyperlinks.has(linkKey(x, y)) || anyClickableAt(x, y);
+  const overClickable = state.hyperlinks.has(linkKey(x, y)) || anyClickableAt(x, y);
   canvas.style.cursor = overClickable ? 'pointer' : 'default';
-  // Same-cell movement is invisible to a cell grid; only emit on a
-  // real cell change.  No time throttle: the cell granularity bounds
-  // the rate by mouse speed already, and dropping any cell-cross
-  // makes hover affordances flicker / stick.
   if (x === lastMove.x && y === lastMove.y) return;
-  lastMove = { x, y, ts: 0 };
+  lastMove = { x, y };
   send('mouse', { x, y, button: mouseHeld, action: 'move' });
 });
 
@@ -1105,206 +941,44 @@ canvas.addEventListener('wheel', (e) => {
 
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
-// Clipboard read: the browser raises a `paste` event on document when
-// the user fires it (Ctrl-V or middle-click).  We pull the text and
-// ship it as gcell's <paste> protocol msg.
 document.addEventListener('paste', (e) => {
   if (!e.clipboardData) return;
   const text = e.clipboardData.getData('text/plain');
   if (text) send('paste', { text });
 });
 
-// ---- Image cache.
-//
-// gcellImage receives PNG/JPEG bytes via webui_send_raw:
-//   u32 image_id  u32 length  raw_bytes
-// We decode via createImageBitmap (browser does it off-thread),
-// upload as a WebGL texture, and stash in the cache keyed by id.
+// Click->focus.  Some webui-launched windows boot without document
+// focus and miss the first round of keydowns otherwise.
+canvas.addEventListener('mousedown', () => canvas.focus());
+window.addEventListener('load',      () => canvas.focus());
+document.addEventListener('visibilitychange',
+  () => { if (document.visibilityState === 'visible') canvas.focus(); });
 
-const imageCache = new Map(); // id -> { tex, w, h }
-let imagesPlaced = [];        // current frame's placements
-
-function uploadImageBitmap(id, bitmap) {
-  const tex = gl.createTexture();
-  gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_2D, tex);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
-  imageCache.set(id, { tex, w: bitmap.width, h: bitmap.height });
-  // Trigger a redraw -- the placements from the most recent frame
-  // were waiting on this texture to land.
-  draw();
-}
-
-window.gcellImage = function (buf) {
-  const u8 = (buf instanceof Uint8Array) ? buf : new Uint8Array(buf);
-  if (u8.byteLength < 8) return;
-  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-  const id = dv.getUint32(0, true);
-  const len = dv.getUint32(4, true);
-  if (u8.byteLength < 8 + len) return;
-  const blob = new Blob([u8.subarray(8, 8 + len)]);
-  createImageBitmap(blob)
-    .then(bitmap => uploadImageBitmap(id, bitmap))
-    .catch(err => shipLog('error', `image ${id} decode: ${err}`));
-};
-
-// Image-draw program: textured quads laid over the cell grid.
-
-const imageVS = `#version 300 es
-in vec2 a_quad;
-uniform vec2 a_pos;      // top-left in cells
-uniform vec2 a_size;     // w,h in cells
-uniform vec4 a_uvRect;   // src x,y,w,h in 0..1 of source texture
-uniform vec2 u_cellSize;
-uniform vec2 u_viewport;
-out vec2 v_uv;
-void main() {
-  vec2 px = (a_pos + a_quad * a_size) * u_cellSize;
-  vec2 ndc = (px / u_viewport) * 2.0 - 1.0;
-  ndc.y = -ndc.y;
-  gl_Position = vec4(ndc, 0.0, 1.0);
-  v_uv = a_uvRect.xy + a_quad * a_uvRect.zw;
-}`;
-
-const imageFS = `#version 300 es
-precision mediump float;
-uniform sampler2D u_img;
-in vec2 v_uv;
-out vec4 fragColor;
-void main() {
-  fragColor = texture(u_img, v_uv);
-}`;
-
-let imageProgram, iuPos, iuSize, iuUv, iuCellSize, iuViewport, iuImg, iaQuadLoc;
-let imageVao;
-
-function buildImageProgram() {
-  imageProgram = gl.createProgram();
-  gl.attachShader(imageProgram, compile(gl.VERTEX_SHADER,   imageVS));
-  gl.attachShader(imageProgram, compile(gl.FRAGMENT_SHADER, imageFS));
-  gl.linkProgram(imageProgram);
-  if (!gl.getProgramParameter(imageProgram, gl.LINK_STATUS)) {
-    throw new Error(gl.getProgramInfoLog(imageProgram) || 'image link failed');
-  }
-
-  iuPos      = gl.getUniformLocation(imageProgram, 'a_pos');
-  iuSize     = gl.getUniformLocation(imageProgram, 'a_size');
-  iuUv       = gl.getUniformLocation(imageProgram, 'a_uvRect');
-  iuCellSize = gl.getUniformLocation(imageProgram, 'u_cellSize');
-  iuViewport = gl.getUniformLocation(imageProgram, 'u_viewport');
-  iuImg      = gl.getUniformLocation(imageProgram, 'u_img');
-  iaQuadLoc  = gl.getAttribLocation(imageProgram, 'a_quad');
-
-  imageVao = gl.createVertexArray();
-  gl.bindVertexArray(imageVao);
-  gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
-  gl.enableVertexAttribArray(iaQuadLoc);
-  gl.vertexAttribPointer(iaQuadLoc, 2, gl.FLOAT, false, 0, 0);
-
-  gl.bindVertexArray(vao);
-}
-
-// Bootstrap + context-loss/restore wire-up.
-function buildAllGl() {
-  buildAtlasTexture();
-  buildCellProgram();
-  buildCursorProgram();
-  buildImageProgram();
-  syncAtlas();
-  // GPU-side image textures are gone on a context loss; the cache
-  // entries point at dead handles.  Drop them so the next placement
-  // re-uploads (server's image-ids hash is server-side; for now the
-  // image data has to be resent by the server -- not blocking the
-  // common case of the terminal example which has no images).
-  imageCache.clear();
-  imagesPlaced = [];
-}
-buildAllGl();
-// Anchor the canvas to the live window immediately so the first
-// applyFrame / draw paints into a viewport that matches what the user
-// sees, instead of HTML's 300x150 default canvas.
-syncCanvasToWindow();
+// ---- GL context-loss -----------------------------------------------
 
 canvas.addEventListener('webglcontextlost', (e) => {
-  // Must preventDefault, otherwise the browser never fires the
-  // restored event.  See WEBGL_lose_context.
   e.preventDefault();
   shipLog('error', 'webgl context lost');
 });
 canvas.addEventListener('webglcontextrestored', () => {
   shipLog('info', 'webgl context restored, rebuilding GL state');
   buildAllGl();
-  // Force a full frame from the server: the engine will encode at
-  // current dims regardless of what the client thinks, but we want
-  // the client's grid invalidated so applyFrame's newdim path runs
-  // and reallocates cellsArray cleanly.
-  gridW = 0; gridH = 0;
-  cellCount = 0;
-  cellsArray = new Float32Array(0);
-  {
-    const dpr  = window.devicePixelRatio || 1;
-    const devW = Math.max(1, Math.round(window.innerWidth  * dpr));
-    const devH = Math.max(1, Math.round(window.innerHeight * dpr));
-    send('resize', {
-      width:  Math.max(20, Math.floor(devW / CSS_CELL_W)),
-      height: Math.max(5,  Math.floor(devH / CSS_CELL_H)),
-    });
-  }
+  state.cellsArray = new Float32Array(0);
+  state.cellCount = 0;
+  state.serverCols = 0;
+  state.serverRows = 0;
+  onWindow('ctx-restore');
 });
 
-function drawImagePlacements(cellW, cellH) {
-  if (imagesPlaced.length === 0) return;
-  gl.useProgram(imageProgram);
-  gl.bindVertexArray(imageVao);
-  gl.uniform2f(iuCellSize, cellW || CELL_W, cellH || CELL_H);
-  gl.uniform2f(iuViewport, canvas.width, canvas.height);
-  gl.uniform1i(iuImg, 1);
-  gl.activeTexture(gl.TEXTURE1);
-  for (const p of imagesPlaced) {
-    const entry = imageCache.get(p.id);
-    if (!entry) continue;  // bytes still in flight; skip until decoded
-    gl.bindTexture(gl.TEXTURE_2D, entry.tex);
-    gl.uniform2f(iuPos,  p.col, p.row);
-    gl.uniform2f(iuSize, p.w,   p.h);
-    // src-x/y/w/h come from the server in pixel coords against the
-    // source image; normalise here using the cached bitmap size.
-    gl.uniform4f(iuUv,
-                 p.sx / entry.w, p.sy / entry.h,
-                 p.sw / entry.w, p.sh / entry.h);
-    gl.drawArrays(gl.TRIANGLES, 0, 6);
-  }
-  gl.bindVertexArray(vao);
-}
-
-// ---- Receive frames pushed by the server.
-//
-// webui_send_raw(window, "gcellFrame", bytes) routes through the
-// bridge to a call on window.gcellFrame in the browser.
-window.gcellFrame = applyFrame;
-
-// ---- Boot
-//
-// Wait until webui.js has finished negotiating the WebSocket before
-// we announce our initial size; otherwise the server gets a resize
-// before it's accepted any binds.
+// ---- Boot ----------------------------------------------------------
 
 function whenWebuiReady(cb) {
   if (window.webui && window.webui.isConnected && window.webui.isConnected()) {
     cb();
     return;
   }
-  // Older webui.js builds expose `webui.event`, an EventTarget that
-  // fires 'connected' when the WS handshake completes.  Newer builds
-  // expose `webui.onConnect(fn)`.  Fall back to polling isConnected.
   if (window.webui) {
-    if (typeof webui.onConnect === 'function') {
-      webui.onConnect(cb);
-      return;
-    }
+    if (typeof webui.onConnect === 'function') { webui.onConnect(cb); return; }
     if (webui.event && typeof webui.event.addEventListener === 'function') {
       webui.event.addEventListener('connected', cb, { once: true });
       return;
@@ -1313,4 +987,33 @@ function whenWebuiReady(cb) {
   setTimeout(() => whenWebuiReady(cb), 32);
 }
 
-whenWebuiReady(() => onResize());
+buildAllGl();
+recompute();
+applyCanvas();
+// Real frame/image handlers replace the HTML stubs; drain whatever the
+// stubs captured during module loading.  Must run after buildAllGl so
+// applyFrame's gl.bufferData(cellsBuf, ...) has live state to write to.
+{
+  const fq = window.__gcellFrameQueue || [];
+  window.gcellFrame = applyFrame;
+  window.__gcellFrameQueue = null;
+  for (const buf of fq) try { applyFrame(buf); } catch (_) {}
+  const iq = window.__gcellImageQueue || [];
+  window.gcellImage = handleImage;
+  window.__gcellImageQueue = null;
+  for (const buf of iq) try { handleImage(buf); } catch (_) {}
+}
+whenWebuiReady(() => {
+  // Run recompute again in case window dims weren't settled at module
+  // boot (Firefox-in-app-mode can briefly report 0x0 inner before its
+  // window manager places the surface).  Then drive the rest off the
+  // re-measured state and tell the server "we're ready" so it pushes a
+  // full frame from the current term -- the only race-free path,
+  // because by definition this fires AFTER the JS module is fully
+  // wired up and the queue stub has been replaced with applyFrame.
+  recompute();
+  applyCanvas();
+  tellServer();
+  send('ready', {});
+  paint();
+});
