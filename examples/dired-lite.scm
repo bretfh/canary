@@ -7,9 +7,9 @@
 ;;; Keys: j/k or ↑/↓ — move cursor; enter — cd into dir;
 ;;;       u — up one directory; q — quit.
 
-(use-modules (gcell)
-             (gcell components panel)
-             (gcell components viewport)
+(use-modules (canary)
+             (canary components panel)
+             (canary components viewport)
              (ice-9 ftw)
              (ice-9 textual-ports)
              (srfi srfi-1)

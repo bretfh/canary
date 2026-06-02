@@ -5,7 +5,7 @@
              (gnu packages version-control)
              (gnu packages web)
              (gnu packages webkit)
-             (gcell deps webui))
+             (canary deps webui))
 
 (packages->manifest
  (list guile-next

@@ -2,9 +2,9 @@
 
 (use-modules (srfi srfi-64)
              (srfi srfi-13)
-             ((gcell term types)  #:prefix t:)
-             ((gcell term parser) #:prefix t:)
-             ((gcell term render) #:prefix t:))
+             ((canary term types)  #:prefix t:)
+             ((canary term parser) #:prefix t:)
+             ((canary term render) #:prefix t:))
 
 (define (face-at term x y)
   (t:term-face-at term x y))

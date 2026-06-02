@@ -1,8 +1,8 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             (gcell key)
-             (gcell keymap))
+             (canary key)
+             (canary keymap))
 
 (test-begin "keymap")
 

@@ -1,4 +1,4 @@
-# Gcell news
+# Canary news
 
 Changes are listed newest-first.  Format follows
 [Keep a Changelog](https://keepachangelog.com).
@@ -7,21 +7,21 @@ Changes are listed newest-first.  Format follows
 
 ### Added
 
-- **`(gcell backend-webui)` — WebGL2-via-webview rendering backend.**
-  An alternative to `(gcell backend-ansi)` that ships the cell grid to
+- **`(canary backend-webui)` — WebGL2-via-webview rendering backend.**
+  An alternative to `(canary backend-ansi)` that ships the cell grid to
   a libwebui WebView (webkit2gtk on Linux) instead of stdout.  The
   widget tree, render pipeline, and draw cmds are unchanged; this
   backend only implements `init` / `shutdown` / `draw` / `size` and
   encodes each rendered frame as a compact binary blob over the
   embedded WebSocket.  A small WebGL2 client at
-  `gcell/backend-webui/client/gcell.js` paints cells onto a canvas
+  `canary/backend-webui/client/canary.js` paints cells onto a canvas
   and forwards keyboard / mouse / resize events back as JSON.
 
   Boot is tuned to hide the lull between webview creation and first
   paint:
 
   - `backend-init` runs `render-frame` once and `client-html` inlines
-    the encoded frame as a base64 JS variable; `gcell.js` decodes and
+    the encoded frame as a base64 JS variable; `canary.js` decodes and
     `applyFrame()`s it on first module-eval — no WebSocket round
     trip on first paint.
   - `buildAllGl` compiles only the cell-grid shader synchronously.
@@ -35,8 +35,8 @@ Changes are listed newest-first.  Format follows
   Use as a drop-in `<backend>`:
 
   ```scheme
-  (use-modules (gcell)
-               (gcell backend-webui))
+  (use-modules (canary)
+               (canary backend-webui))
   (run-app (make <counter>) #:backend (webui-backend))
   ```
 
@@ -48,12 +48,12 @@ Changes are listed newest-first.  Format follows
   has a race in `_webui_wv_show` that returns `false` even when GTK
   and WebKit are present.
 
-- **`tools/build/` — `gcell-build`, the single-file static-binary
+- **`tools/build/` — `canary-build`, the single-file static-binary
   build tool.**  Wraps a `guix shell` static toolchain (libguile-3.0
   + bdw-gc + libffi + gmp + libunistring + libltdl, all static, plus
   guile-fibers with its epoll C extension statically linked) and a
-  Zig-driven link step.  App authors write a `gcell-app.scm`
-  manifest; `gcell-build ship` walks the project, stages gcell +
+  Zig-driven link step.  App authors write a `canary-app.scm`
+  manifest; `canary-build ship` walks the project, stages canary +
   fibers + the app, and produces a `dist/<name>` ELF — typically
   15-20 MB, `NEEDED` is only `libc/libm/ld-linux`.
 
@@ -106,8 +106,8 @@ Changes are listed newest-first.  Format follows
 
 ### Added
 
-- **`<focusable>` mixin and `update-slots` helper** in `(gcell
-  widget)`, re-exported from `(gcell)`.  Inherit from `<focusable>`
+- **`<focusable>` mixin and `update-slots` helper** in `(canary
+  widget)`, re-exported from `(canary)`.  Inherit from `<focusable>`
   to give a widget an auto-generated identity slot the engine keys
   focus, mount/unmount, and per-widget subscriptions by — identity
   survives across value-typed updates.  `update-slots` returns a
@@ -126,7 +126,7 @@ Changes are listed newest-first.  Format follows
 
 ### Added
 
-- **Modes table as discoverable API** (`(gcell term modes)`).  A
+- **Modes table as discoverable API** (`(canary term modes)`).  A
   single `<mode-state>` slot on `<term>` replaces the five ad-hoc
   boolean slots (auto-margin, insert, keypad, bracketed-paste,
   cursor-visible).  Every ECMA-48 / DEC / xterm mode the parser
@@ -146,10 +146,10 @@ Changes are listed newest-first.  Format follows
 
 - **Typed action and op records + `update` dispatch on `<term>`.**
   Two new modules:
-  - `(gcell term action)` exposes `<action>` / `<action-csi>` —
+  - `(canary term action)` exposes `<action>` / `<action-csi>` —
     the raw, syntactic form of each parsed control sequence.
-  - `(gcell term dispatch)` defines `<op>` / `<op-set-mode>` /
-    `<op-reset-mode>` and routes them to `<term>` through gcell's
+  - `(canary term dispatch)` defines `<op>` / `<op-set-mode>` /
+    `<op-reset-mode>` and routes them to `<term>` through canary's
     existing `update` GOOPS generic.  Specialise `update` at the
     REPL to intercept emulator decisions:
 
@@ -162,7 +162,7 @@ Changes are listed newest-first.  Format follows
   CSI h/l in the parser now flows through this layer; behaviour is
   unchanged for end users.
 
-- **Stateful UTF-8 byte decoder** (`(gcell term utf8)`).  A new
+- **Stateful UTF-8 byte decoder** (`(canary term utf8)`).  A new
   `<utf8-decoder>` record holds partial codepoint state across calls,
   so byte streams chunked by a `read` (PTY, file, socket) can be
   decoded correctly even when a multi-byte codepoint straddles a
@@ -173,7 +173,7 @@ Changes are listed newest-first.  Format follows
 ### Fixed
 
 - **Pending-wrap (LCF) at the right margin.**  The terminal emulator
-  in `gcell/term/` now follows the VT100/xterm spec for autowrap.
+  in `canary/term/` now follows the VT100/xterm spec for autowrap.
   Printing a character at the last column sets a pending-wrap flag
   rather than walking the cursor off the grid; the next print
   consumes the flag (wrapping to column 0 of the next row when

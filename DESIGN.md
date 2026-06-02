@@ -1,4 +1,4 @@
-# gcell
+# canary
 
 A TUI library for Guile. You describe the screen as a tree, the engine
 turns it into terminal cells. Edit your code in the REPL and the next
@@ -21,14 +21,14 @@ Styling attributes are individual flags: `#:bold`, `#:italic`,
 
 ## API
 
-Dev loop is `guile -L /path/to/gcell myapp.scm`. Live-coding via
+Dev loop is `guile -L /path/to/canary myapp.scm`. Live-coding via
 geiser, evaluate forms into a running app, etc. — the live-coding
 section near the bottom of this doc covers it. Shipping a finished
 app to end users without making them install Guile is covered in
 `SHIPPING.md` and isn't a topic here.
 
 ```scheme
-(use-modules (gcell))
+(use-modules (canary))
 ```
 
 Brings in:
@@ -58,13 +58,13 @@ Brings in:
 Components live in separate modules and are imported individually:
 
 ```scheme
-(use-modules (gcell components panel)
-             (gcell components textinput)
-             (gcell components spinner))
+(use-modules (canary components panel)
+             (canary components textinput)
+             (canary components spinner))
 ```
 
 The VT emulator core is also a public library; pull it in with
-`(use-modules (gcell term))` when you want to parse, snapshot, or
+`(use-modules (canary term))` when you want to parse, snapshot, or
 replay terminal byte streams directly.
 
 The sections below cover each piece.
@@ -72,7 +72,7 @@ The sections below cover each piece.
 ## Hello, counter
 
 ```scheme
-(use-modules (gcell) (oop goops))
+(use-modules (canary) (oop goops))
 
 (define-class <counter> (<focusable>)
   (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
@@ -302,7 +302,7 @@ Engine-emitted records matched in `update`.
 
 Multi-method dispatch on the msg class is the natural shape.  One
 method per msg class you care about; everything else falls through to
-the global catch-all in `(gcell view)`, so you don't write a per-
+the global catch-all in `(canary view)`, so you don't write a per-
 class catch-all.
 
 ```scheme
@@ -419,7 +419,7 @@ overlay text inputs.
 
 ### Anatomy of a multi-scene app
 
-The shape every non-trivial gcell app converges on:
+The shape every non-trivial canary app converges on:
 
 ```scheme
 ;;; Root: holds the active scene, swaps it on <scene-change>.
@@ -650,7 +650,7 @@ give it by wrapping in `flex` (or `(width ...)` / `(height ...)`).
 
 ## Bundled components
 
-Plain widget classes in `gcell/components/`:
+Plain widget classes in `canary/components/`:
 
 - `<button>`: title + on-click
 - `<panel>`: title + border + footer + content, with hover affordance
@@ -707,7 +707,7 @@ keeps two `<term>` records as private state: `cur-term` and
    one.
 
 `<term>` is therefore both the model the emulator parses into *and*
-the model gcell's own rendering writes into.  Two doors into the
+the model canary's own rendering writes into.  Two doors into the
 same data structure:
 
 - write path: tree → draw cmds → cells, used every frame
@@ -723,8 +723,8 @@ conceal, strike), hyperlink uri, and semantic-content tag.  Adding a
 new cell attribute means extending `<face-attrs>` once; both the
 write path and the parse path pick it up.
 
-The emulator pieces live in `(gcell term ...)` and re-export
-together as `(gcell term)`.  Useful entry points:
+The emulator pieces live in `(canary term ...)` and re-export
+together as `(canary term)`.  Useful entry points:
 
 - `make-term`, `term-process-output!`, `term-process-bytes!`
 - `view->grid` to render a view tree into a fresh `<term>`

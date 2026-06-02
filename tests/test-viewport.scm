@@ -2,9 +2,9 @@
 
 (use-modules (srfi srfi-1)
              (srfi srfi-64)
-             (gcell view)
-             (gcell layout)
-             (gcell components viewport)
+             (canary view)
+             (canary layout)
+             (canary components viewport)
              (oop goops))
 
 (test-begin "viewport")

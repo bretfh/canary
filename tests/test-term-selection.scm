@@ -1,12 +1,12 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             ((gcell term types)     #:prefix t:)
-             ((gcell term ops)       #:prefix t:)
-             ((gcell term write)     #:prefix t:)
-             ((gcell term parser)    #:prefix t:)
-             ((gcell term base64)    #:prefix t:)
-             ((gcell term selection) #:prefix t:))
+             ((canary term types)     #:prefix t:)
+             ((canary term ops)       #:prefix t:)
+             ((canary term write)     #:prefix t:)
+             ((canary term parser)    #:prefix t:)
+             ((canary term base64)    #:prefix t:)
+             ((canary term selection) #:prefix t:))
 
 (test-begin "term-selection")
 

@@ -1,11 +1,11 @@
 GUILE ?= guile
 GUILD ?= guild
 BUILD_DIR ?= build
-SCM_FILES := $(shell find gcell -name '*.scm')
-GO_FILES := $(patsubst gcell/%.scm,$(BUILD_DIR)/gcell/%.go,$(SCM_FILES))
+SCM_FILES := $(shell find canary -name '*.scm')
+GO_FILES := $(patsubst canary/%.scm,$(BUILD_DIR)/canary/%.go,$(SCM_FILES))
 TEST_FILES := $(wildcard tests/test-*.scm)
 
-# gcell/backend-webui.scm imports (webui), which lives in a sibling
+# canary/backend-webui.scm imports (webui), which lives in a sibling
 # guile-webui repo.  Honour GUILE_WEBUI_ROOT, then the canonical
 # ~/git/guile/guile-webui, then ../guile-webui (sibling of this repo);
 # the first one that exists wins.  Empty when none is found — the
@@ -23,22 +23,22 @@ endif
 
 all: compile
 
-# Build tool — produces static binaries of gcell apps.  See
+# Build tool — produces static binaries of canary apps.  See
 # tools/build/README.md for the app-author workflow.
 tool:
 	@command -v guix >/dev/null || { echo "guix not on PATH"; exit 1; }
-	@echo "gcell-build ready: $(CURDIR)/tools/build/gcell-build"
+	@echo "canary-build ready: $(CURDIR)/tools/build/canary-build"
 
 tool-install:
-	install -Dm755 tools/build/gcell-build $(DESTDIR)$(HOME)/.local/bin/gcell-build
-	@echo "installed: ~/.local/bin/gcell-build"
+	install -Dm755 tools/build/canary-build $(DESTDIR)$(HOME)/.local/bin/canary-build
+	@echo "installed: ~/.local/bin/canary-build"
 
 tool-test: compile
 	$(MAKE) -C tools/build test
 
 compile: $(GO_FILES)
 
-$(BUILD_DIR)/gcell/%.go: gcell/%.scm
+$(BUILD_DIR)/canary/%.go: canary/%.scm
 	@mkdir -p $(dir $@)
 	$(GUILD) compile -L . $(WEBUI_L) -o $@ $<
 
@@ -49,7 +49,7 @@ test:
 	done
 
 lint:
-	@! grep -rn '\\x1b' gcell --include='*.scm' \
+	@! grep -rn '\\x1b' canary --include='*.scm' \
 		| grep -v 'backend-ansi.scm\|terminal.scm' \
 		|| (echo "ANSI escape codes found outside backend-ansi/terminal" && exit 1)
 

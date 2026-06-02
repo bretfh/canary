@@ -1,7 +1,7 @@
-;;; examples/terminal.scm — gcell as a terminal emulator.
+;;; examples/terminal.scm — canary as a terminal emulator.
 ;;;
 ;;; Spawns $SHELL on a fresh PTY, feeds its byte stream through
-;;; gcell's VT emulator (`term-process-output!`), renders the cell grid into
+;;; canary's VT emulator (`term-process-output!`), renders the cell grid into
 ;;; one full-window widget.  Keystrokes translate back to PTY writes;
 ;;; the engine forwards <resize> to TIOCSWINSZ on the master fd.
 ;;;
@@ -17,20 +17,20 @@
 ;;; parser) + the cells-node view primitive + the widget/engine
 ;;; plumbing.  PTY FFI, the key->bytes table, and the widget all
 ;;; live in this single file -- this is an example app, not a
-;;; gcell-shipped feature.
+;;; canary-shipped feature.
 
-(use-modules (gcell)
-             ((gcell engine) #:select (start-engine! send force-render!))
-             ((gcell engine-types) #:select (engine))
-             ((gcell backend-webui) #:select (webui-backend))
-             ((gcell view) #:select (make-cells-node))
-             ((gcell term types)
+(use-modules (canary)
+             ((canary engine) #:select (start-engine! send force-render!))
+             ((canary engine-types) #:select (engine))
+             ((canary backend-webui) #:select (webui-backend))
+             ((canary view) #:select (make-cells-node))
+             ((canary term types)
               #:select (make-term term-resize!
                         term-chars term-faces term-width term-height
                         term-cursor-x term-cursor-y))
-             ((gcell term parser) #:select (term-process-bytes!))
-             ((gcell term utf8)   #:select (make-utf8-decoder))
-             ((gcell protocol) #:select (size))
+             ((canary term parser) #:select (term-process-bytes!))
+             ((canary term utf8)   #:select (make-utf8-decoder))
+             ((canary protocol) #:select (size))
              (oop goops)
              (ice-9 match)
              (ice-9 threads)
@@ -124,7 +124,7 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
 
 
 ;;;
-;;; Key -> bytes.  Mirror of gcell/input.scm in reverse: take the
+;;; Key -> bytes.  Mirror of canary/input.scm in reverse: take the
 ;;; (sym, mods) the engine hands us and emit what the child wants.
 ;;; Covers ASCII + control combos + arrows + navigation + escape;
 ;;; expand for function keys, modifier-encoded arrows, kitty kbd.
@@ -285,7 +285,7 @@ survives transient errors so a single failed ioctl can't kill it."
 
 ;;;
 ;;; PTY -> term pump.  An OS thread does the blocking read(2) so it
-;;; doesn't tie up the fibers scheduler; gcell's `send` is mutex-
+;;; doesn't tie up the fibers scheduler; canary's `send` is mutex-
 ;;; protected so calling it across threads is fine.  After each
 ;;; chunk we re-make the widget instance with `update-slots` so the
 ;;; engine's eq?-based view cache invalidates and a fresh frame
@@ -332,7 +332,7 @@ survives transient errors so a single failed ioctl can't kill it."
 ;;;
 
 (define (bell-pipe)
-  ;; Same shape gcell's internal helper builds: an ISO-8859-1 pipe
+  ;; Same shape canary's internal helper builds: an ISO-8859-1 pipe
   ;; with the write side unbuffered, used by `send` to wake the
   ;; engine's event-loop fiber from another thread.
   (let ((p (pipe)))
@@ -353,7 +353,7 @@ survives transient errors so a single failed ioctl can't kill it."
          (eng    (engine #:backend     (webui-backend #:size (size cols rows))
                          #:theme       default-theme
                          #:keymap      (keymap)
-                         #:title       "gcell-shell"
+                         #:title       "canary-shell"
                          #:mouse-mode  'off
                          #:cursor      'block
                          #:alt-screen? #t

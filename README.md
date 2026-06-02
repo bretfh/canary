@@ -1,8 +1,8 @@
-# gcell
+# canary
 
 elm/tea inspired tui in guile. see `DESIGN.md` for architecture,
 `examples/counter.scm` for a worked example, `SHIPPING.md` for
-producing single-file binaries of gcell apps that run on machines
+producing single-file binaries of canary apps that run on machines
 with no Guile installed.
 
 ## run
@@ -41,9 +41,9 @@ guile -L . examples/counter.scm
 
 | target         |                                                   |
 |----------------|---------------------------------------------------|
-| `make compile`      | guild compile `gcell/*.scm` to `build/gcell/*.go` |
+| `make compile`      | guild compile `canary/*.scm` to `build/canary/*.go` |
 | `make test`         | run `tests/test-*.scm` under srfi-64              |
 | `make lint`         | reject ansi escapes outside backend-ansi/terminal |
 | `make repl`         | `guile --listen=37147` for geiser                 |
-| `make tool-install` | install `gcell-build` into `~/.local/bin/`; see `SHIPPING.md` |
-| `make tool-test`    | smoke `gcell-build ship` against the counter example |
+| `make tool-install` | install `canary-build` into `~/.local/bin/`; see `SHIPPING.md` |
+| `make tool-test`    | smoke `canary-build ship` against the counter example |

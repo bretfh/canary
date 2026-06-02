@@ -1,9 +1,9 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             ((gcell term types)  #:prefix t:)
-             ((gcell term parser) #:prefix t:)
-             ((gcell term modes)  #:prefix t:))
+             ((canary term types)  #:prefix t:)
+             ((canary term parser) #:prefix t:)
+             ((canary term modes)  #:prefix t:))
 
 (define (sync-on? t) (t:mode-get (t:term-modes t) 'sync-output))
 

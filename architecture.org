@@ -1,7 +1,7 @@
-#+TITLE: gcell architecture
+#+TITLE: canary architecture
 #+OPTIONS: toc:nil num:nil
 
-This document covers gcell's internal architecture, data flow, and
+This document covers canary's internal architecture, data flow, and
 module organisation.
 
 * Table of contents
@@ -23,7 +23,7 @@ module organisation.
 :CUSTOM_ID: overview
 :END:
 
-gcell is a TUI library for Guile. Apps are GOOPS classes with a
+canary is a TUI library for Guile. Apps are GOOPS classes with a
 ~view~ method returning a node tree and an ~update~ method returning
 ~(cons next-self cmd)~. The engine reads input, decodes typed msgs,
 walks the tree, dispatches ~update~ through it, renders the result,
@@ -253,7 +253,7 @@ sequenceDiagram
    chain. For everything else: broadcast through every widget in
    the rendered tree. Each widget's ~update~ method dispatches on
    the msg class; non-matching widgets fall through to the global
-   catch-all in ~(gcell view)~ and return ~(cons self #f)~.
+   catch-all in ~(canary view)~ and return ~(cons self #f)~.
 6. *Cmd collection.* The cascade collects every returned cmd into
    a batch.
 7. *Cmd execution.* The cmd handler interprets each: spawn or
@@ -307,7 +307,7 @@ it without ever dispatching ~update~. Focus, ~<mount>~, and
 
 ** Catch-all
 
-~(gcell view)~ defines a global ~(update self msg)~ catch-all
+~(canary view)~ defines a global ~(update self msg)~ catch-all
 that returns ~(cons self #f)~. Users specialise ~update~ on the
 msg classes they care about; everything else silently no-ops. No
 per-class boilerplate.
@@ -392,7 +392,7 @@ into the same cell record.
 :CUSTOM_ID: terminal-emulator-parse-path
 :END:
 
-The same ~<term>~ record gcell writes into is what gcell's own
+The same ~<term>~ record canary writes into is what canary's own
 emulator parses ANSI bytes into. Both doors land in the same
 cell grid.
 
@@ -440,25 +440,25 @@ graph LR
 
 ** Module map
 
-The emulator lives under ~gcell/term/~ and re-exports as ~(gcell
+The emulator lives under ~canary/term/~ and re-exports as ~(canary
 term)~:
 
 | submodule              | purpose                                      |
 |------------------------+----------------------------------------------|
-| ~gcell/term/types~    | ~<term>~, ~<face-attrs>~, ~<cell>~          |
-| ~gcell/term/utf8~     | UTF-8 byte to codepoint decoding             |
-| ~gcell/term/parser~   | CSI / OSC / DCS / ESC state machine          |
-| ~gcell/term/action~   | Parser exit actions; emit op records          |
-| ~gcell/term/ops~      | Op records: ~<op-print>~, ~<op-set-mode>~ etc. |
-| ~gcell/term/dispatch~ | Op -> ~<term>~ mutations                      |
-| ~gcell/term/sgr~      | SGR parameter -> ~<face-attrs>~ update        |
-| ~gcell/term/modes~    | 38-entry mode table (DECSET / DECRST)         |
-| ~gcell/term/write~    | Direct cell write helpers (used by replay)    |
-| ~gcell/term/render~   | ~term-diff->ansi~ output emitter              |
-| ~gcell/term/selection~| Selection rectangles, copy mode helpers       |
-| ~gcell/term/snapshot~ | Golden-file snapshot helpers for tests        |
-| ~gcell/term/base64~   | OSC 52 clipboard payload encoding             |
-| ~gcell/term/color~    | Colour formats: indexed, RGB, name resolution |
+| ~canary/term/types~    | ~<term>~, ~<face-attrs>~, ~<cell>~          |
+| ~canary/term/utf8~     | UTF-8 byte to codepoint decoding             |
+| ~canary/term/parser~   | CSI / OSC / DCS / ESC state machine          |
+| ~canary/term/action~   | Parser exit actions; emit op records          |
+| ~canary/term/ops~      | Op records: ~<op-print>~, ~<op-set-mode>~ etc. |
+| ~canary/term/dispatch~ | Op -> ~<term>~ mutations                      |
+| ~canary/term/sgr~      | SGR parameter -> ~<face-attrs>~ update        |
+| ~canary/term/modes~    | 38-entry mode table (DECSET / DECRST)         |
+| ~canary/term/write~    | Direct cell write helpers (used by replay)    |
+| ~canary/term/render~   | ~term-diff->ansi~ output emitter              |
+| ~canary/term/selection~| Selection rectangles, copy mode helpers       |
+| ~canary/term/snapshot~ | Golden-file snapshot helpers for tests        |
+| ~canary/term/base64~   | OSC 52 clipboard payload encoding             |
+| ~canary/term/color~    | Colour formats: indexed, RGB, name resolution |
 
 ** Op records as dispatch targets
 
@@ -551,7 +551,7 @@ referenced names.
 
 ** Why no per-app default background
 
-Most TUI surfaces want to draw their own background. gcell
+Most TUI surfaces want to draw their own background. canary
 leaves cells with no explicit ~#:bg~ at the terminal default
 (SGR 49) so a host terminal's background shows through. Apps that
 want a solid background use ~fill~ at the root of their view.
@@ -678,7 +678,7 @@ the common case; users almost never call ~cancel~ explicitly.
 :CUSTOM_ID: live-coding-via-repl
 :END:
 
-This is gcell's counterpart to TUIOS's SSH section: how
+This is canary's counterpart to TUIOS's SSH section: how
 external clients reach a running instance.
 
 #+begin_src mermaid
@@ -689,7 +689,7 @@ graph TB
         E3[any nrepl-like tool]
     end
 
-    subgraph "Running gcell app"
+    subgraph "Running canary app"
         REPL["Guile TCP REPL :37147"]
         IMG[Live image: classes, methods, vars]
         ENG[Running engine]
@@ -763,39 +763,39 @@ shape:
 
 | module                          | file                              | purpose                                                       |
 |---------------------------------+-----------------------------------+---------------------------------------------------------------|
-| ~(gcell)~                      | ~gcell.scm~                      | umbrella re-export module; the only import most apps need     |
-| ~(gcell engine)~               | ~gcell/engine.scm~               | event loop, msg dispatch, cmd execution, subscriptions        |
-| ~(gcell engine-types)~         | ~gcell/engine-types.scm~         | ~<engine>~ record, accessor / setter pairs                    |
-| ~(gcell widget)~               | ~gcell/widget.scm~               | ~<focusable>~ base class, ~widget-id~, ~update-slots~         |
-| ~(gcell protocol)~             | ~gcell/protocol.scm~             | msg classes, cmd ctors, batch / sequence / focus / cancel     |
-| ~(gcell view)~                 | ~gcell/view.scm~                 | ~view~ + ~update~ generics, global catch-all, cascade walker  |
-| ~(gcell layout)~               | ~gcell/layout.scm~               | layout records: vbox, hbox, pad, align, flex, wrap, pin, ...  |
-| ~(gcell borders)~              | ~gcell/borders.scm~              | ~<border>~ + ascii / normal / rounded / thick / double        |
-| ~(gcell draw)~                 | ~gcell/draw.scm~                 | low-level draw cmd records                                    |
-| ~(gcell render)~               | ~gcell/render.scm~               | tree -> draw cmds, view->cmds, wrap-paragraph                 |
-| ~(gcell faces)~                | ~gcell/faces.scm~                | ~<face-attrs>~, style flag handling                           |
-| ~(gcell theme)~                | ~gcell/theme.scm~                | palettes, theme-set!, cycle-palette, default-theme            |
-| ~(gcell key)~                  | ~gcell/key.scm~                  | ~<key>~ record, modifier canonicalisation                     |
-| ~(gcell keymap)~               | ~gcell/keymap.scm~               | global keymap, chord state                                    |
-| ~(gcell keymap-input)~         | ~gcell/keymap-input.scm~         | scoped keymap node, dispatch stack walk                       |
-| ~(gcell input)~                | ~gcell/input.scm~                | raw byte to msg decoder; CSI u, paste, mouse, focus reports   |
-| ~(gcell backend)~              | ~gcell/backend.scm~              | backend generic interface                                     |
-| ~(gcell backend-ansi)~         | ~gcell/backend-ansi.scm~         | ANSI backend; tty init / shutdown, ~cur-term~ / ~prev-term~   |
-| ~(gcell backend-test)~         | ~gcell/backend-test.scm~         | headless backend for tests                                    |
-| ~(gcell terminal)~             | ~gcell/terminal.scm~             | tty open, raw mode, restore                                   |
-| ~(gcell image)~                | ~gcell/image.scm~                | image registry for kitty-graphics                             |
-| ~(gcell spring)~               | ~gcell/spring.scm~               | damped harmonic oscillator for animation                      |
-| ~(gcell width)~                | ~gcell/width.scm~                | wcwidth-aware char / string column width                      |
-| ~(gcell term)~                 | ~gcell/term.scm~                 | umbrella for the emulator submodules                          |
-| ~(gcell term *)~               | ~gcell/term/*.scm~               | parser, dispatch, ops, modes, SGR, render, snapshot           |
-| ~(gcell components button)~    | ~gcell/components/button.scm~    | ~<button>~ widget                                             |
-| ~(gcell components panel)~     | ~gcell/components/panel.scm~     | ~<panel>~ widget: title, border, footer, content              |
-| ~(gcell components textinput)~ | ~gcell/components/textinput.scm~ | ~<textinput>~ widget: single-line input with cursor           |
-| ~(gcell components spinner)~   | ~gcell/components/spinner.scm~   | ~<spinner>~ widget with self-installed ticker                 |
-| ~(gcell components progress)~  | ~gcell/components/progress.scm~  | ~<progress>~ bar widget                                       |
-| ~(gcell components paginator)~ | ~gcell/components/paginator.scm~ | ~<paginator>~ page indicator                                  |
-| ~(gcell components viewport)~  | ~gcell/components/viewport.scm~  | ~<viewport>~ scrollable list with tail-mode                   |
-| ~(gcell components menu)~      | ~gcell/components/menu.scm~      | ~<menu>~ widget: focus, hotkeys, on-click rows                |
+| ~(canary)~                      | ~canary.scm~                      | umbrella re-export module; the only import most apps need     |
+| ~(canary engine)~               | ~canary/engine.scm~               | event loop, msg dispatch, cmd execution, subscriptions        |
+| ~(canary engine-types)~         | ~canary/engine-types.scm~         | ~<engine>~ record, accessor / setter pairs                    |
+| ~(canary widget)~               | ~canary/widget.scm~               | ~<focusable>~ base class, ~widget-id~, ~update-slots~         |
+| ~(canary protocol)~             | ~canary/protocol.scm~             | msg classes, cmd ctors, batch / sequence / focus / cancel     |
+| ~(canary view)~                 | ~canary/view.scm~                 | ~view~ + ~update~ generics, global catch-all, cascade walker  |
+| ~(canary layout)~               | ~canary/layout.scm~               | layout records: vbox, hbox, pad, align, flex, wrap, pin, ...  |
+| ~(canary borders)~              | ~canary/borders.scm~              | ~<border>~ + ascii / normal / rounded / thick / double        |
+| ~(canary draw)~                 | ~canary/draw.scm~                 | low-level draw cmd records                                    |
+| ~(canary render)~               | ~canary/render.scm~               | tree -> draw cmds, view->cmds, wrap-paragraph                 |
+| ~(canary faces)~                | ~canary/faces.scm~                | ~<face-attrs>~, style flag handling                           |
+| ~(canary theme)~                | ~canary/theme.scm~                | palettes, theme-set!, cycle-palette, default-theme            |
+| ~(canary key)~                  | ~canary/key.scm~                  | ~<key>~ record, modifier canonicalisation                     |
+| ~(canary keymap)~               | ~canary/keymap.scm~               | global keymap, chord state                                    |
+| ~(canary keymap-input)~         | ~canary/keymap-input.scm~         | scoped keymap node, dispatch stack walk                       |
+| ~(canary input)~                | ~canary/input.scm~                | raw byte to msg decoder; CSI u, paste, mouse, focus reports   |
+| ~(canary backend)~              | ~canary/backend.scm~              | backend generic interface                                     |
+| ~(canary backend-ansi)~         | ~canary/backend-ansi.scm~         | ANSI backend; tty init / shutdown, ~cur-term~ / ~prev-term~   |
+| ~(canary backend-test)~         | ~canary/backend-test.scm~         | headless backend for tests                                    |
+| ~(canary terminal)~             | ~canary/terminal.scm~             | tty open, raw mode, restore                                   |
+| ~(canary image)~                | ~canary/image.scm~                | image registry for kitty-graphics                             |
+| ~(canary spring)~               | ~canary/spring.scm~               | damped harmonic oscillator for animation                      |
+| ~(canary width)~                | ~canary/width.scm~                | wcwidth-aware char / string column width                      |
+| ~(canary term)~                 | ~canary/term.scm~                 | umbrella for the emulator submodules                          |
+| ~(canary term *)~               | ~canary/term/*.scm~               | parser, dispatch, ops, modes, SGR, render, snapshot           |
+| ~(canary components button)~    | ~canary/components/button.scm~    | ~<button>~ widget                                             |
+| ~(canary components panel)~     | ~canary/components/panel.scm~     | ~<panel>~ widget: title, border, footer, content              |
+| ~(canary components textinput)~ | ~canary/components/textinput.scm~ | ~<textinput>~ widget: single-line input with cursor           |
+| ~(canary components spinner)~   | ~canary/components/spinner.scm~   | ~<spinner>~ widget with self-installed ticker                 |
+| ~(canary components progress)~  | ~canary/components/progress.scm~  | ~<progress>~ bar widget                                       |
+| ~(canary components paginator)~ | ~canary/components/paginator.scm~ | ~<paginator>~ page indicator                                  |
+| ~(canary components viewport)~  | ~canary/components/viewport.scm~  | ~<viewport>~ scrollable list with tail-mode                   |
+| ~(canary components menu)~      | ~canary/components/menu.scm~      | ~<menu>~ widget: focus, hotkeys, on-click rows                |
 
 ** Naming conventions
 
@@ -836,8 +836,8 @@ when the host does not speak the protocol.
 
 - =DESIGN.md= : authoring reference: msgs, cmds, layout, theme,
   focus, anti-patterns
-- =gcell/= : module sources; small enough to read directly
-- =gcell/components/= : worked examples of widgets that
+- =canary/= : module sources; small enough to read directly
+- =canary/components/= : worked examples of widgets that
   participate in the cascade
 - =examples/= : counter, chat, dired-lite
 - =tests/= : snapshot and dispatch tests against the same

@@ -1,9 +1,9 @@
-;;; counter.scm — hello-world for gcell.
+;;; counter.scm — hello-world for canary.
 ;;;
-;;; Run: guile -L /path/to/guile-gcell examples/counter.scm
+;;; Run: guile -L /path/to/guile-canary examples/counter.scm
 ;;; Keys: + or k — increment; - or j — decrement; r — reset; q — quit.
 
-(use-modules (gcell) (oop goops))
+(use-modules (canary) (oop goops))
 
 (define-class <counter> (<focusable>)
   (n #:init-keyword #:n

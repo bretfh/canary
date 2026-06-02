@@ -1,9 +1,9 @@
 (add-to-load-path (string-append (dirname (current-filename)) "/.."))
 
 (use-modules (srfi srfi-64)
-             (gcell input)
-             (gcell protocol)
-             (gcell key))
+             (canary input)
+             (canary protocol)
+             (canary key))
 
 (test-begin "input")
 

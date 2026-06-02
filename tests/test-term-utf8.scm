@@ -3,10 +3,10 @@
 (use-modules (srfi srfi-64)
              (srfi srfi-13)
              (rnrs bytevectors)
-             ((gcell term types) #:prefix t:)
-             ((gcell term parser) #:prefix t:)
-             ((gcell term render) #:prefix t:)
-             ((gcell term utf8) #:prefix u:))
+             ((canary term types) #:prefix t:)
+             ((canary term parser) #:prefix t:)
+             ((canary term render) #:prefix t:)
+             ((canary term utf8) #:prefix u:))
 
 (define replacement (string (integer->char #xFFFD)))
 

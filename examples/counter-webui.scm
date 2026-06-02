@@ -1,14 +1,14 @@
 ;;; counter-webui.scm
 ;;;
 ;;; Same widget as counter.scm, but uses the webui backend so the
-;;; gcell cell grid renders into a browser window via WebGL.
+;;; canary cell grid renders into a browser window via WebGL.
 ;;;
-;;; Run: LD_LIBRARY_PATH=/path/to/libwebui guile -L /path/to/gcell \
+;;; Run: LD_LIBRARY_PATH=/path/to/libwebui guile -L /path/to/canary \
 ;;;        -L /path/to/guile-webui examples/counter-webui.scm
 ;;; Keys: + or k -- increment; - or j -- decrement; r -- reset; q -- quit.
 
-(use-modules (gcell)
-             (gcell backend-webui)
+(use-modules (canary)
+             (canary backend-webui)
              (oop goops))
 
 (define-class <counter> (<focusable>)

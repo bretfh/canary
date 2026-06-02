@@ -2,12 +2,12 @@
 
 (use-modules (srfi srfi-64)
              (rnrs bytevectors)
-             (gcell)
-             (gcell view)
-             (gcell draw)
-             (gcell render)
-             (gcell backend)
-             (gcell backend-test))
+             (canary)
+             (canary view)
+             (canary draw)
+             (canary render)
+             (canary backend)
+             (canary backend-test))
 
 (test-begin "image")
 

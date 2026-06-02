@@ -2,11 +2,11 @@
 
 (use-modules (srfi srfi-64)
              (fibers channels)
-             (gcell engine)
-             (gcell engine-types)
-             (gcell backend-ansi)
-             (gcell protocol)
-             (gcell layout)
+             (canary engine)
+             (canary engine-types)
+             (canary backend-ansi)
+             (canary protocol)
+             (canary layout)
              (oop goops))
 
 (test-begin "resize-debounce")
