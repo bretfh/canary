@@ -43,7 +43,14 @@
           (delete 'configure)
           (replace 'build
             (lambda* (#:key make-flags #:allow-other-keys)
-              (apply invoke "make" "-f" "GNUmakefile" "release" make-flags)))
+              ;; Ship the debug build.  Release (-O2) has a race that
+              ;; makes webui_show_wv silently return false on Linux GTK
+              ;; webview; the debug build (-g, no -O, -DWEBUI_LOG) has
+              ;; enough printf serialisation that the wv thread reliably
+              ;; flips is_webview_mode inside the 2.5s window.  The
+              ;; size penalty (~200KB) is irrelevant for a local-only
+              ;; UI bridge.
+              (apply invoke "make" "-f" "GNUmakefile" "debug" make-flags)))
           (replace 'install
             (lambda* (#:key outputs #:allow-other-keys)
               (let* ((out     (assoc-ref outputs "out"))
@@ -51,8 +58,8 @@
                      (include (string-append out "/include")))
                 (mkdir-p lib)
                 (mkdir-p include)
-                (install-file "dist/libwebui-2.so" lib)
-                (install-file "dist/libwebui-2-static.a" lib)
+                (install-file "dist/debug/libwebui-2.so" lib)
+                (install-file "dist/debug/libwebui-2-static.a" lib)
                 (install-file "include/webui.h" include)))))))
     (home-page "https://webui.me")
     (synopsis "Local HTTP+WebSocket server with browser-as-GUI bridge")

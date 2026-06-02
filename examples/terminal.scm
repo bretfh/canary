@@ -28,7 +28,8 @@
               #:select (make-term term-resize!
                         term-chars term-faces term-width term-height
                         term-cursor-x term-cursor-y))
-             ((gcell term parser) #:select (term-process-output!))
+             ((gcell term parser) #:select (term-process-bytes!))
+             ((gcell term utf8)   #:select (make-utf8-decoder))
              ((gcell protocol) #:select (size))
              (oop goops)
              (ice-9 match)
@@ -295,38 +296,27 @@ survives transient errors so a single failed ioctl can't kill it."
   (bytes #:init-keyword #:bytes #:getter pty-data-bytes))
 
 (define-method (update (e <pty-emulator>) (msg <pty-data>))
-  ;; Reader thread already term-write!'d the bytes AND already kicked
-  ;; the engine via force-render!.  This method exists only to satisfy
-  ;; widget-handles? so the cascade doesn't no-op the msg.
   (cons e #f))
 
 (define (spawn-reader! e eng)
   (call-with-new-thread
    (lambda ()
-     (let ((fd  (pty-fd e))
-           (t   (pty-term e))
-           (buf (make-bytevector 4096 0)))
+     (let ((fd      (pty-fd e))
+           (t       (pty-term e))
+           (buf     (make-bytevector 4096 0))
+           (decoder (make-utf8-decoder)))
        (let loop ()
          (let ((n (%read fd (bytevector->pointer buf) 4096)))
            (cond
             ((<= n 0)
-             ;; Child exited or read error; ask the engine to stop.
              (send eng 'quit))
             (else
-             (let ((chunk (make-bytevector n 0)))
-               (bytevector-copy! buf 0 chunk 0 n)
-               (catch #t
-                 (lambda ()
-                   ;; term-process-output! runs the full state-machine
-                   ;; (ground / ESC / CSI / OSC / DCS) so SGR colors,
-                   ;; cursor moves, mode toggles, title sets, etc.
-                   ;; actually take effect.  term-write! alone would
-                   ;; print the raw escape bytes as literal chars.
-                   (term-process-output! t (utf8->string chunk)))
-                 (lambda _ #f)))
-             ;; Drive the engine from the eng we were handed, not via
-             ;; pty-engine on the widget -- removes the possibility of
-             ;; the slot being #f at the moment the first chunk lands.
+             ;; Decoder carries partial multi-byte codepoints across
+             ;; read(2) boundaries; invalid bytes surface as U+FFFD
+             ;; instead of dropping the chunk.  utf8->string would
+             ;; raise and the catch would silently lose the bytes,
+             ;; which is how bash's startup PS1 was disappearing.
+             (term-process-bytes! t decoder buf 0 n)
              (force-render! eng)
              (loop)))))))))
 

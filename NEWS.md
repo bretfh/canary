@@ -7,6 +7,47 @@ Changes are listed newest-first.  Format follows
 
 ### Added
 
+- **`(gcell backend-webui)` — WebGL2-via-webview rendering backend.**
+  An alternative to `(gcell backend-ansi)` that ships the cell grid to
+  a libwebui WebView (webkit2gtk on Linux) instead of stdout.  The
+  widget tree, render pipeline, and draw cmds are unchanged; this
+  backend only implements `init` / `shutdown` / `draw` / `size` and
+  encodes each rendered frame as a compact binary blob over the
+  embedded WebSocket.  A small WebGL2 client at
+  `gcell/backend-webui/client/gcell.js` paints cells onto a canvas
+  and forwards keyboard / mouse / resize events back as JSON.
+
+  Boot is tuned to hide the lull between webview creation and first
+  paint:
+
+  - `backend-init` runs `render-frame` once and `client-html` inlines
+    the encoded frame as a base64 JS variable; `gcell.js` decodes and
+    `applyFrame()`s it on first module-eval — no WebSocket round
+    trip on first paint.
+  - `buildAllGl` compiles only the cell-grid shader synchronously.
+    The cursor and image programs link inside a double
+    `requestAnimationFrame` after the first paint commits.
+  - Glyph atlas rasterisation is lazy.  Only space and `?` are
+    rasterised eagerly (for the atlas-overflow fallback); every other
+    codepoint is rasterised the first time `applyFrame` references
+    it, then `syncAtlas` uploads.
+
+  Use as a drop-in `<backend>`:
+
+  ```scheme
+  (use-modules (gcell)
+               (gcell backend-webui))
+  (run-app (make <counter>) #:backend (webui-backend))
+  ```
+
+  Linux only this release.  Requires `gtk+` and `webkitgtk-for-gtk3`
+  in the Guix manifest; `backend-init` pre-dlopens them by absolute
+  path from `LIBRARY_PATH` so libwebui's internal SONAME lookup
+  succeeds without `LD_LIBRARY_PATH` set.  The bundled `webui` guix
+  package builds the `make debug` target — the release `-O2` binary
+  has a race in `_webui_wv_show` that returns `false` even when GTK
+  and WebKit are present.
+
 - **`tools/build/` — `gcell-build`, the single-file static-binary
   build tool.**  Wraps a `guix shell` static toolchain (libguile-3.0
   + bdw-gc + libffi + gmp + libunistring + libltdl, all static, plus

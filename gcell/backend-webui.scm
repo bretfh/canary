@@ -26,8 +26,6 @@
   #:use-module ((ice-9 textual-ports) #:select (get-string-all))
   #:use-module ((ice-9 ports) #:select (call-with-input-file))
   #:use-module ((ice-9 threads) #:select (call-with-new-thread join-thread))
-  #:use-module ((ice-9 popen) #:select (open-input-pipe close-pipe))
-  #:use-module ((srfi srfi-13) #:select (string-contains))
   #:use-module (ice-9 match)
   #:use-module ((ice-9 format) #:select (format))
   #:export (<webui-backend>
@@ -41,24 +39,45 @@
 
 ;;; Commentary:
 ;;;
-;;; A gcell backend that ships its cell grid to a web browser instead
-;;; of a terminal.  webui's C library handles the HTTP+WebSocket
-;;; server and launches the user's browser in app mode; this backend
-;;; encodes each rendered frame as a compact binary blob and pushes it
-;;; over the socket, where a small WebGL2 client paints it onto a
+;;; A gcell backend that ships its cell grid to a libwebui WebView
+;;; (webkit2gtk on Linux) instead of a terminal.  webui's C library
+;;; handles the embedded HTTP+WebSocket server, embeds the webkit
+;;; widget in-process, and points it at the local URL; this backend
+;;; encodes each rendered frame as a compact binary blob and pushes
+;;; it over the socket, where a small WebGL2 client paints it onto a
 ;;; canvas.
 ;;;
 ;;; The widget tree, layout, render pipeline, draw cmds, and diff are
 ;;; unchanged from the ANSI path: this backend implements only the
 ;;; backend protocol (init / shutdown / draw / size).  The cell grid
 ;;; (`<term>` from `gcell/term/types.scm`) is the wire-shaped
-;;; abstraction.  Browser-side never sees widgets; it only paints
+;;; abstraction.  Webview side never sees widgets; it only paints
 ;;; cells.
 ;;;
-;;; Input flows the other way: the browser sends JSON events ({"type":
+;;; First paint avoids the WebSocket round trip: backend-init runs
+;;; render-frame once and `client-html` inlines the encoded frame as a
+;;; base64 JS variable that gcell.js applyFrame()s the moment the
+;;; module starts executing.
+;;;
+;;; Input flows the other way: the webview sends JSON events ({"type":
 ;;; "key"|"mouse"|"resize",...}) through a webui-bind callback, which
 ;;; this module translates into gcell's protocol message types and
 ;;; delivers to the engine.
+;;;
+;;; Threading: libwebui's GTK webview requires that webui_show_wv and
+;;; webui_wait both run on the same POSIX thread (it creates the
+;;; GtkWindow + WebKitWebView in the calling thread and gtk_main has
+;;; to be in that same thread).  backend-init spawns a dedicated
+;;; thread that does both and then returns so the engine fibers can
+;;; boot.
+;;;
+;;; LD_LIBRARY_PATH: `guix shell -m manifest.scm` sets LIBRARY_PATH
+;;; but leaves LD_LIBRARY_PATH empty, so libwebui's internal
+;;; dlopen("libgtk-3.so.0", RTLD_LAZY) returns NULL and the webview
+;;; show silently no-ops.  %preload-webview-libs! walks LIBRARY_PATH
+;;; and dynamic-links libgtk and libwebkit2gtk by absolute path before
+;;; webui touches them, so the SONAME lookup later finds the cached
+;;; handle.
 ;;;
 ;;; Code:
 
@@ -162,13 +181,7 @@
   (webui-backend-size-slot b))
 
 (define (apply-resize! b w h)
-  "Atomic resize on B: bring the size slot, the cur-term, and the
-delta cache into agreement at WxH.  Caller is responsible for
-ordering this before any subsequent BACKEND-DRAW so the frame goes
-out at the new dims.  The three writes are not protected by a
-mutex; callers are in the engine event-loop fiber and the only
-foreign-thread writers are webui callbacks which only enqueue
-msgs.  Single owner of these three slots."
+  "Bring B's size slot, cur-term, and delta cache into agreement at WxH."
   (set! (webui-backend-size-slot b) (size w h))
   (set! (webui-backend-cells-cache b) #f)
   (let ((term (webui-backend-cur-term b)))
@@ -314,154 +327,38 @@ msgs.  Single owner of these three slots."
 (define %css-cell-h 20)
 
 
-;;;
-;;; Firefox profile prefs.
-;;;
-;;; webui's _webui_browser_create_new_profile (webui.c:6010-6219) writes
-;;; its own prefs.js into $HOME/.WebUI/WebUIFirefoxProfile-NoHC the first
-;;; time the profile is created -- including `browser.tabs.inTitlebar=0`,
-;;; which on sway hides the titlebar and causes the inner viewport
-;;; height to oscillate as the window is moved between tiles.
-;;;
-;;; We pre-create the profile ourselves with our own prefs to skip
-;;; webui's create-profile branch.  Both the profile folder AND a
-;;; profiles.ini entry exist after we run, so webui.c:6147 short-
-;;; circuits and our prefs.js stays untouched.
-;;;
-;;; We deliberately do NOT pin `layout.css.devPixelsPerPx` or
-;;; `widget.wayland.fractional-scale.enabled`.  Letting Firefox
-;;; negotiate the real compositor scale gives the browser a buffer at
-;;; the same scale as the output, so cells render at constant
-;;; physical-pixel size regardless of which sway tile the window is in.
-;;; Forcing 1x defeats Firefox's scale negotiation and lets sway
-;;; linearly rescale the buffer to fit the tile, which makes cells
-;;; visibly grow and shrink with window size.
-
-(define %gcell-firefox-profile-name "WebUIFirefoxProfile-NoHC")
-
-(define (%webui-firefox-profile-path)
-  "Return the Firefox profile path webui will use for this app on Linux.
-Mirrors webui.c:6113-6133 for the non-snap case."
-  (let ((home (or (getenv "HOME") "/tmp")))
-    (string-append home "/.WebUI/" %gcell-firefox-profile-name)))
-
-(define (%firefox-profiles-ini-path)
-  "Return the path to Firefox's profiles.ini.  webui consults this to
-decide whether the profile already exists (webui.c:6103-6108)."
-  (let ((home (or (getenv "HOME") "/tmp")))
-    (let ((std  (string-append home "/.mozilla/firefox/profiles.ini"))
-          (snap (string-append home
-                               "/snap/firefox/common/.mozilla/firefox/profiles.ini")))
+(define (%search-library-path basename)
+  "Look up BASENAME (e.g. \"libgtk-3.so.0\") on $LIBRARY_PATH and
+return its absolute path or #f.  guix shell -m manifest.scm sets
+LIBRARY_PATH but not LD_LIBRARY_PATH, so dlopen-by-SONAME fails for
+libs that ride the manifest profile — that's why libwebui's
+_webui_load_gtk_and_webkit() can't find libgtk-3.so.0."
+  (let* ((env  (or (getenv "LIBRARY_PATH") ""))
+         (dirs (string-split env #\:)))
+    (let loop ((rest dirs))
       (cond
-       ((file-exists? std)  std)
-       ((file-exists? snap) snap)
-       (else std)))))
-
-(define (%profiles-ini-has? ini name)
-  "Return #t when NAME is registered as a profile in INI."
-  (and (file-exists? ini)
-       (let ((text (call-with-input-file ini get-string-all)))
-         (string-contains text (string-append "Name=" name)))))
-
-(define (%mkdir-p dir)
-  "mkdir -p DIR; tolerates already-existing intermediate dirs."
-  (let loop ((parts (filter (lambda (s) (positive? (string-length s)))
-                             (string-split dir #\/)))
-             (acc "/"))
-    (cond
-     ((null? parts) #t)
-     (else
-      (let ((next (string-append acc (car parts))))
-        (unless (file-exists? next)
-          (false-if-exception (mkdir next)))
-        (loop (cdr parts) (string-append next "/")))))))
-
-(define (%write-file! path text)
-  "Overwrite PATH with TEXT."
-  (let ((p (open-output-file path)))
-    (display text p)
-    (close-port p)))
-
-(define %gcell-firefox-prefs
-  ;; Force the system titlebar so the inner viewport stops oscillating
-  ;; when sway shows/hides CSD.  Keep the webui defaults we still want:
-  ;; legacy stylesheets enabled (so userChrome.css loads), skip default-
-  ;; browser nag, don't warn on close.  Last-write-wins inside prefs.js,
-  ;; so listing inTitlebar=1 after webui would have written =0 makes
-  ;; ours stick.
-  ;;
-  ;; widget.wayland.fractional-scale.enabled=true tells Firefox to
-  ;; negotiate the wp_fractional_scale_v1 protocol with sway, so
-  ;; Firefox renders its buffer at the EXACT per-window scale the
-  ;; compositor wants instead of rendering at 1x and letting sway
-  ;; linearly rescale the buffer to fit the on-screen tile.  Without
-  ;; this, every browser drag goes through a transient where sway
-  ;; bilinearly stretches a stale 1x buffer to the new tile dims and
-  ;; the canvas cells visibly grow or shrink even though the JS-side
-  ;; backing/style numbers all agree.  The default in modern Firefox
-  ;; is already true, but we set it explicitly so our profile is not
-  ;; subject to per-version drift.
-  (string-append
-   "user_pref(\"toolkit.legacyUserProfileCustomizations.stylesheets\", true);\n"
-   "user_pref(\"browser.shell.checkDefaultBrowser\", false);\n"
-   "user_pref(\"browser.tabs.warnOnClose\", false);\n"
-   "user_pref(\"browser.tabs.inTitlebar\", 1);\n"
-   "user_pref(\"widget.wayland.fractional-scale.enabled\", true);\n"))
-
-(define %gcell-firefox-user-chrome
-  ;; Same chrome-collapse rules webui ships at webui.c:6210-6215.  We
-  ;; reproduce them because we're pre-creating the profile ourselves;
-  ;; webui's create-profile branch will short-circuit on a populated
-  ;; profile and never get a chance to write its own userChrome.css.
-  (string-append
-   "#navigator-toolbox,#TabsToolbar,#nav-bar,#PersonalToolbar,#sidebar-box"
-   "{visibility:collapse!important;height:0!important;margin:0!important;"
-   "padding:0!important;}"
-   "#titlebar{visibility:visible!important;display:flex!important;}"
-   "#browser{margin-top:0!important;padding-top:0!important;}"))
-
-(define (%firefox-create-profile! name path)
-  "Invoke `firefox -CreateProfile NAME PATH` synchronously so Firefox
-registers the profile in profiles.ini.  Returns #t on success."
-  (let* ((cmd  (string-append
-                "firefox -CreateProfile \"" name " " path "\""
-                " >/dev/null 2>&1"))
-         (port (open-input-pipe cmd)))
-    (close-pipe port)
-    ;; Wait briefly for the profile dir to materialise.  Firefox's
-    ;; CreateProfile is normally instant but Wayland session start can
-    ;; add latency.
-    (let loop ((tries 20))
-      (cond
-       ((file-exists? path) #t)
-       ((zero? tries) #f)
+       ((null? rest) #f)
        (else
-        (usleep 100000)
-        (loop (- tries 1)))))))
+        (let ((cand (string-append (car rest) "/" basename)))
+          (cond
+           ((file-exists? cand) cand)
+           (else (loop (cdr rest))))))))))
 
-(define (%ensure-gcell-firefox-prefs!)
-  "Pre-create the Firefox profile webui will use, with prefs that lock
-font rendering against Wayland fractional-scale drift.  Idempotent on
-subsequent runs: re-writes prefs.js + userChrome.css every time so
-edits to the constants above take effect on the next gcell launch
-without the user having to delete the profile dir."
-  (let* ((path (%webui-firefox-profile-path))
-         (ini  (%firefox-profiles-ini-path))
-         (name %gcell-firefox-profile-name))
-    ;; Ensure profile is registered in profiles.ini.  Without this entry
-    ;; webui's _webui_browser_create_new_profile takes the slow path
-    ;; (delete + firefox -CreateProfile + write its own prefs), which
-    ;; would clobber ours.
-    (unless (%profiles-ini-has? ini name)
-      (%firefox-create-profile! name path))
-    (when (file-exists? path)
-      (let ((prefs (string-append path "/prefs.js"))
-            (chrome-dir (string-append path "/chrome")))
-        (%write-file! prefs %gcell-firefox-prefs)
-        (unless (file-exists? chrome-dir)
-          (false-if-exception (mkdir chrome-dir)))
-        (%write-file! (string-append chrome-dir "/userChrome.css")
-                      %gcell-firefox-user-chrome)))))
+(define (%preload-webview-libs!)
+  "dlopen libgtk-3 and libwebkit2gtk-4.1 with their full guix-profile
+paths.  Once loaded, libwebui's `dlopen(\"libgtk-3.so.0\", RTLD_LAZY)`
+inside _webui_load_gtk_and_webkit() returns the cached handle instead
+of searching the (empty) LD_LIBRARY_PATH.  Without this the webview
+path silently no-ops with `GTK load failed` in the libwebui debug log."
+  (for-each
+   (lambda (name)
+     (let ((p (%search-library-path name)))
+       (when p
+         (false-if-exception
+          (dynamic-link p)))))
+   '("libgtk-3.so.0"
+     "libwebkit2gtk-4.1.so.0"
+     "libwebkit2gtk-4.0.so.37")))
 
 (define-method (backend-init (b <webui-backend>))
   (let* ((sz   (webui-backend-size-slot b))
@@ -470,6 +367,10 @@ without the user having to delete the profile dir."
                             #:height (size-height sz))))
     (set! (webui-backend-window   b) w)
     (set! (webui-backend-cur-term b) term)
+    ;; Pre-load GTK + WebKit2GTK so libwebui's later dlopen-by-SONAME
+    ;; resolves them.  Required because `guix shell -m manifest.scm`
+    ;; sets LIBRARY_PATH but leaves LD_LIBRARY_PATH empty.
+    (%preload-webview-libs!)
     ;; Don't block backend-init waiting for the browser to connect;
     ;; let the engine fibers start, and serve the first frame as soon
     ;; as the connection lands.
@@ -486,23 +387,7 @@ without the user having to delete the profile dir."
     ;; on requests without the auth cookie, which makes the demo
     ;; fragile against curl-based probes; disable it for the dev demo.
     (webui-set-config +webui-config-use-cookies+ #f)
-    ;; No webui-set-size: the browser-side recompute reports the live
-    ;; window dims on connection, which drives apply-resize! through
-    ;; the engine.  Pre-seeding a server-picked window size only causes
-    ;; a brief two-step transient where the WM places the window,
-    ;; libwebui resizes it, the browser fires resize, then we resize
-    ;; again on the JSON event.  Skip the dance.
-    ;; Chromium-class browsers need GPU process init for WebGL2 (the
-    ;; cell renderer aborts at `getContext('webgl2')` otherwise);
-    ;; webui's stock flag set suppresses it on fresh profiles.  No-op
-    ;; for Firefox.
-    (webui-set-chromium-defaults w)
-    ;; Pre-seed the Firefox profile with locked prefs BEFORE webui-show.
-    ;; Once both the profile dir and the profiles.ini entry exist, webui
-    ;; skips its own profile-creation branch (webui.c:6147) and our
-    ;; prefs survive every subsequent launch.
-    (%ensure-gcell-firefox-prefs!)
-    ;; The browser sends every key/mouse/resize event through this one
+    ;; The webview sends every key/mouse/resize event through this one
     ;; bind, tagged by type in the JSON payload.  webui invokes the
     ;; callback from a CIVETweb worker thread; guile-webui's bounce
     ;; shim wraps the dispatch in scm_with_guile so the foreign thread
@@ -510,29 +395,36 @@ without the user having to delete the profile dir."
     (webui-bind w %input-bind-id
                 (lambda (event)
                   (dispatch-browser-event! b event)))
-    ;; Empty element id catches every event the bind protocol surfaces,
-    ;; including WEBUI_EVENT_CONNECTED / DISCONNECTED.  Without this we
-    ;; only see calls from webui.call('input', ...), which means the
-    ;; very first frame (sent from backend-draw before the browser's
-    ;; WebSocket comes up) goes into the void and the pane never paints
-    ;; until the user manually generates a state change.
+    ;; Empty element id catches WEBUI_EVENT_CONNECTED / DISCONNECTED so
+    ;; we can drop the cells-cache and force a full re-render on every
+    ;; new connection (page reload, navigation, etc.).
     (webui-bind w ""
                 (lambda (event)
                   (handle-window-event! b event)))
-    (webui-show w (client-html))
-    ;; webui's worker threads need its main event loop running for
-    ;; HTTP and WS state to stay alive; without webui-wait the server
-    ;; tears down as soon as the first client connects.  Run it on a
-    ;; dedicated POSIX thread so the gcell engine's fibers scheduler
-    ;; keeps the main thread.
+    ;; Run render-frame once before the HTML response goes out.  The
+    ;; result rides along inline as window.__gcellInitialFrame so
+    ;; gcell.js paints on the very first module-eval — no WebSocket
+    ;; round-trip on first paint.
+    (%paint-initial-grid! b)
+    ;; libwebui's Linux GTK webview path requires that webui_show_wv
+    ;; AND webui_wait both run in the SAME POSIX thread (webui.c:
+    ;; 13434-13453 picks the calling thread when is_gtk_main_run is
+    ;; false; webui.c:3899-3913 then enters gtk_main() in webui_wait,
+    ;; and gtk_main has to be in the same thread that owns the widgets).
+    ;; Spawning a dedicated thread that does both lets backend-init
+    ;; return so the engine fibers can boot.
     (set! (webui-backend-wait-thread b)
           (call-with-new-thread
            (lambda ()
              (catch #t
-               (lambda () (webui-wait))
+               (lambda ()
+                 (webui-show-wv w (client-html b))
+                 (webui-wait))
                (lambda args
                  (format (current-error-port)
-                         "webui-wait thread error: ~s~%" args))))))
+                         "[gcell backend-webui] webview thread error: ~s~%"
+                         args)
+                 (force-output (current-error-port)))))))
     ;; Telemetry: dump a one-line stats snapshot every 2s to stderr AND
     ;; to engine-log! so it surfaces on the in-grid log overlay the user
     ;; is actually looking at while they use the app.  The stderr line
@@ -594,7 +486,7 @@ Use this after editing gcell/backend-webui/client/gcell.js (or any
 client asset) when you want the running session to pick up the new
 code instead of stopping and restarting the gcell process."
   (let ((w (webui-backend-window b)))
-    (when w (webui-show w (client-html)))))
+    (when w (webui-show-wv w (client-html b)))))
 
 (define-method (backend-shutdown (b <webui-backend>))
   (let ((w (webui-backend-window b)))
@@ -694,11 +586,6 @@ its render-frame just before invoking backend-draw."
          (t0   (%mono-ns))
          (placements (collect-image-placements b cmds))
          (clicks     (engine-click-rects b)))
-    ;; Invariant: apply-resize! brings term and size-slot into agreement
-    ;; before any backend-draw can run on them.  If they disagree here,
-    ;; that's a real bug somewhere -- log it loudly and continue with
-    ;; `term' as the truth (the frame header reads its dims, so the
-    ;; client will adapt to whatever we send).
     (unless (and (= (t:term-width  term) (size-width  sz))
                  (= (t:term-height term) (size-height sz)))
       (let ((eng (webui-backend-engine b)))
@@ -903,7 +790,6 @@ the cache."
     (bytevector-u16-set! bv 12 cy (endianness little))
     (bytevector-u8-set!  bv 14 style)
     (bytevector-u8-set!  bv 15 0)
-    (%reset-colour-sample!)
     ;; Cell section.
     (cond
      (do-delta?
@@ -997,27 +883,11 @@ the cache."
 (define %default-fg #xFFFFFFFF)
 (define %default-bg #xFFFFFFFF)
 
-;; One-shot per draw: log the first non-default colour we see, so we
-;; can confirm SGR is producing coloured faces and color->rgb is
-;; resolving them.  Reset by encode-frame each new frame.
-(define %colour-sample-logged? #f)
-(define (%reset-colour-sample!) (set! %colour-sample-logged? #f))
-(define (%log-colour-sample! slot raw resolved)
-  (unless %colour-sample-logged?
-    (set! %colour-sample-logged? #t)
-    (format (current-error-port)
-            "[face->rgb] slot=~a raw=~s resolved=~a~%"
-            slot raw (if resolved (number->string resolved 16) "default"))
-    (force-output (current-error-port))))
-
 (define (face-fg->rgb face)
   (cond
    ((not face) %default-fg)
-   (else
-    (let* ((raw (t:face-fg face))
-           (resolved (and raw (color->rgb raw))))
-      (when raw (%log-colour-sample! 'fg raw resolved))
-      (or resolved %default-fg)))))
+   (else (or (and (t:face-fg face) (color->rgb (t:face-fg face)))
+             %default-fg))))
 
 (define (face-bg->rgb face)
   (cond
@@ -1113,11 +983,6 @@ already fired before the WebSocket came up."
       (set! (webui-backend-cells-cache b) #f)
       (hash-clear! (webui-backend-image-ids b))
       (set! (webui-backend-next-image-id b) 1)
-      ;; Push a fresh frame now that the WS is up.  Anything backend-draw
-      ;; wrote into the void before the handshake is gone; the client
-      ;; needs the current term state to paint.  send-to-engine 'force-
-      ;; render asks the event-loop to run render-frame on the next
-      ;; cycle without going through the resize-debounce 10 ms delay.
       (when eng (send-to-engine eng 'force-render)))
      (else #f))))
 
@@ -1157,10 +1022,6 @@ bind, tagged type=\"log\", and gets surfaced via ENGINE-LOG!."
          ((string=? tag "log")
           (forward-log! eng json))
          ((string=? tag "ready")
-          ;; Client finished loading: GL programs built, canvas sized,
-          ;; gcellFrame wired up to applyFrame.  Any frame we sent
-          ;; before this point may have raced the WS handshake / module
-          ;; load.  Push a fresh one now from the live term state.
           (set! (webui-backend-cells-cache b) #f)
           (send-to-engine eng 'force-render))
          (else
@@ -1447,45 +1308,126 @@ suffixed `-ns'; cumulative + max + mean for each timing channel."
 ;;; HTML+JS bundle (served to the browser).
 ;;;
 
-(define (client-html)
+(define (%paint-initial-grid! b)
+  "Run the engine's render-frame once against B so (webui-backend-cur-term b)
+and (webui-backend-cells-cache b) hold the initial widget paint before
+the HTML response goes out.  Fibers aren't running yet but render-frame
+is pure-Scheme — it just reads the root, flattens to draw cmds, paints
+into the term grid, and runs encode-frame which seeds cells-cache.
+handle-window-event! clears cells-cache on WebSocket connect, so the
+first wire frame the server pushes is still a full encode."
+  (let ((eng (webui-backend-engine b)))
+    (when eng
+      (catch #t
+        (lambda ()
+          ((module-ref (resolve-module '(gcell engine)) 'render-frame) eng))
+        (lambda (key . args)
+          (format (current-error-port)
+                  "[gcell backend-webui] initial paint failed: ~s ~s~%"
+                  key args)
+          (force-output (current-error-port)))))))
+
+(define %base64-alphabet
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
+
+(define (%bv->base64 bv)
+  "Encode BV as a base64 ASCII string (RFC 4648, padded).  Used to
+inline the initial frame bytes into the served HTML so gcell.js can
+applyFrame() the moment its module finishes booting — no WebSocket
+round-trip on first paint."
+  (let* ((len  (bytevector-length bv))
+         (full (quotient len 3))
+         (rem  (- len (* 3 full)))
+         (olen (* 4 (quotient (+ len 2) 3)))
+         (out  (make-string olen #\=))
+         (A    %base64-alphabet))
+    (let loop ((i 0) (j 0))
+      (cond
+       ((< i full)
+        (let* ((p  (* i 3))
+               (b0 (bytevector-u8-ref bv p))
+               (b1 (bytevector-u8-ref bv (+ p 1)))
+               (b2 (bytevector-u8-ref bv (+ p 2))))
+          (string-set! out  j        (string-ref A (ash b0 -2)))
+          (string-set! out (+ j 1)   (string-ref A (logand #x3F
+                                                           (logior (ash b0 4)
+                                                                   (ash b1 -4)))))
+          (string-set! out (+ j 2)   (string-ref A (logand #x3F
+                                                           (logior (ash b1 2)
+                                                                   (ash b2 -6)))))
+          (string-set! out (+ j 3)   (string-ref A (logand #x3F b2)))
+          (loop (+ i 1) (+ j 4))))
+       ((= rem 1)
+        (let ((b0 (bytevector-u8-ref bv (* i 3))))
+          (string-set! out  j      (string-ref A (ash b0 -2)))
+          (string-set! out (+ j 1) (string-ref A (logand #x3F (ash b0 4))))
+          out))
+       ((= rem 2)
+        (let* ((p  (* i 3))
+               (b0 (bytevector-u8-ref bv p))
+               (b1 (bytevector-u8-ref bv (+ p 1))))
+          (string-set! out  j      (string-ref A (ash b0 -2)))
+          (string-set! out (+ j 1) (string-ref A (logand #x3F
+                                                         (logior (ash b0 4)
+                                                                 (ash b1 -4)))))
+          (string-set! out (+ j 2) (string-ref A (logand #x3F (ash b1 2))))
+          out))
+       (else out)))))
+
+(define (%initial-frame-base64 b)
+  "Encode (webui-backend-cells-cache b) as a v5 frame bytevector and
+base64 it.  Returns the empty string if no cache is seeded yet — the
+client will simply wait for the first WebSocket frame as before."
+  (let* ((term (webui-backend-cur-term b))
+         (clicks (engine-click-rects b)))
+    (cond
+     ((not term) "")
+     (else
+      ;; Run encode-frame against an empty cells-cache so the inlined
+      ;; bytes are a full frame, then re-seed the cache for the next
+      ;; diff encode.
+      (set! (webui-backend-cells-cache b) #f)
+      (let ((bv (encode-frame b term '() clicks)))
+        (%bv->base64 bv))))))
+
+(define (client-html b)
   "Return the complete HTML document that boots the browser-side
-WebGL2 renderer.  Stamps cache-busting meta tags so the browser
-never serves a stale copy of the HTML or its inlined JS after the
-server restarts -- restart, reload, see the new code, no manual
-Ctrl-Shift-R needed."
-  (string-append
-   "<!doctype html><html><head>"
-   "<meta charset=\"utf-8\">"
-   "<meta name=\"viewport\""
-   " content=\"width=device-width, initial-scale=1.0,"
-   " minimum-scale=1.0, maximum-scale=1.0, user-scalable=no\">"
-   "<meta http-equiv=\"Cache-Control\""
-   " content=\"no-store, no-cache, must-revalidate, max-age=0\">"
-   "<meta http-equiv=\"Pragma\" content=\"no-cache\">"
-   "<meta http-equiv=\"Expires\" content=\"0\">"
-   "<title>gcell</title>"
-   "<style>"
-   "html,body{margin:0;height:100%;background:#000;overflow:hidden;}"
-   "canvas{display:block;background:#000;}"
-   "</style>"
-   "<script src=\"webui.js\"></script>"
-   ;; Stub queue installed before the deferred module loads.  webui's
-   ;; bridge dispatches incoming raw_send straight to window[name], and
-   ;; type=\"module\" defers gcell.js execution by enough that a frame
-   ;; can arrive during the WS handshake and find gcellFrame undefined.
-   ;; Stash bytes here; the module's applyFrame definition will replay.
-   "<script>"
-   "window.__gcellFrameQueue=[];"
-   "window.gcellFrame=function(b){window.__gcellFrameQueue.push(b);};"
-   "window.__gcellImageQueue=[];"
-   "window.gcellImage=function(b){window.__gcellImageQueue.push(b);};"
-   "</script>"
-   "</head><body>"
-   "<canvas id=\"cv\"></canvas>"
-   "<script type=\"module\">"
-   (load-client-script "gcell.js")
-   "</script>"
-   "</body></html>"))
+WebGL2 renderer.  Embeds the initial frame bytes inline as base64 in
+a JS variable so gcell.js applyFrame()s on first module run — no
+WebSocket round-trip on first paint."
+  (let ((frame-b64 (%initial-frame-base64 b)))
+    (string-append
+     "<!doctype html><html><head>"
+     "<meta charset=\"utf-8\">"
+     "<meta name=\"viewport\""
+     " content=\"width=device-width, initial-scale=1.0,"
+     " minimum-scale=1.0, maximum-scale=1.0, user-scalable=no\">"
+     "<meta http-equiv=\"Cache-Control\""
+     " content=\"no-store, no-cache, must-revalidate, max-age=0\">"
+     "<meta http-equiv=\"Pragma\" content=\"no-cache\">"
+     "<meta http-equiv=\"Expires\" content=\"0\">"
+     "<title>gcell</title>"
+     "<style>"
+     "html,body{margin:0;height:100%;background:#000;overflow:hidden;}"
+     "canvas{display:block;background:#000;}"
+     "</style>"
+     ;; Inline stub queues plus the initial frame, set up BEFORE
+     ;; webui.js loads.  webui.js is deferred so HTML parse doesn't
+     ;; block on its fetch.
+     "<script>"
+     "window.__gcellFrameQueue=[];"
+     "window.gcellFrame=function(b){window.__gcellFrameQueue.push(b);};"
+     "window.__gcellImageQueue=[];"
+     "window.gcellImage=function(b){window.__gcellImageQueue.push(b);};"
+     "window.__gcellInitialFrame=\"" frame-b64 "\";"
+     "</script>"
+     "<script src=\"webui.js\" defer></script>"
+     "</head><body>"
+     "<canvas id=\"cv\"></canvas>"
+     "<script type=\"module\">"
+     (load-client-script "gcell.js")
+     "</script>"
+     "</body></html>")))
 
 (define (%resolve-gcell-find)
   "Return gcell-build's runtime embed-table accessor (%gcell-find)

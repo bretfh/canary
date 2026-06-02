@@ -59,6 +59,7 @@
             send
             stop-engine!
             force-render!
+            render-frame
             refresh-live-widgets!
             handle-resize!
             resize-flushed?
@@ -121,12 +122,8 @@ wakeup so the next ring! actually triggers a wait."
     (ring! (engine-msg-bell eng))))
 
 (define (force-render! eng)
-  "Request an unconditional re-render on the next event-loop cycle.
-For widgets that mutate buffers in place (PTY terms, image scratch
-surfaces) where the engine's eq?-based identity check would otherwise
-report `no state change' and skip the frame.  Cheaper than the
-update-slots identity bump trick and doesn't require a sentinel slot
-on every such widget."
+  "Request a re-render on the next event-loop cycle, regardless of
+whether dispatch reports the root unchanged."
   (send eng 'force-render))
 
 (define (drain-msgs! eng)
@@ -1246,15 +1243,7 @@ onto its own surface.  Unknown cmds are dropped."
   "Apply a flushed <resize> MSG: cache new dims on the backend (via
 BACKEND-HANDLE-RESIZE!), invalidate the diff baseline, cascade to
 user code.  Called by the debounce fiber after quiescence, and
-directly during bootstrap.
-
-Invariant: after this returns, BACKEND-SIZE and every widget-held
-size-tracking object reachable from the engine root agree on
-(width, height).  The cascade is what enforces this: widgets that
-own a <term> (or other size-bearing buffer) must specialise
-`(update X <resize>)' to apply the new dims; the dispatch-skip
-optimisation in dispatch-update! is what makes that contract
-detectable -- widgets without that method silently ignore the resize."
+directly during bootstrap."
   (let ((b (engine-backend eng)))
     (backend-handle-resize! b (resize-width msg) (resize-height msg)))
   (let ((cmd (cascade! eng msg)))

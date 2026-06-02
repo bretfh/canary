@@ -1,14 +1,5 @@
 // gcell WebGL2 client.
 //
-// One state object, one resize path, one paint function.  Cell pixel
-// size is a constant; cell count is a function of the window.  The
-// server is told the count whenever the window changes; the server
-// adapts.  No defensive re-syncs, no animation-frame polling for
-// drift, no identity hacks -- everything routes through the same
-// recompute -> applyCanvas -> tellServer -> paint sequence regardless
-// of which event source fired (window.resize, visualViewport,
-// matchMedia DPR cross, ResizeObserver).
-//
 // Frame layout (matches encode-frame in gcell/backend-webui.scm):
 //   u32 magic 0..3       0x4C454347 "GCEL" little-endian
 //   u8  version 4        v5 carries click overlay; v4 added delta
@@ -45,30 +36,30 @@ const canvas = document.getElementById('cv');
 // across browsers and webui's app-mode window flavours.
 canvas.setAttribute('tabindex', '0');
 canvas.style.outline = 'none';
+// Size the drawing buffer to final dims BEFORE getContext.  Resizing
+// the canvas after the GL context exists can trigger ctx loss +
+// restore under sway/Wayland with fractional scaling; that cycle
+// throws away buildAllGl + uploaded cells and costs hundreds of ms
+// of round-trip work.  Sizing first means the GL context is born at
+// final dims; the later applyCanvas() at the same size is a no-op.
+{
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width  = Math.max(1, Math.round(window.innerWidth  * dpr));
+  canvas.height = Math.max(1, Math.round(window.innerHeight * dpr));
+  canvas.style.width  = window.innerWidth  + 'px';
+  canvas.style.height = window.innerHeight + 'px';
+}
 const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
 if (!gl) throw new Error('webgl2 required');
 
-// ---- State ---------------------------------------------------------
-//
-// Everything mutable lives here.  recompute() reads window dims and
-// fills the derived fields.  applyCanvas() writes them to canvas.
-// paint() reads them and draws.  No other code touches these.
-
 const state = {
-  // input from browser
   cssW: 0, cssH: 0, dpr: 1,
-
-  // derived: invariants 2 + 3
   backingW: 0, backingH: 0,
   cols: 0, rows: 0,
 
-  // server-pushed cells (one record per cell, FLOATS_PER_CELL each)
   cellsArray: new Float32Array(0),
   cellCount:  0,
 
-  // server-side authoritative grid (echoed back in frame headers).
-  // serverCols/Rows == 0 means we haven't been told yet; serverGen
-  // bumps every time we ship a 'resize' so we can detect echoes.
   serverCols: 0, serverRows: 0,
 
   cursorCol:   0,
@@ -76,10 +67,9 @@ const state = {
   cursorStyle: 1,
   cursorBlink: false,
 
-  // overlays: rebuilt from each frame
-  hyperlinks:   new Map(),    // (row<<16|col) -> url
-  clickRects:   [],           // [{col,row,w,h}]
-  imagesPlaced: [],           // [{id,col,row,w,h,sx,sy,sw,sh}]
+  hyperlinks:   new Map(),
+  clickRects:   [],
+  imagesPlaced: [],
 };
 
 const FLOATS_PER_CELL = 12;
@@ -148,7 +138,15 @@ function atlasIndexFor(cp) {
   return slot;
 }
 
-for (let cp = 32; cp < 127; cp++) atlasIndexFor(cp);
+// Pre-rasterise only space and '?' so atlasIndexFor's overflow
+// fallback (line above) returns a sensible result.  Every other
+// glyph is rasterised on demand the first time applyFrame asks for
+// it.  This keeps module load off the show-to-paint critical path —
+// the old eager loop ran rasteriseGlyph 95 times × 3 atlas layers =
+// 285 Canvas 2D fillText calls, which on slower CPUs was 30-100ms
+// of visible lull before the canvas could paint.
+atlasIndexFor(32);
+atlasIndexFor(63);
 
 let atlasTex;
 function buildAtlasTexture() {
@@ -458,6 +456,10 @@ function handleImage(buf) {
 
 function drawImagePlacements() {
   if (state.imagesPlaced.length === 0) return;
+  // The image program is deferred past first paint; skip image cmds
+  // until it's compiled.  Anything queued before that point will be
+  // drawn on the next paint after buildDeferredPrograms lands.
+  if (!deferredProgramsReady) return;
   gl.useProgram(imageProgram);
   gl.bindVertexArray(imageVao);
   gl.uniform2f(iuCellSize, CELL_W_DEV, CELL_H_DEV);
@@ -478,16 +480,31 @@ function drawImagePlacements() {
   gl.bindVertexArray(vao);
 }
 
+// Shader compiles are the bulk of the GL-boot lull (cursor + image
+// programs together can run 30-100ms on slower GPUs).  The cell
+// program is the only one needed to paint the first frame, so build
+// it synchronously and defer the other two past the first paint.
+let deferredProgramsReady = false;
+
 function buildAllGl() {
   buildAtlasTexture();
   buildCellProgram();
-  buildCursorProgram();
-  buildImageProgram();
   syncAtlas();
   // GPU image textures are gone on context loss; cache entries point
   // at dead handles.  Drop them so the next placement re-decodes.
   imageCache.clear();
   state.imagesPlaced = [];
+  // Force cursor + image programs to be rebuilt — buildAllGl runs on
+  // both initial boot and webglcontextrestored, and a restored
+  // context has stale program handles.
+  deferredProgramsReady = false;
+}
+
+function buildDeferredPrograms() {
+  if (deferredProgramsReady) return;
+  buildCursorProgram();
+  buildImageProgram();
+  deferredProgramsReady = true;
 }
 
 // ---- Frame parsing --------------------------------------------------
@@ -633,13 +650,6 @@ function applyFrame(buf) {
   paint();
 }
 
-// gcellFrame/gcellImage are wired up at boot below, after buildAllGl
-// has created the GL resources that applyFrame writes into.  The HTML
-// installs queueing stubs that capture any frames arriving during the
-// WS handshake; boot replays the queue once the GL state is alive.
-
-// ---- The four single-source-of-truth functions --------------------
-
 function recompute() {
   const cssW = Math.max(1, window.innerWidth);
   const cssH = Math.max(1, window.innerHeight);
@@ -663,10 +673,6 @@ function recompute() {
 }
 
 function applyCanvas() {
-  // Unconditional writes.  Browsers no-op same-value assignments, but
-  // we don't gate on them -- guard branches are what hid the resize
-  // bug behind layers of "if it looks fine, don't fix it".  Note:
-  // setting canvas.width clears the backing; the next paint() repaints.
   canvas.width  = state.backingW;
   canvas.height = state.backingH;
   canvas.style.width  = state.cssW + 'px';
@@ -691,7 +697,7 @@ function paint() {
     gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, state.cellCount);
   }
   drawImagePlacements();
-  if (state.cursorStyle !== 0) {
+  if (state.cursorStyle !== 0 && deferredProgramsReady) {
     gl.useProgram(cursorProgram);
     gl.bindVertexArray(cursorVao);
     gl.uniform2f(cuCell, state.cursorCol, state.cursorRow);
@@ -711,10 +717,6 @@ function cursorAlpha() {
   const t = (performance.now() % 1000) / 1000;
   return 0.5 + 0.5 * Math.cos(t * 2 * Math.PI);
 }
-
-// One handler for every event source.  Order is fixed: read the
-// window, write the canvas, tell the server (only when grid changed),
-// repaint.  Single shape, no branches per event source.
 
 function onWindow(reason) {
   const changed = recompute();
@@ -738,8 +740,6 @@ if (window.visualViewport) {
 if (typeof ResizeObserver !== 'undefined') {
   new ResizeObserver(() => onWindow('ro')).observe(document.documentElement);
 }
-// matchMedia at DPR thresholds catches Wayland fractional-scale flips
-// that don't fire window.resize.
 for (const t of [1.0, 1.25, 1.5, 1.75, 2.0, 3.0]) {
   try {
     window.matchMedia(`(resolution: ${t}dppx)`)
@@ -747,9 +747,6 @@ for (const t of [1.0, 1.25, 1.5, 1.75, 2.0, 3.0]) {
   } catch (_) { /* old browsers */ }
 }
 
-// Cursor blink: one rAF loop that only repaints the cursor pass.
-// State and grid are unchanged between blink frames, so we don't go
-// through onWindow -- just redraw with the current state.
 function blinkLoop() {
   if (state.cursorBlink && state.cursorStyle !== 0) paint();
   requestAnimationFrame(blinkLoop);
@@ -790,12 +787,9 @@ function paintHud() {
 // ---- Outbound shape -----------------------------------------------
 
 function send(type, extra) {
-  if (!window.webui) return;
-  // sent_ms: client-side Date.now() in unix-epoch ms so the server's
-  // gettimeofday sees the same epoch.  performance.now() would be
-  // monotonic-from-navigation and meaningless to the server.
+  if (!window.webui || !webui.isConnected || !webui.isConnected()) return;
   const payload = Object.assign({ type, sent_ms: Date.now() }, extra);
-  webui.call('input', JSON.stringify(payload));
+  webui.call('input', JSON.stringify(payload)).catch(() => {});
 }
 
 function shipLog(level, text) {
@@ -804,12 +798,14 @@ function shipLog(level, text) {
 
 window.addEventListener('error', e => {
   const where = e.filename ? `${e.filename}:${e.lineno}:${e.colno} ` : '';
-  shipLog('error', `${where}${e.message || e.error || 'unknown error'}`);
+  try { shipLog('error', `${where}${e.message || e.error || 'unknown error'}`); }
+  catch (_) {}
 });
 window.addEventListener('unhandledrejection', e => {
   const r = e.reason;
   const text = r && r.stack ? r.stack : (r && r.message ? r.message : String(r));
-  shipLog('error', `unhandled rejection: ${text}`);
+  try { shipLog('error', `unhandled rejection: ${text}`); }
+  catch (_) {}
 });
 (function wrapConsole() {
   const wrap = (orig, level) => function (...args) {
@@ -963,11 +959,24 @@ canvas.addEventListener('webglcontextlost', (e) => {
 canvas.addEventListener('webglcontextrestored', () => {
   shipLog('info', 'webgl context restored, rebuilding GL state');
   buildAllGl();
-  state.cellsArray = new Float32Array(0);
-  state.cellCount = 0;
-  state.serverCols = 0;
-  state.serverRows = 0;
-  onWindow('ctx-restore');
+  // Cells live in state.cellsArray (a JS-side TypedArray); the GL
+  // buffer cellsBuf is fresh after buildAllGl.  If we already have
+  // frame bytes, re-upload them and paint immediately — no server
+  // round-trip, no flicker.  Only fall back to asking the server for
+  // a fresh frame when we have nothing to paint.
+  if (state.cellCount > 0 && state.cellsArray.length > 0) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, cellsBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, state.cellsArray, gl.STREAM_DRAW);
+    if (atlasDirty) syncAtlas();
+    paint();
+  } else {
+    state.serverCols = 0;
+    state.serverRows = 0;
+    recompute();
+    applyCanvas();
+    tellServer();
+    send('ready', {});
+  }
 });
 
 // ---- Boot ----------------------------------------------------------
@@ -990,9 +999,22 @@ function whenWebuiReady(cb) {
 buildAllGl();
 recompute();
 applyCanvas();
-// Real frame/image handlers replace the HTML stubs; drain whatever the
-// stubs captured during module loading.  Must run after buildAllGl so
-// applyFrame's gl.bufferData(cellsBuf, ...) has live state to write to.
+// Apply the server-inlined initial frame so the canvas paints the
+// moment the module finishes booting -- no WebSocket round-trip, no
+// token handshake, no force-render request.  The server encodes the
+// engine's first render into window.__gcellInitialFrame as base64
+// during HTML generation; we decode it here and feed it through the
+// same applyFrame path live frames use.
+if (window.__gcellInitialFrame) {
+  try {
+    const bin = atob(window.__gcellInitialFrame);
+    const len = bin.length;
+    const buf = new Uint8Array(len);
+    for (let i = 0; i < len; i++) buf[i] = bin.charCodeAt(i);
+    applyFrame(buf);
+  } catch (_) {}
+  window.__gcellInitialFrame = null;
+}
 {
   const fq = window.__gcellFrameQueue || [];
   window.gcellFrame = applyFrame;
@@ -1003,17 +1025,18 @@ applyCanvas();
   window.__gcellImageQueue = null;
   for (const buf of iq) try { handleImage(buf); } catch (_) {}
 }
+// Compile cursor + image programs only after the first cell-grid
+// paint is committed, so they're not on the show-to-paint critical
+// path.  Double-rAF lets the browser actually present the first
+// frame before we block on GL link.
+requestAnimationFrame(() => requestAnimationFrame(() => {
+  buildDeferredPrograms();
+  // Paint again so the cursor (and any queued images) show up now
+  // that their programs exist.
+  if (state.cellCount > 0) paint();
+}));
 whenWebuiReady(() => {
-  // Run recompute again in case window dims weren't settled at module
-  // boot (Firefox-in-app-mode can briefly report 0x0 inner before its
-  // window manager places the surface).  Then drive the rest off the
-  // re-measured state and tell the server "we're ready" so it pushes a
-  // full frame from the current term -- the only race-free path,
-  // because by definition this fires AFTER the JS module is fully
-  // wired up and the queue stub has been replaced with applyFrame.
   recompute();
   applyCanvas();
   tellServer();
-  send('ready', {});
-  paint();
 });
