@@ -1,3 +1,6 @@
+;;; Dev-shell manifest.  Invoke with
+;;;   guix shell -L ~/dots -m manifest.scm
+
 (use-modules (gnu packages commencement)
              (gnu packages gtk)
              (gnu packages guile)
@@ -5,7 +8,7 @@
              (gnu packages version-control)
              (gnu packages web)
              (gnu packages webkit)
-             (canary deps webui))
+             (etc packages webui))
 
 (packages->manifest
  (list guile-next
