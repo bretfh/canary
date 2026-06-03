@@ -1,10 +1,3 @@
 (channel
  (version 0)
- (directory "guix")
- (dependencies
-  (channel
-   (name 'bfh-dots)
-   (url "https://git.lab.local/bfh/dots.git"))
-  (channel
-   (name 'guile-webui)
-   (url "https://git.lab.local/bfh/guile-webui.git"))))
+ (directory "guix"))
