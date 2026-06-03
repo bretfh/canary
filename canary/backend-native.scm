@@ -49,8 +49,8 @@
 (define %default-atlas-oversample  2)
 (define %default-layer-for-bold    1)
 (define %default-layer-for-italic  2)
-(define %default-fg                #x00E6E6E6)   ; light gray, ~0.9
-(define %default-bg                #x00000000)   ; black
+(define %default-fg                #xFFFFFFFF)  ; wire sentinel: no library opinion
+(define %default-bg                #xFFFFFFFF)
 (define %default-cursor-styles     '((hidden    . 0)
                                      (block     . 1)
                                      (underline . 2)
@@ -317,23 +317,10 @@ fractions within the cell for the two decoration strips."
 (define %native-config-size
   (+ 4 4 4               ; cell_w_dev, cell_h_dev, font_px_dev
      4 4 4 4             ; atlas_oversample, atlas_cols, atlas_rows, n_layers
-     16 16               ; default_fg[4] f32, default_bg[4] f32
+     4 4                 ; default_fg u32, default_bg u32 (raw wire colours)
      4 4 4               ; underline_y, strike_y_min, strike_y_max
      4 4))               ; layer_for_bold, layer_for_italic
 
-(define (rgb-u32->rgba-f32-bytes rgb out off)
-  "Decode RGB (a u32 with byte layout 0x00RRGGBB) into four IEEE
-single-precision floats at OFF in OUT.  Used to pack the backend's
-DEFAULT-FG / DEFAULT-BG into the NativeConfig struct; per-cell wire
-sentinel handling lives in the renderer's per-cell unpacker, not
-here."
-  (let* ((r (/ (logand (ash rgb -16) #xFF) 255.0))
-         (g (/ (logand (ash rgb  -8) #xFF) 255.0))
-         (b (/ (logand rgb            #xFF) 255.0)))
-    (bytevector-ieee-single-native-set! out off          r)
-    (bytevector-ieee-single-native-set! out (+ off 4)    g)
-    (bytevector-ieee-single-native-set! out (+ off 8)    b)
-    (bytevector-ieee-single-native-set! out (+ off 12)   1.0)))
 
 (define (pack-font-config paths-ptr-array n-paths font-px)
   "Pack a FontConfig extern struct: pointer-to-path-array, count, px.
@@ -375,13 +362,13 @@ call so the pointers stay valid."
     (bytevector-s32-native-set! bv 16 (native-backend-atlas-cols b))
     (bytevector-s32-native-set! bv 20 (native-backend-atlas-rows b))
     (bytevector-u32-native-set! bv 24 (length (native-backend-font-paths b)))
-    (rgb-u32->rgba-f32-bytes (native-backend-default-fg b) bv 28)
-    (rgb-u32->rgba-f32-bytes (native-backend-default-bg b) bv 44)
-    (bytevector-ieee-single-native-set! bv 60 (native-backend-underline-y b))
-    (bytevector-ieee-single-native-set! bv 64 (native-backend-strike-y-min b))
-    (bytevector-ieee-single-native-set! bv 68 (native-backend-strike-y-max b))
-    (bytevector-s32-native-set! bv 72 (native-backend-layer-for-bold b))
-    (bytevector-s32-native-set! bv 76 (native-backend-layer-for-italic b))
+    (bytevector-u32-native-set! bv 28 (native-backend-default-fg b))
+    (bytevector-u32-native-set! bv 32 (native-backend-default-bg b))
+    (bytevector-ieee-single-native-set! bv 36 (native-backend-underline-y b))
+    (bytevector-ieee-single-native-set! bv 40 (native-backend-strike-y-min b))
+    (bytevector-ieee-single-native-set! bv 44 (native-backend-strike-y-max b))
+    (bytevector-s32-native-set! bv 48 (native-backend-layer-for-bold b))
+    (bytevector-s32-native-set! bv 52 (native-backend-layer-for-italic b))
     bv))
 
 

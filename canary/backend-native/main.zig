@@ -86,8 +86,8 @@ const NativeConfig = extern struct {
     atlas_cols: i32,
     atlas_rows: i32,
     n_layers: u32,
-    default_fg: [4]f32,
-    default_bg: [4]f32,
+    default_fg: u32,
+    default_bg: u32,
     underline_y: f32,
     strike_y_min: f32,
     strike_y_max: f32,
@@ -105,8 +105,8 @@ const Backend = struct {
     atlas_cols: i32 = 0,
     atlas_rows: i32 = 0,
     n_layers: u32 = 0,
-    default_fg: [4]f32 = .{ 0, 0, 0, 0 },
-    default_bg: [4]f32 = .{ 0, 0, 0, 0 },
+    default_fg: u32 = COLOR_DEFAULT_SENTINEL,
+    default_bg: u32 = COLOR_DEFAULT_SENTINEL,
     underline_y: f32 = 0,
     strike_y_min: f32 = 0,
     strike_y_max: f32 = 0,
@@ -695,21 +695,27 @@ fn build_cells_attribs(b: *Backend) usize {
         out[base + 0] = col;
         out[base + 1] = row;
         out[base + 2] = @floatFromInt(slot);
-        unpack_color(fg, out[base + 3 ..][0..4], b.default_fg);
-        unpack_color(bg, out[base + 7 ..][0..4], b.default_bg);
+        unpack_color(fg, out[base + 3 ..][0..4], b.default_fg, .{ 1, 1, 1, 1 });
+        unpack_color(bg, out[base + 7 ..][0..4], b.default_bg, .{ 0, 0, 0, 1 });
         out[base + 11] = @floatFromInt(attrs);
     }
     return w * h;
 }
 
-fn unpack_color(packed_color: u32, dst: *[4]f32, fallback: [4]f32) void {
-    if (packed_color == COLOR_DEFAULT_SENTINEL) {
-        dst.* = fallback;
+fn rgb_to_rgba(packed_color: u32, dst: *[4]f32) void {
+    dst[0] = @as(f32, @floatFromInt((packed_color >> 16) & 0xFF)) / 255.0;
+    dst[1] = @as(f32, @floatFromInt((packed_color >> 8) & 0xFF)) / 255.0;
+    dst[2] = @as(f32, @floatFromInt(packed_color & 0xFF)) / 255.0;
+    dst[3] = 1.0;
+}
+
+fn unpack_color(packed_color: u32, dst: *[4]f32, backend_default: u32, ultimate_fallback: [4]f32) void {
+    if (packed_color != COLOR_DEFAULT_SENTINEL) {
+        rgb_to_rgba(packed_color, dst);
+    } else if (backend_default != COLOR_DEFAULT_SENTINEL) {
+        rgb_to_rgba(backend_default, dst);
     } else {
-        dst[0] = @as(f32, @floatFromInt((packed_color >> 16) & 0xFF)) / 255.0;
-        dst[1] = @as(f32, @floatFromInt((packed_color >> 8) & 0xFF)) / 255.0;
-        dst[2] = @as(f32, @floatFromInt(packed_color & 0xFF)) / 255.0;
-        dst[3] = 1.0;
+        dst.* = ultimate_fallback;
     }
 }
 
@@ -751,7 +757,9 @@ fn run_loop(b: *Backend) void {
         }
 
         gl.glViewport(0, 0, b.framebuffer_w, b.framebuffer_h);
-        gl.glClearColor(b.default_bg[0], b.default_bg[1], b.default_bg[2], b.default_bg[3]);
+        var clear_rgba: [4]f32 = .{ 0, 0, 0, 1 };
+        if (b.default_bg != COLOR_DEFAULT_SENTINEL) rgb_to_rgba(b.default_bg, &clear_rgba);
+        gl.glClearColor(clear_rgba[0], clear_rgba[1], clear_rgba[2], clear_rgba[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
 
         gl.glUseProgram(b.cell_prog);
@@ -775,7 +783,9 @@ fn run_loop(b: *Backend) void {
             gl.glUniform2f(b.cu_viewport, @floatFromInt(b.framebuffer_w), @floatFromInt(b.framebuffer_h));
             gl.glUniform1i(b.cu_style, @intCast(cursor_style));
             gl.glUniform1f(b.cu_alpha, cursor_alpha_now(b));
-            gl.glUniform4f(b.cu_color, b.default_fg[0], b.default_fg[1], b.default_fg[2], 1.0);
+            var cursor_rgba: [4]f32 = .{ 1, 1, 1, 1 };
+            if (b.default_fg != COLOR_DEFAULT_SENTINEL) rgb_to_rgba(b.default_fg, &cursor_rgba);
+            gl.glUniform4f(b.cu_color, cursor_rgba[0], cursor_rgba[1], cursor_rgba[2], 1.0);
             gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6);
         }
 
