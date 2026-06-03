@@ -51,9 +51,10 @@
                           (find-files "build" "\\.go$"))))))))
     (native-inputs (list guile-next gcc-toolchain))
     (inputs (list guile-next guile-fibers guile-webui))
-    ;; guile-webui propagated so a consumer that depends on canary
-    ;; gets the webui backend wired in without a second dep entry.
-    (propagated-inputs (list guile-fibers guile-webui))
+    ;; guile-next propagated so `guix shell guile-canary` puts both
+    ;; guile and canary's modules on the same load path; guile-webui
+    ;; so the webui backend works without a second dep entry.
+    (propagated-inputs (list guile-next guile-fibers guile-webui))
     (synopsis "Live-reloadable TUI library for Guile")
     (description "Elm-shaped TUI library for Guile.  Widgets compose by
 embed-by-reference; the ANSI backend renders cell-diffs to a terminal, the
