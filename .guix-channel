@@ -4,4 +4,5 @@
  (dependencies
   (channel
    (name 'guile-webui)
-   (url "file:///home/bfh/git/guile/guile-webui"))))
+   (url "file:///home/bfh/git/guile/guile-webui")
+   (branch "master"))))
