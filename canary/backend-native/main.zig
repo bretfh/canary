@@ -540,7 +540,17 @@ fn load_font(b: *Backend, layer: usize, name: []const u8) bool {
         std.debug.print("canary-native FT_New_Memory_Face {s}: 0x{x}\n", .{ path, err });
         return false;
     }
-    _ = ft.FT_Set_Pixel_Sizes(b.fonts[layer], 0, @intCast(CELL_H));
+    // Pick the EM size so the font's ascender + |descender| equals
+    // CELL_H pixels.  FT_Set_Pixel_Sizes alone leaves descenders
+    // overhanging the cell (DejaVu Sans Mono at EM=CELL_H is ~17%
+    // taller than CELL_H, so g/j/y/p/q clip at the cell bottom).
+    const face = b.fonts[layer];
+    const units = @as(i32, face.*.units_per_EM);
+    const asc = @as(i32, face.*.ascender);   // font units, positive
+    const dsc = @as(i32, face.*.descender);  // font units, negative
+    const total = asc - dsc;                  // glyph-bbox height
+    const target = @divFloor(CELL_H * units, total);
+    _ = ft.FT_Set_Pixel_Sizes(face, 0, @intCast(target));
     return true;
 }
 
