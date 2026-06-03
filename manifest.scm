@@ -1,5 +1,10 @@
 ;;; Dev-shell manifest.  Invoke with
-;;;   guix shell -L ~/dots -m manifest.scm
+;;;   guix shell -m manifest.scm
+;;; once ~/.config/guix/channels.scm has been pulled (the
+;;; bfh-dots, guile-webui, and guile-canary channels supply
+;;; webui, canary-native-backend, and the canary core).
+;;; For in-progress edits not yet on a pulled channel:
+;;;   guix shell -L guix -L ~/dots/channel -m manifest.scm
 
 (use-modules (gnu packages commencement)
              (gnu packages gtk)
@@ -8,7 +13,8 @@
              (gnu packages version-control)
              (gnu packages web)
              (gnu packages webkit)
-             (etc packages webui))
+             (etc packages webui)
+             (canary-native-backend))
 
 (packages->manifest
  (list guile-next
@@ -21,6 +27,11 @@
        ;; silent no-op and the window stays blank.
        gtk+
        webkitgtk-for-gtk3
+       ;; Native backend: glfw + freetype + libepoxy on Wayland.  The
+       ;; package propagates guile-canary, font-dejavu, glfw-3.4, etc.
+       ;; so `guile examples/clock-native.scm` runs straight out of
+       ;; this shell with no extra env vars.
+       canary-native-backend
        gcc-toolchain
        gnu-make
        git))
