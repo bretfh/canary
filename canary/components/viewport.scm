@@ -19,7 +19,7 @@
             viewport-scroll-to-start
             viewport-scroll-to-end))
 
-(define-class <viewport> (<focusable>)
+(define-component <viewport>
   (items  #:init-keyword #:items  #:init-value '()   #:getter viewport-items)
   (offset #:init-keyword #:offset #:init-value 0     #:getter viewport-offset)
   (step   #:init-keyword #:step   #:init-value 1     #:getter viewport-step)

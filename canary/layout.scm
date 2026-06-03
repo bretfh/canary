@@ -247,14 +247,14 @@ body on hover. For a static substitute, use (lambda (_) replacement)."
   (make-hover-node body styler))
 
 (define (with-keymap km body)
-  "Wrap BODY with keymap KM.  When any focusable descendant of BODY is
+  "Wrap BODY with keymap KM.  When any component descendant of BODY is
 on the engine's focus chain, KM contributes to the active keymap
 stack (innermost wrapper has highest priority; engine global keymap
 is the bottom of the stack).  KM is a <keymap> value built with
 `keymap` and `bind`.  Composes with everything else in the tree —
 nest `with-keymap` inside `with-keymap` to layer modals; wrap a
 scene's view with one to scope its binds; vanish from the tree
-naturally when BODY (or its focusable descendants) leaves."
+naturally when BODY (or its component descendants) leaves."
   (make-keymap-node km body))
 
 (define* (flex body #:key (grow 1) (shrink 0))

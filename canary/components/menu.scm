@@ -16,7 +16,7 @@
             make-menu-item menu-item menu-item?
             menu-item-label menu-item-action menu-item-hotkey))
 
-;;; A focusable list of choices.  An item is `(label, action, hotkey)`;
+;;; A list of choices that takes focus.  An item is `(label, action, hotkey)`;
 ;;; the menu owns the current focus.  Navigation:
 ;;;   - up/down (and k/j)             move focus
 ;;;   - enter                          send the focused item's action
@@ -42,7 +42,7 @@ LABEL.  Use `make-menu-item` directly for a non-leading hotkey."
   (make-menu-item label action
                   (char-downcase (string-ref label 0))))
 
-(define-class <menu> (<focusable>)
+(define-component <menu>
   (items       #:init-keyword #:items       #:init-value '()           #:getter menu-items)
   (focus       #:init-keyword #:focus       #:init-value 0             #:getter menu-focus)
   (title       #:init-keyword #:title       #:init-value #f            #:getter menu-title)

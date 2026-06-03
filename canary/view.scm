@@ -523,7 +523,7 @@ swap glyphs, wrap with overlay, return a static replacement node."
 
 (define (make-keymap-node km body)
   "Return a fresh <keymap-node> attaching keymap KM to BODY.  When a
-focusable descendant of BODY is on the engine's focus chain, KM
+component descendant of BODY is on the engine's focus chain, KM
 contributes to the active keymap stack.  See `with-keymap` in
 (canary layout) for the constructor."
   (%keymap-node km body #f))

@@ -14,7 +14,7 @@
 
 (test-begin "lifecycle")
 
-(define-class <tape> (<focusable>)
+(define-component <tape>
   (msgs #:init-value '() #:accessor tape-msgs))
 
 (define-method (view (t <tape>)) (txt "x"))

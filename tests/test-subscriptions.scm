@@ -13,7 +13,7 @@
 (test-begin "subscriptions")
 
 ;;; A widget that subscribes to <tick> only.
-(define-class <ticker> (<focusable>)
+(define-component <ticker>
   (n #:init-keyword #:n #:init-value 0 #:accessor ticker-n))
 
 (define-method (view (t <ticker>)) (txt "ticker"))
@@ -22,13 +22,13 @@
   (cons (update-slots t #:n (+ 1 (ticker-n t))) #f))
 
 ;;; A widget with NO specialised update method at all.
-(define-class <inert> (<focusable>)
+(define-component <inert>
   (calls #:init-value 0 #:accessor inert-calls))
 
 (define-method (view (s <inert>)) (txt "inert"))
 
 ;;; A root that contains both.
-(define-class <pair-root> (<focusable>)
+(define-component <pair-root>
   (a #:init-form (make <ticker>) #:getter pair-a)
   (b #:init-form (make <inert>)  #:getter pair-b))
 

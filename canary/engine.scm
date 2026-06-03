@@ -456,13 +456,13 @@ but anything inside them is."
 
 (define (build-id-map node)
   "Walk NODE recursively and return a hash table mapping each
-focusable node's id to the node itself.  Used after the root has
+component's id to the component itself.  Used after the root has
 been swapped so id-keyed bookkeeping (focus chain, live set, widget
 subs) can resolve to current instances."
   (let ((tbl (make-hash-table)))
     (walk-tree node
                (lambda (n)
-                 (when (is-a? n <focusable>)
+                 (when (is-a? n <component>)
                    (hash-set! tbl (widget-id n) n))))
     tbl))
 
@@ -492,7 +492,7 @@ unchanged."
       (cons node #f))))
 
 (define (search-each items id eng msg)
-  "Walk each item in ITEMS searching for a focusable node with id ID;
+  "Walk each item in ITEMS searching for a component with id ID;
 rebuild the list if any item changed.  Returns (cons items-or-rebuilt
 cmd-or-#f)."
   (let loop ((rest items) (acc '()) (changed? #f) (found-cmd #f))
@@ -508,7 +508,7 @@ cmd-or-#f)."
       (cons (if changed? (reverse acc) items) found-cmd)))))
 
 (define (search-and-replace val id eng msg)
-  "Recursively search VAL for a focusable node with widget-id ID; on
+  "Recursively search VAL for a component with widget-id ID; on
 finding it, dispatch MSG on it and substitute the result back.
 Returns (cons new-val cmd-or-#f).  Layout records are traversed
 transparently — dispatch reaches widgets inside them but the layout
@@ -518,7 +518,7 @@ record itself is not rebuilt (it's transient anyway)."
    ((string? val) (cons val #f))
    ((is-a? val <object>)
     (cond
-     ((and (is-a? val <focusable>) (eq? (widget-id val) id))
+     ((and (is-a? val <component>) (eq? (widget-id val) id))
       (plain-update eng val msg))
      (else
       (let loop ((slots (class-slots (class-of val)))
@@ -768,7 +768,7 @@ Three contribution sources:
            ((is-a? node <object>)
             (cond
              ((and (not inside?)
-                   (is-a? node <focusable>)
+                   (is-a? node <component>)
                    (eq? (widget-id node) target-id))
               ;; Hit the focused widget: descend into its view with
               ;; `inside?` set so keymap-nodes inside its view tree
@@ -1081,7 +1081,7 @@ unmount can auto-cancel it."
     (let* ((cell        (make-sub-cell))
            (owner       (%current-update-widget))
            (owner-id    (and owner
-                             (is-a? owner <focusable>)
+                             (is-a? owner <component>)
                              (widget-id owner))))
       (when id (hash-set! (engine-subs eng) id cell))
       (when (and owner-id id)
@@ -1159,7 +1159,7 @@ onto its own surface.  Unknown cmds are dropped."
               (ids  (cond
                      ((not path) '())
                      (else (map widget-id
-                                (filter (lambda (n) (is-a? n <focusable>))
+                                (filter (lambda (n) (is-a? n <component>))
                                         path)))))
               (prev (engine-focus-chain eng)))
          (set-engine-focus-chain! eng ids)

@@ -3,7 +3,9 @@
   #:use-module (ice-9 match)
   #:export (update-slots
             class-slot-keywords
-            <focusable>
+            <canary-class>
+            <component>
+            define-component
             widget-id))
 
 ;;; Commentary:
@@ -12,6 +14,22 @@
 ;;; same kind as OBJ with every slot copied over except those listed
 ;;; in the override kwargs.  The slot list for each kind of node is
 ;;; looked up once and cached.
+;;;
+;;; <canary-class> is the metaclass for every component class.  It's
+;;; currently a thin subclass of <class> with no overrides — its purpose
+;;; is to give canary a hook point for future class-level behavior
+;;; (custom redefinition semantics for live coding, slot-policy
+;;; enforcement, per-class registry).  Subclasses of <component>
+;;; inherit it automatically via `ensure-metaclass'.
+;;;
+;;; <component> is the instance-shape base class: every widget that the
+;;; engine tracks (focus chain, mount/unmount, per-widget subs) inherits
+;;; from it for the auto-generated identity slot.
+;;;
+;;; `define-component' is sugar for `(define-class NAME (<component>)
+;;; SLOT ...)' — it injects <component> as the sole super so users don't
+;;; spell the universal truth out per class.  Drop to plain `define-
+;;; class' when you genuinely need multi-inheritance.
 ;;;
 ;;; Code:
 
@@ -29,8 +47,14 @@ cache."
         (hash-set! %slot-keyword-cache cls pairs)
         pairs)))
 
-(define-class <focusable> ()
-  (id #:init-form (gensym "w-") #:getter widget-id))
+(define-class <canary-class> (<class>))
+
+(define-class <component> ()
+  (id #:init-form (gensym "w-") #:getter widget-id)
+  #:metaclass <canary-class>)
+
+(define-syntax-rule (define-component name slot/option ...)
+  (define-class name (<component>) slot/option ...))
 
 (define (update-slots obj . overrides)
   "Return a fresh instance of the same kind as OBJ with every slot

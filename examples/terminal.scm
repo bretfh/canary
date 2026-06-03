@@ -204,7 +204,7 @@ dup2 + execlp; parent keeps the master fd and the child's pid."
 ;;; cells-node over the term's chars+faces buffers.
 ;;;
 
-(define-class <pty-emulator> (<focusable>)
+(define-component <pty-emulator>
   (term    #:init-keyword #:term #:getter pty-term)
   (fd      #:init-keyword #:fd   #:getter pty-fd)
   (pid     #:init-keyword #:pid  #:getter pty-pid)

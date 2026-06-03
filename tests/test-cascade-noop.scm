@@ -12,7 +12,7 @@
 
 (test-begin "cascade-noop")
 
-(define-class <noop> (<focusable>)
+(define-component <noop>
   (n #:init-keyword #:n #:init-value 0 #:getter noop-n))
 
 (define-method (view (w <noop>)) (txt "noop"))
@@ -41,7 +41,7 @@
 
 ;; State-changing cascade: update-slots breaks identity, so the gate
 ;; opens; the cascade returns a fresh instance.
-(define-class <bump> (<focusable>)
+(define-component <bump>
   (n #:init-keyword #:n #:init-value 0 #:getter bump-n))
 
 (define-method (view (w <bump>)) (txt "bump"))

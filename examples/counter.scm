@@ -5,7 +5,7 @@
 
 (use-modules (canary) (oop goops))
 
-(define-class <counter> (<focusable>)
+(define-component <counter>
   (n #:init-keyword #:n
      #:init-value   0
      #:getter       counter-n))

@@ -74,7 +74,7 @@ The sections below cover each piece.
 ```scheme
 (use-modules (canary) (oop goops))
 
-(define-class <counter> (<focusable>)
+(define-component <counter>
   (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
 
 (define-method (view (c <counter>))
@@ -104,10 +104,12 @@ view   : (lambda (self)     -> node)
 update : (lambda (self msg) -> (cons next-self cmd-or-#f))   ; optional
 ```
 
-Stateful nodes inherit from `<focusable>` so they carry an
-auto-generated identity slot the engine keys focus, mount/unmount,
-and per-widget subs by.  Read slots with their `#:getter`
-accessors; build the next state with `update-slots`.
+Stateful nodes use `define-component` instead of `define-class`,
+which injects `<component>` as the base so they carry an auto-
+generated identity slot the engine keys focus, mount/unmount, and
+per-widget subs by.  Read slots with their `#:getter` accessors;
+build the next state with `update-slots`.  Drop to `define-class`
+explicitly only when you need multi-inheritance.
 
 Specialise them on your class. Startup logic is just `update`
 specialised on the `<init>` msg:
@@ -125,7 +127,7 @@ For widgets that need to *read* the terminal size (animation budgets,
 viewport sizing), capture `<resize>` into a slot:
 
 ```scheme
-(define-class <my-app> (<focusable>)
+(define-component <my-app>
   (cols #:init-value 80 #:getter my-cols)
   (rows #:init-value 24 #:getter my-rows)
   ...)
@@ -166,7 +168,7 @@ it finds. Every layout primitive accepts widgets and layout records
 interchangeably.
 
 ```scheme
-(define-class <chat> (<focusable>)
+(define-component <chat>
   (lines #:init-value '()             #:getter chat-lines)
   (input #:init-form (textinput) #:getter chat-input))
 
@@ -423,7 +425,7 @@ The shape every non-trivial canary app converges on:
 
 ```scheme
 ;;; Root: holds the active scene, swaps it on <scene-change>.
-(define-class <app> (<focusable>)
+(define-component <app>
   (scene #:init-keyword #:scene #:getter app-scene))
 
 (define-method (view (a <app>))
@@ -437,7 +439,7 @@ The shape every non-trivial canary app converges on:
   (cons (update-slots a #:scene (scene-change-scene msg)) #f))
 
 ;;; Each scene owns its keymap and wraps its own view.
-(define-class <auth> (<focusable>)
+(define-component <auth>
   (menu #:init-form (menu #:items %auth-items) #:getter auth-menu))
 
 (define %auth-km
@@ -458,7 +460,7 @@ The shape every non-trivial canary app converges on:
 (define %pause-km
   (keymap (bind 'escape 'close-pause) (bind 'enter 'menu-select)))
 
-(define-class <canvas> (<focusable>)
+(define-component <canvas>
   (pause-menu #:init-value #f #:getter canvas-pause-menu))
 
 (define-method (view (c <canvas>))
@@ -484,7 +486,7 @@ Three things are non-obvious the first time you build this shape:
   binds on the parent — they should travel with the scene.
 
 - **Use `focus` to route raw keys to one of N coexisting children.**
-  Cascade walks every focusable slot on the parent for non-key msgs,
+  Cascade walks every component slot on the parent for non-key msgs,
   but raw keys go through the focus chain alone. If a parent has
   three textinputs in slots and you don't focus one, all three
   receive every keystroke.

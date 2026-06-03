@@ -14,7 +14,7 @@
             progress-empty-face
             progress-percent))
 
-(define-class <progress> (<focusable>)
+(define-component <progress>
   (current       #:init-keyword #:current       #:init-value 0
                  #:getter progress-current)
   (total         #:init-keyword #:total         #:init-value 100

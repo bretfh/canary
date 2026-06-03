@@ -9,7 +9,7 @@
 (define (now-string)
   (strftime "%H:%M:%S" (localtime (current-time))))
 
-(define-class <clock> (<focusable>)
+(define-component <clock>
   (time #:init-form (now-string)
         #:getter    clock-time))
 

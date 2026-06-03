@@ -89,7 +89,7 @@ Changes are listed newest-first.  Format follows
     #f)
 
   ;; after
-  (define-class <counter> (<focusable>)
+  (define-component <counter>
     (n #:init-keyword #:n #:init-value 0 #:getter counter-n))
 
   (define-method (update (c <counter>) (msg <key>))
@@ -106,8 +106,8 @@ Changes are listed newest-first.  Format follows
 
 ### Added
 
-- **`<focusable>` mixin and `update-slots` helper** in `(canary
-  widget)`, re-exported from `(canary)`.  Inherit from `<focusable>`
+- **`<component>` mixin and `update-slots` helper** in `(canary
+  widget)`, re-exported from `(canary)`.  Inherit from `<component>`
   to give a widget an auto-generated identity slot the engine keys
   focus, mount/unmount, and per-widget subscriptions by — identity
   survives across value-typed updates.  `update-slots` returns a
@@ -119,7 +119,7 @@ Changes are listed newest-first.  Format follows
   every widget it finds, and rebuilds the parent so its slot holds
   the returned `next-self`.  Two slots that referenced the same
   widget instance no longer share mutable state; the engine
-  preserves widget identity across the cascade via the `<focusable>`
+  preserves widget identity across the cascade via the `<component>`
   id.
 
 ## 0.2.0 — unreleased
