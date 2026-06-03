@@ -49,8 +49,8 @@
 (define %default-atlas-oversample  2)
 (define %default-layer-for-bold    1)
 (define %default-layer-for-italic  2)
-(define %default-fg                #xFFFFFFFF)
-(define %default-bg                #xFFFFFFFF)
+(define %default-fg                #x00E6E6E6)   ; light gray, ~0.9
+(define %default-bg                #x00000000)   ; black
 (define %default-cursor-styles     '((hidden    . 0)
                                      (block     . 1)
                                      (underline . 2)
@@ -322,20 +322,18 @@ fractions within the cell for the two decoration strips."
      4 4))               ; layer_for_bold, layer_for_italic
 
 (define (rgb-u32->rgba-f32-bytes rgb out off)
-  (cond
-   ((= rgb #xFFFFFFFF)
-    (bytevector-ieee-single-native-set! out off          1.0)
-    (bytevector-ieee-single-native-set! out (+ off 4)    1.0)
-    (bytevector-ieee-single-native-set! out (+ off 8)    1.0)
-    (bytevector-ieee-single-native-set! out (+ off 12)   1.0))
-   (else
-    (let* ((r (/ (logand (ash rgb -16) #xFF) 255.0))
-           (g (/ (logand (ash rgb  -8) #xFF) 255.0))
-           (b (/ (logand rgb            #xFF) 255.0)))
-      (bytevector-ieee-single-native-set! out off          r)
-      (bytevector-ieee-single-native-set! out (+ off 4)    g)
-      (bytevector-ieee-single-native-set! out (+ off 8)    b)
-      (bytevector-ieee-single-native-set! out (+ off 12)   1.0)))))
+  "Decode RGB (a u32 with byte layout 0x00RRGGBB) into four IEEE
+single-precision floats at OFF in OUT.  Used to pack the backend's
+DEFAULT-FG / DEFAULT-BG into the NativeConfig struct; per-cell wire
+sentinel handling lives in the renderer's per-cell unpacker, not
+here."
+  (let* ((r (/ (logand (ash rgb -16) #xFF) 255.0))
+         (g (/ (logand (ash rgb  -8) #xFF) 255.0))
+         (b (/ (logand rgb            #xFF) 255.0)))
+    (bytevector-ieee-single-native-set! out off          r)
+    (bytevector-ieee-single-native-set! out (+ off 4)    g)
+    (bytevector-ieee-single-native-set! out (+ off 8)    b)
+    (bytevector-ieee-single-native-set! out (+ off 12)   1.0)))
 
 (define (pack-font-config paths-ptr-array n-paths font-px)
   "Pack a FontConfig extern struct: pointer-to-path-array, count, px.
