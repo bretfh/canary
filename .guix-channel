@@ -3,6 +3,6 @@
  (directory "guix")
  (dependencies
   (channel
-   (name 'guile-webui)
+   (name guile-webui)
    (url "file:///home/bfh/git/guile/guile-webui")
    (branch "master"))))
