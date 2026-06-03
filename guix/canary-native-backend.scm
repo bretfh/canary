@@ -39,11 +39,8 @@
                       (string-append (getcwd) "/.zig-cache"))
               (setenv "ZIG_LOCAL_CACHE_DIR"
                       (string-append (getcwd) "/.zig-local"))
-              (let ((fonts (assoc-ref inputs "font-dejavu")))
-                (with-directory-excursion "canary/backend-native"
-                  (invoke "zig" "build"
-                          (string-append "-Dfont-dir="
-                                         fonts "/share/fonts/truetype"))))
+              (with-directory-excursion "canary/backend-native"
+                (invoke "zig" "build"))
               ;; Compile backend-native.scm against the freshly built
               ;; libcanary-native.so so its FFI lookups resolve.
               (setenv "LD_LIBRARY_PATH"

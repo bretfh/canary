@@ -7,10 +7,6 @@
                                             <resize> resize))
   #:use-module ((canary key) #:select (<key> key normalize-key))
   #:use-module ((canary backend-ansi) #:select (render-cmds-to-term!))
-  #:use-module ((canary engine-types) #:select (engine-click-regions))
-  #:use-module ((canary draw) #:select (clickable-cmd? clickable-col
-                                        clickable-row clickable-w
-                                        clickable-h))
   #:use-module (canary theme)
   #:use-module ((canary term types) #:prefix t:)
   #:use-module (oop goops)
@@ -24,26 +20,49 @@
 
 ;;; Commentary:
 ;;;
-;;; A canary backend that opens a native window via glfw and renders
-;;; the cell grid directly with OpenGL 3.3 core.  Glyphs come from
-;;; freetype against three DejaVu Sans Mono weights (regular/bold/
-;;; oblique) packed into a sampler2DArray atlas; the cell shader is
-;;; the same shape as canary's WebGL2 client (instanced quad per cell,
-;;; per-cell attribs for col/row/glyph-slot/fg/bg/attrs).
+;;; Backend that opens a native window via glfw and renders the cell
+;;; grid through libcanary-native.so (an OpenGL 3.3 core renderer
+;;; built from canary/backend-native/main.zig).
 ;;;
-;;; All glfw/GL/FreeType work happens in a single POSIX thread spawned
-;;; from backend-init via call-with-new-thread.  Glfw input callbacks
-;;; on that foreign thread push POD events onto a mpsc ring and notify
-;;; via an eventfd; a fiber on the main thread blocks on the eventfd,
-;;; drains the ring, builds canary protocol records, and sends them
-;;; into the engine.  No SCM is touched from the glfw thread, which is
-;;; the foreign-thread rule.
-;;;
-;;; backend-draw on the engine fiber hands cell bytes to the renderer
-;;; through a mutex-protected mailbox inside libcanary-native.so; the
-;;; render thread wakes on glfwPostEmptyEvent and uploads + draws.
+;;; The Scheme module owns every user-facing knob: font paths, font
+;;; size, atlas geometry, default colours, cursor-style mapping, and
+;;; the underline/strikethrough vertical positions.  Defaults live as
+;;; %name constants below; the user overrides them via constructor
+;;; kwargs.  All values flow into the renderer through a two-phase
+;;; FFI configure call -- font config first (so freetype reports the
+;;; derived cell dimensions), then the full runtime config -- before
+;;; the render thread enters its loop.
 ;;;
 ;;; Code:
+
+
+;;;
+;;; Defaults.
+;;;
+
+(define %default-font-px           16)
+(define %default-font-paths        '("DejaVuSansMono.ttf"
+                                     "DejaVuSansMono-Bold.ttf"
+                                     "DejaVuSansMono-Oblique.ttf"))
+(define %default-atlas-cols        16)
+(define %default-atlas-rows        16)
+(define %default-atlas-oversample  2)
+(define %default-layer-for-bold    1)
+(define %default-layer-for-italic  2)
+(define %default-fg                #xFFFFFFFF)
+(define %default-bg                #xFFFFFFFF)
+(define %default-cursor-styles     '((hidden    . 0)
+                                     (block     . 1)
+                                     (underline . 2)
+                                     (bar       . 3)))
+(define %default-underline-y       0.86)
+(define %default-strike-y-min      0.46)
+(define %default-strike-y-max      0.54)
+
+(define %font-dir-fallbacks
+  '("/run/current-system/profile/share/fonts/truetype"
+    "/.guix-home/profile/share/fonts/truetype"
+    "/.guix-profile/share/fonts/truetype"))
 
 
 ;;;
@@ -51,9 +70,6 @@
 ;;;
 
 (define (%search-library-path basename)
-  ;; Walk a union of search paths: $GUIX_ENVIRONMENT/lib (guix shell
-  ;; profile root), LIBRARY_PATH, and LD_LIBRARY_PATH.  Any one of
-  ;; these may carry the .so depending on how the host invoked us.
   (let* ((env (string-append
                (or (and=> (getenv "GUIX_ENVIRONMENT")
                           (lambda (p) (string-append p "/lib"))) "")
@@ -87,22 +103,12 @@
             (and p (false-if-exception (dynamic-link p))))
           prog)))))
 
-;; libnative is resolved on first use rather than at module-load so
-;; this module compiles cleanly (guild can produce backend-native.go)
-;; even when libcanary-native.so isn't on the host -- canary's core
-;; build doesn't ship the .so; the canary-native-backend Guix package
-;; does.  First call to any FFI proc forces the lookup and caches it.
 (define libnative-promise
   (delay
     (%find-lib "libcanary-native.so" '("canary-native" "libcanary-native")
                "canary_native_create")))
 
 (define (%c name) (dynamic-func name (force libnative-promise)))
-
-
-;;;
-;;; FFI bindings (lazy: pointer->procedure runs on first call).
-;;;
 
 (define-syntax-rule (define-foreign name ret args c-name)
   (define name
@@ -112,18 +118,19 @@
           (set! proc (pointer->procedure ret (%c c-name) args)))
         (apply proc actual-args)))))
 
-(define-foreign %create        '*   '()                                          "canary_native_create")
-(define-foreign %destroy       void '(*)                                         "canary_native_destroy")
-(define-foreign %run           void '(*)                                         "canary_native_run")
-(define-foreign %stop          void '(*)                                         "canary_native_stop")
-(define-foreign %eventfd       int  '(*)                                         "canary_native_eventfd")
-(define-foreign %drain-eventfd void '(*)                                         "canary_native_drain_eventfd")
-(define-foreign %wait-event    int  '(*)                                         "canary_native_wait_event")
-(define-foreign %next-event    int  (list '* '* '* '* '* '* '* '* '* '* '*)     "canary_native_next_event")
-(define-foreign %submit-frame  void (list '* '* size_t uint16 uint16 uint16 uint16 uint8 int) "canary_native_submit_frame")
-(define-foreign %set-title     void '(* *)                                       "canary_native_set_title")
-(define-foreign %cell-w-dev    int  '()                                          "canary_native_cell_w_dev")
-(define-foreign %cell-h-dev    int  '()                                          "canary_native_cell_h_dev")
+(define-foreign %create            '*   '()                                     "canary_native_create")
+(define-foreign %destroy           void '(*)                                    "canary_native_destroy")
+(define-foreign %configure-font    int  '(* *)                                  "canary_native_configure_font")
+(define-foreign %query-cell-size   int  '(* * *)                                "canary_native_query_cell_size")
+(define-foreign %configure         int  '(* *)                                  "canary_native_configure")
+(define-foreign %run               void '(*)                                    "canary_native_run")
+(define-foreign %stop              void '(*)                                    "canary_native_stop")
+(define-foreign %eventfd           int  '(*)                                    "canary_native_eventfd")
+(define-foreign %wait-event        int  '(*)                                    "canary_native_wait_event")
+(define-foreign %drain-eventfd     void '(*)                                    "canary_native_drain_eventfd")
+(define-foreign %next-event        int  (list '* '* '* '* '* '* '* '* '* '* '*) "canary_native_next_event")
+(define-foreign %submit-frame      void (list '* '* size_t uint16 uint16 uint16 uint16 uint8 int) "canary_native_submit_frame")
+(define-foreign %set-title         void '(* *)                                  "canary_native_set_title")
 
 
 ;;;
@@ -140,13 +147,244 @@
   (theme         #:init-keyword #:theme
                  #:init-value default-theme
                  #:accessor native-backend-theme)
-  (render-thread #:init-value #f #:accessor native-backend-render-thread)
-  (drain-thread  #:init-value #f #:accessor native-backend-drain-thread)
+  (font-px       #:init-keyword #:font-px
+                 #:accessor native-backend-font-px)
+  (font-paths    #:init-keyword #:font-paths
+                 #:accessor native-backend-font-paths)
+  (cell-w        #:init-keyword #:cell-w
+                 #:accessor native-backend-cell-w)
+  (cell-h        #:init-keyword #:cell-h
+                 #:accessor native-backend-cell-h)
+  (atlas-cols    #:init-keyword #:atlas-cols
+                 #:accessor native-backend-atlas-cols)
+  (atlas-rows    #:init-keyword #:atlas-rows
+                 #:accessor native-backend-atlas-rows)
+  (atlas-oversample #:init-keyword #:atlas-oversample
+                    #:accessor native-backend-atlas-oversample)
+  (layer-for-bold   #:init-keyword #:layer-for-bold
+                    #:accessor native-backend-layer-for-bold)
+  (layer-for-italic #:init-keyword #:layer-for-italic
+                    #:accessor native-backend-layer-for-italic)
+  (default-fg    #:init-keyword #:default-fg
+                 #:accessor native-backend-default-fg)
+  (default-bg    #:init-keyword #:default-bg
+                 #:accessor native-backend-default-bg)
+  (cursor-styles #:init-keyword #:cursor-styles
+                 #:accessor native-backend-cursor-styles)
+  (underline-y   #:init-keyword #:underline-y
+                 #:accessor native-backend-underline-y)
+  (strike-y-min  #:init-keyword #:strike-y-min
+                 #:accessor native-backend-strike-y-min)
+  (strike-y-max  #:init-keyword #:strike-y-max
+                 #:accessor native-backend-strike-y-max)
+  (render-thread  #:init-value #f #:accessor native-backend-render-thread)
+  (drain-thread   #:init-value #f #:accessor native-backend-drain-thread)
   (drain-running? #:init-value #t #:accessor native-backend-drain-running?))
 
-(define* (native-backend #:key (size (size 80 24)) (theme default-theme))
-  "Return a fresh <native-backend> sized to SIZE under THEME."
-  (make <native-backend> #:size size #:theme theme))
+(define (%font-dir)
+  "Resolve the directory that holds the TTF basenames passed in FONT-PATHS.
+Walks CANARY_NATIVE_FONT_DIR first, then GUIX_ENVIRONMENT/share/fonts/truetype
+(set by `guix shell'), then the user-profile fallbacks.  Returns the
+first directory that contains at least one .ttf file."
+  (define (candidate-from-env env-name suffix)
+    (and=> (getenv env-name)
+           (lambda (p) (string-append p suffix))))
+  (define (any-ttf? dir)
+    (and (file-exists? dir)
+         (catch #t
+           (lambda ()
+             (let ((dh (opendir dir)))
+               (let loop ()
+                 (let ((e (readdir dh)))
+                   (cond
+                    ((eof-object? e) (closedir dh) #f)
+                    ((string-suffix? ".ttf" e) (closedir dh) #t)
+                    (else (loop)))))))
+           (lambda _ #f))))
+  (let ((env-dir (getenv "CANARY_NATIVE_FONT_DIR")))
+    (cond
+     ((and env-dir (any-ttf? env-dir)) env-dir)
+     (else
+      (let loop ((rest (append
+                        (filter identity
+                                (list (candidate-from-env "GUIX_ENVIRONMENT"
+                                                          "/share/fonts/truetype")
+                                      (candidate-from-env "HOME"
+                                                          "/.guix-home/profile/share/fonts/truetype")
+                                      (candidate-from-env "HOME"
+                                                          "/.guix-profile/share/fonts/truetype")))
+                        %font-dir-fallbacks)))
+        (cond
+         ((null? rest)
+          (error "canary backend-native: no TTF font directory found; set CANARY_NATIVE_FONT_DIR"))
+         ((any-ttf? (car rest)) (car rest))
+         (else (loop (cdr rest)))))))))
+
+(define (%resolve-font-path p)
+  "Return P as an absolute path: P itself if it's already absolute,
+otherwise (font-dir)/P."
+  (cond
+   ((and (string? p) (> (string-length p) 0) (char=? (string-ref p 0) #\/))
+    p)
+   (else
+    (string-append (%font-dir) "/" p))))
+
+(define* (native-backend
+          #:key (size             (size 80 24))
+                (theme            default-theme)
+                (font-px          %default-font-px)
+                (font-paths       %default-font-paths)
+                (cell-w           #f)
+                (cell-h           #f)
+                (atlas-cols       %default-atlas-cols)
+                (atlas-rows       %default-atlas-rows)
+                (atlas-oversample %default-atlas-oversample)
+                (layer-for-bold   %default-layer-for-bold)
+                (layer-for-italic %default-layer-for-italic)
+                (default-fg       %default-fg)
+                (default-bg       %default-bg)
+                (cursor-styles    %default-cursor-styles)
+                (underline-y      %default-underline-y)
+                (strike-y-min     %default-strike-y-min)
+                (strike-y-max     %default-strike-y-max))
+  "Return a fresh <native-backend>.  SIZE is the cell grid (a <size>
+of columns by rows).  THEME is a <theme>.  FONT-PX is the requested
+font size in device pixels; FONT-PATHS is a list of TTF basenames or
+absolute paths whose length determines the atlas-layer count.  CELL-W
+and CELL-H default to #f, meaning derive from the font's max advance
+and ascender+descender at FONT-PX; pass explicit pixel counts to force
+padded cells.  ATLAS-COLS and ATLAS-ROWS set the codepoint slot grid;
+ATLAS-OVERSAMPLE multiplies atlas texture resolution against the cell
+to keep glyphs crisp under fractional scaling.  LAYER-FOR-BOLD and
+LAYER-FOR-ITALIC are integer indices into FONT-PATHS (or -1 for no
+styled layer).  DEFAULT-FG and DEFAULT-BG are u32 RGB values (sentinel
+#xFFFFFFFF means the renderer picks its own).  CURSOR-STYLES is an
+alist mapping symbols (hidden block underline bar) to integer wire
+codes.  UNDERLINE-Y, STRIKE-Y-MIN, and STRIKE-Y-MAX are vertical
+fractions within the cell for the two decoration strips."
+  (validate-kwargs! font-px font-paths atlas-cols atlas-rows atlas-oversample
+                    layer-for-bold layer-for-italic
+                    underline-y strike-y-min strike-y-max)
+  (make <native-backend>
+    #:size size #:theme theme
+    #:font-px font-px
+    #:font-paths font-paths
+    #:cell-w cell-w
+    #:cell-h cell-h
+    #:atlas-cols atlas-cols
+    #:atlas-rows atlas-rows
+    #:atlas-oversample atlas-oversample
+    #:layer-for-bold layer-for-bold
+    #:layer-for-italic layer-for-italic
+    #:default-fg default-fg
+    #:default-bg default-bg
+    #:cursor-styles cursor-styles
+    #:underline-y underline-y
+    #:strike-y-min strike-y-min
+    #:strike-y-max strike-y-max))
+
+(define (validate-kwargs! font-px paths cols rows oversample bold italic uy ymin ymax)
+  (unless (and (integer? font-px) (positive? font-px))
+    (error "native-backend: FONT-PX must be a positive integer" font-px))
+  (unless (and (list? paths) (pair? paths))
+    (error "native-backend: FONT-PATHS must be a non-empty list" paths))
+  (unless (and (integer? cols) (positive? cols))
+    (error "native-backend: ATLAS-COLS must be a positive integer" cols))
+  (unless (and (integer? rows) (positive? rows))
+    (error "native-backend: ATLAS-ROWS must be a positive integer" rows))
+  (unless (and (integer? oversample) (positive? oversample))
+    (error "native-backend: ATLAS-OVERSAMPLE must be a positive integer" oversample))
+  (let ((n (length paths)))
+    (unless (or (= bold -1) (and (<= 0 bold) (< bold n)))
+      (error "native-backend: LAYER-FOR-BOLD out of range" bold))
+    (unless (or (= italic -1) (and (<= 0 italic) (< italic n)))
+      (error "native-backend: LAYER-FOR-ITALIC out of range" italic)))
+  (for-each
+   (lambda (v name)
+     (unless (and (real? v) (<= 0 v) (<= v 1))
+       (error name v)))
+   (list uy ymin ymax)
+   (list "native-backend: UNDERLINE-Y must be in [0,1]"
+         "native-backend: STRIKE-Y-MIN must be in [0,1]"
+         "native-backend: STRIKE-Y-MAX must be in [0,1]")))
+
+
+;;;
+;;; Config packing.
+;;;
+
+(define %font-config-size (+ 8 4 4))   ; pointer (u64) + n_paths (u32) + font_px (i32)
+(define %native-config-size
+  (+ 4 4 4               ; cell_w_dev, cell_h_dev, font_px_dev
+     4 4 4 4             ; atlas_oversample, atlas_cols, atlas_rows, n_layers
+     16 16               ; default_fg[4] f32, default_bg[4] f32
+     4 4 4               ; underline_y, strike_y_min, strike_y_max
+     4 4))               ; layer_for_bold, layer_for_italic
+
+(define (rgb-u32->rgba-f32-bytes rgb out off)
+  (cond
+   ((= rgb #xFFFFFFFF)
+    (bytevector-ieee-single-native-set! out off          1.0)
+    (bytevector-ieee-single-native-set! out (+ off 4)    1.0)
+    (bytevector-ieee-single-native-set! out (+ off 8)    1.0)
+    (bytevector-ieee-single-native-set! out (+ off 12)   1.0))
+   (else
+    (let* ((r (/ (logand (ash rgb -16) #xFF) 255.0))
+           (g (/ (logand (ash rgb  -8) #xFF) 255.0))
+           (b (/ (logand rgb            #xFF) 255.0)))
+      (bytevector-ieee-single-native-set! out off          r)
+      (bytevector-ieee-single-native-set! out (+ off 4)    g)
+      (bytevector-ieee-single-native-set! out (+ off 8)    b)
+      (bytevector-ieee-single-native-set! out (+ off 12)   1.0)))))
+
+(define (pack-font-config paths-ptr-array n-paths font-px)
+  "Pack a FontConfig extern struct: pointer-to-path-array, count, px.
+The path-array bytevector is the caller's; keep it alive."
+  (let ((bv (make-bytevector %font-config-size 0)))
+    (bytevector-u64-native-set! bv 0
+                                (pointer-address (bytevector->pointer paths-ptr-array)))
+    (bytevector-u32-native-set! bv 8  n-paths)
+    (bytevector-s32-native-set! bv 12 font-px)
+    bv))
+
+(define (pack-paths-array paths)
+  "Pack PATHS (a list of strings) as a contiguous array of pointers
+to null-terminated UTF-8 byte buffers.  Returns (paths-bv string-bvs)
+where caller retains both bytevectors for the duration of the FFI
+call so the pointers stay valid."
+  (let* ((strs (map (lambda (s)
+                      (let ((bv (string->utf8 s)))
+                        (let ((with-nul (make-bytevector (+ 1 (bytevector-length bv)) 0)))
+                          (bytevector-copy! bv 0 with-nul 0 (bytevector-length bv))
+                          with-nul)))
+                    paths))
+         (n   (length paths))
+         (out (make-bytevector (* 8 n) 0)))
+    (let loop ((i 0) (rest strs))
+      (cond
+       ((null? rest) (values out strs))
+       (else
+        (bytevector-u64-native-set! out (* i 8)
+                                    (pointer-address (bytevector->pointer (car rest))))
+        (loop (+ i 1) (cdr rest)))))))
+
+(define (pack-native-config b cell-w-dev cell-h-dev)
+  (let* ((bv (make-bytevector %native-config-size 0)))
+    (bytevector-s32-native-set! bv 0  cell-w-dev)
+    (bytevector-s32-native-set! bv 4  cell-h-dev)
+    (bytevector-s32-native-set! bv 8  (native-backend-font-px b))
+    (bytevector-s32-native-set! bv 12 (native-backend-atlas-oversample b))
+    (bytevector-s32-native-set! bv 16 (native-backend-atlas-cols b))
+    (bytevector-s32-native-set! bv 20 (native-backend-atlas-rows b))
+    (bytevector-u32-native-set! bv 24 (length (native-backend-font-paths b)))
+    (rgb-u32->rgba-f32-bytes (native-backend-default-fg b) bv 28)
+    (rgb-u32->rgba-f32-bytes (native-backend-default-bg b) bv 44)
+    (bytevector-ieee-single-native-set! bv 60 (native-backend-underline-y b))
+    (bytevector-ieee-single-native-set! bv 64 (native-backend-strike-y-min b))
+    (bytevector-ieee-single-native-set! bv 68 (native-backend-strike-y-max b))
+    (bytevector-s32-native-set! bv 72 (native-backend-layer-for-bold b))
+    (bytevector-s32-native-set! bv 76 (native-backend-layer-for-italic b))
+    bv))
 
 
 ;;;
@@ -170,6 +408,12 @@
   (apply-resize! b w h))
 
 (define-method (backend-mark-dirty! (b <native-backend>)) #f)
+
+(define (cursor-code b mode)
+  "Translate a cursor MODE symbol to its wire code via the backend's
+cursor-styles alist."
+  (let ((entry (assq mode (native-backend-cursor-styles b))))
+    (if entry (cdr entry) 1)))
 
 (define-method (backend-handle-cmd (b <native-backend>) eng cmd)
   (match cmd
@@ -197,15 +441,18 @@
 
 
 ;;;
-;;; Input direction: glfw thread -> eventfd -> fiber -> engine.
+;;; Input drain: render thread -> eventfd -> POSIX drain thread -> engine.
 ;;;
 
 (define (send-to-engine eng msg)
+  "Forward MSG to ENG's main fiber via the engine's `send' procedure,
+which is thread-safe."
   (let ((send-proc (module-ref (resolve-module '(canary engine)) 'send)))
     (send-proc eng msg)))
 
 (define (decode-mods byte)
-  "GLFW_MOD_SHIFT=1, _CONTROL=2, _ALT=4, _SUPER=8 -> canary mod symbols."
+  "Translate a GLFW modifier bitmask BYTE to a list of canary mod
+symbols ('shift 'control 'alt 'meta)."
   (let loop ((bit 0) (out '()))
     (cond
      ((= bit 4) (reverse out))
@@ -220,9 +467,6 @@
                   (cons mod out)
                   out)))))))
 
-;; Subset of GLFW_KEY_* that don't produce printable characters and
-;; therefore must be translated into named-key symbols (chars come
-;; through char_callback instead).  Matches canary.js keySym() output.
 (define %glfw-named-keys
   '((256 . escape)
     (257 . enter)
@@ -238,20 +482,13 @@
     (267 . pagedown)
     (268 . home)
     (269 . end)
-    (290 . f1)
-    (291 . f2)
-    (292 . f3)
-    (293 . f4)
-    (294 . f5)
-    (295 . f6)
-    (296 . f7)
-    (297 . f8)
-    (298 . f9)
-    (299 . f10)
-    (300 . f11)
-    (301 . f12)))
+    (290 . f1)  (291 . f2)  (292 . f3)  (293 . f4)
+    (294 . f5)  (295 . f6)  (296 . f7)  (297 . f8)
+    (298 . f9)  (299 . f10) (300 . f11) (301 . f12)))
 
 (define (glfw-key-action->event action)
+  "Translate a GLFW action byte ACTION (0=press, 1=release, 2=repeat)
+to a canary event symbol."
   (case action
     ((0) 'press)
     ((1) 'release)
@@ -259,6 +496,9 @@
     (else 'press)))
 
 (define (build-key-event sym-int mods-byte action)
+  "Build a <key> for the named GLFW key code SYM-INT, or #f if it's
+not one of the named keys.  Printable codepoints go through the char
+path instead."
   (let ((named (assv sym-int %glfw-named-keys)))
     (and named
          (let ((k (normalize-key (cons (cdr named) (decode-mods mods-byte)))))
@@ -266,24 +506,29 @@
            k))))
 
 (define (build-char-event codepoint)
+  "Build a <key> for the printable Unicode CODEPOINT."
   (let ((k (normalize-key (list (integer->char codepoint)))))
     (slot-set! k 'event 'press)
     k))
 
 (define (drain-events! b)
+  "Pump every pending input event out of the renderer's ring into the
+engine.  Called by the drain thread after %wait-event signals."
   (let* ((handle (native-backend-handle b))
-         (eng    (native-backend-engine b)))
+         (eng    (native-backend-engine b))
+         (cell-w (native-backend-cell-w b))
+         (cell-h (native-backend-cell-h b)))
     (%drain-eventfd handle)
-    (let ((kind-bv     (make-bytevector 1 0))
-          (sym-bv      (make-bytevector 4 0))
-          (mods-bv     (make-bytevector 1 0))
-          (action-bv   (make-bytevector 1 0))
-          (x-bv        (make-bytevector 4 0))
-          (y-bv        (make-bytevector 4 0))
-          (button-bv   (make-bytevector 1 0))
-          (w-bv        (make-bytevector 2 0))
-          (h-bv        (make-bytevector 2 0))
-          (scroll-bv   (make-bytevector 1 0)))
+    (let ((kind-bv   (make-bytevector 1 0))
+          (sym-bv    (make-bytevector 4 0))
+          (mods-bv   (make-bytevector 1 0))
+          (action-bv (make-bytevector 1 0))
+          (x-bv      (make-bytevector 4 0))
+          (y-bv      (make-bytevector 4 0))
+          (button-bv (make-bytevector 1 0))
+          (w-bv      (make-bytevector 2 0))
+          (h-bv      (make-bytevector 2 0))
+          (scroll-bv (make-bytevector 1 0)))
       (let loop ()
         (let ((got (%next-event handle
                                 (bytevector->pointer kind-bv)
@@ -308,46 +553,35 @@
                   (rh     (bytevector-u16-native-ref h-bv 0))
                   (sdy    (bytevector-s8-ref scroll-bv 0)))
               (case kind
-                ((1) ; named key (printable text takes the char path below)
+                ((1)
                  (cond
-                  ;; GLFW_KEY_SPACE produces a char event, not a named-key.
-                  ;; Treat printable codes (32..126) as chars when char
-                  ;; event hasn't already covered them — but the simpler
-                  ;; rule: emit named-key symbols only.
                   ((< sym 256)
-                   ;; Translate single Unicode codepoint to a char-keyed key.
                    (when (and (>= sym 32) (= action 0))
                      (send-to-engine eng (build-char-event sym))))
                   (else
                    (let ((k (build-key-event sym mods action)))
                      (when k (send-to-engine eng k))))))
-                ((2) ; mouse
-                 (let* ((cell-w (%cell-w-dev))
-                        (cell-h (%cell-h-dev))
-                        (cx     (quotient mx cell-w))
-                        (cy     (quotient my cell-h))
-                        (act    (case action
-                                  ((0) 'press)
-                                  ((1) 'release)
-                                  ((2) 'motion)
-                                  (else 'motion))))
+                ((2)
+                 (let* ((cx  (quotient mx cell-w))
+                        (cy  (quotient my cell-h))
+                        (act (case action
+                               ((0) 'press)
+                               ((1) 'release)
+                               ((2) 'motion)
+                               (else 'motion))))
                    (send-to-engine eng (mouse cx cy btn act))))
-                ((3) ; resize: framebuffer pixels -> cell grid
-                 (let* ((cell-w (%cell-w-dev))
-                        (cell-h (%cell-h-dev))
-                        (cols   (max 20 (quotient rw cell-w)))
-                        (rows   (max 5  (quotient rh cell-h))))
+                ((3)
+                 (let ((cols (max 20 (quotient rw cell-w)))
+                       (rows (max 5  (quotient rh cell-h))))
                    (send-to-engine eng (resize cols rows))))
-                ((5) ; scroll
-                 (let* ((cell-w (%cell-w-dev))
-                        (cell-h (%cell-h-dev))
-                        (cx     (quotient mx cell-w))
-                        (cy     (quotient my cell-h)))
+                ((5)
+                 (let ((cx (quotient mx cell-w))
+                       (cy (quotient my cell-h)))
                    (send-to-engine eng
                                    (mouse cx cy 3
                                           (if (positive? sdy)
                                               'scroll-up 'scroll-down)))))
-                ((6) ; window-close button -> stop the engine
+                ((6)
                  ((module-ref (resolve-module '(canary engine))
                               'stop-engine!)
                   eng))
@@ -355,11 +589,8 @@
             (loop)))))))
 
 (define (start-drain-thread! b)
-  "Spawn a POSIX thread that blocks on the C-side wait_event call and
-dispatches input into the engine.  Mirrors webui's wait-thread shape:
-the engine's fiber scheduler hasn't booted yet at backend-init time, so
-we can't use spawn-fiber here.  send-to-engine is thread-safe via the
-engine's queue mutex."
+  "Spawn the drain POSIX thread that blocks on the renderer's eventfd
+and pushes input into the engine."
   (let ((handle (native-backend-handle b)))
     (call-with-new-thread
      (lambda ()
@@ -378,25 +609,26 @@ engine's queue mutex."
 
 
 ;;;
-;;; Output direction: cmds -> term -> wire cell bytevector -> shim.
+;;; Frame submission.
 ;;;
 
-(define %cell-size 13)
-(define %default-fg #xFFFFFFFF)
-(define %default-bg #xFFFFFFFF)
+(define %wire-cell-size 13)
+(define %color-default-sentinel #xFFFFFFFF)
 
 (define (face-fg->rgb face)
   (cond
-   ((not face) %default-fg)
+   ((not face) %color-default-sentinel)
    (else (or (and (t:face-fg face) (color->rgb (t:face-fg face)))
-             %default-fg))))
+             %color-default-sentinel))))
 
 (define (face-bg->rgb face)
   (cond
-   ((not face) %default-bg)
-   (else (or (color->rgb (t:face-bg face)) %default-bg))))
+   ((not face) %color-default-sentinel)
+   (else (or (color->rgb (t:face-bg face)) %color-default-sentinel))))
 
 (define (color->rgb c)
+  "Resolve C to a u32 with byte layout 0x00RRGGBB, or #f if unrecognised.
+Accepts palette indices, hex strings (#rrggbb), 3-element lists/vectors."
   (cond
    ((not c) #f)
    ((and (integer? c) (>= c 0) (< c 256))
@@ -416,6 +648,9 @@ engine's queue mutex."
    (else #f)))
 
 (define (face->attrs face)
+  "Pack FACE's boolean attributes into a single byte: bit 0 bold, bit
+1 italic, bit 2 underline, bit 3 inverse, bit 4 crossed, bit 5 faint,
+bit 6 hyperlink."
   (if (not face)
       0
       (logior (if (t:face-bold?    face) 1  0)
@@ -426,23 +661,23 @@ engine's queue mutex."
               (if (t:face-faint?   face) 32 0))))
 
 (define (build-cells-bv term)
+  "Encode TERM's cells into a fresh bytevector of width*height *
+%wire-cell-size bytes (u32 cp, u32 fg, u32 bg, u8 attrs)."
   (let* ((w     (t:term-width  term))
          (h     (t:term-height term))
          (cells (* w h))
          (chars (t:term-chars term))
          (faces (t:term-faces term))
-         (bv    (make-bytevector (* cells %cell-size) 0)))
+         (bv    (make-bytevector (* cells %wire-cell-size) 0)))
     (do ((i 0 (+ i 1)))
         ((= i cells) bv)
-      (let* ((off  (* i %cell-size))
+      (let* ((off  (* i %wire-cell-size))
              (cp   (u32vector-ref chars i))
              (face (vector-ref    faces i))
              (a    (face->attrs face)))
         (bytevector-u32-set! bv off cp (endianness little))
-        (bytevector-u32-set! bv (+ off 4)
-                             (face-fg->rgb face) (endianness little))
-        (bytevector-u32-set! bv (+ off 8)
-                             (face-bg->rgb face) (endianness little))
+        (bytevector-u32-set! bv (+ off 4) (face-fg->rgb face) (endianness little))
+        (bytevector-u32-set! bv (+ off 8) (face-bg->rgb face) (endianness little))
         (bytevector-u8-set!  bv (+ off 12) a)))))
 
 (define-method (backend-draw (b <native-backend>) cmds)
@@ -474,6 +709,49 @@ engine's queue mutex."
 ;;; Lifecycle.
 ;;;
 
+(define (configure-renderer! b h)
+  "Push the backend's config into the renderer.  Two phases: load the
+fonts at the requested px so freetype can report derived cell metrics,
+then send the full runtime config with the user override (or the
+freetype-derived defaults)."
+  (let* ((paths (map %resolve-font-path (native-backend-font-paths b)))
+         (font-px (native-backend-font-px b))
+         (oversample (native-backend-atlas-oversample b)))
+    ;; Phase 1: font.
+    (call-with-values
+        (lambda () (pack-paths-array paths))
+      (lambda (paths-bv strs)
+        ;; Keep paths-bv and each string bv alive until the FFI call returns.
+        (let* ((font-cfg (pack-font-config paths-bv (length paths)
+                                           (* font-px oversample))))
+          (let ((rc (%configure-font h (bytevector->pointer font-cfg))))
+            (unless (zero? rc)
+              (error "canary_native_configure_font failed" rc paths)))
+          ;; Phase 2: query derived cell, then commit full config.
+          (let* ((out-w (make-bytevector 4 0))
+                 (out-h (make-bytevector 4 0))
+                 (qrc (%query-cell-size h
+                                        (bytevector->pointer out-w)
+                                        (bytevector->pointer out-h))))
+            (unless (zero? qrc)
+              (error "canary_native_query_cell_size failed" qrc))
+            (let* ((raw-w (bytevector-s32-native-ref out-w 0))
+                   (raw-h (bytevector-s32-native-ref out-h 0))
+                   ;; Ceiling-divide back to device px so the atlas cell
+                   ;; (cell_w_dev * oversample) is never smaller than the
+                   ;; font's reported bbox -- otherwise the lost fractional
+                   ;; px lands on the deepest descenders.
+                   (derived-w (max 1 (quotient (+ raw-w (- oversample 1)) oversample)))
+                   (derived-h (max 1 (quotient (+ raw-h (- oversample 1)) oversample)))
+                   (cell-w (or (native-backend-cell-w b) derived-w))
+                   (cell-h (or (native-backend-cell-h b) derived-h)))
+              (set! (native-backend-cell-w b) cell-w)
+              (set! (native-backend-cell-h b) cell-h)
+              (let ((native-cfg (pack-native-config b cell-w cell-h)))
+                (let ((rc2 (%configure h (bytevector->pointer native-cfg))))
+                  (unless (zero? rc2)
+                    (error "canary_native_configure failed" rc2)))))))))))
+
 (define-method (backend-init (b <native-backend>))
   (let* ((sz   (native-backend-size-slot b))
          (term (t:make-term #:width  (size-width sz)
@@ -481,6 +759,7 @@ engine's queue mutex."
          (h    (%create)))
     (set! (native-backend-cur-term b) term)
     (set! (native-backend-handle   b) h)
+    (configure-renderer! b h)
     (set! (native-backend-render-thread b)
           (call-with-new-thread
            (lambda ()

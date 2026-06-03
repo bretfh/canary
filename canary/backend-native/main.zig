@@ -1,31 +1,8 @@
-//! canary backend-native — the C side of (canary backend-native).
-//!
-//! glfw owns the window + input + GL 3.3 core context.  freetype
-//! rasterises glyphs.  libepoxy loads GL symbols.  Three GL programs:
-//! cell-grid (instanced quads), cursor (uniform-driven quad), image-
-//! overlay (per-placement uniforms).  Matches canary/backend-webui/
-//! client/canary.js's WebGL2 client: 3-layer sampler2DArray atlas
-//! (regular/bold/italic), 2x oversampled, LINEAR filter, on-demand
-//! glyph rasterisation, instanced per-cell rendering with identical
-//! fragment shader logic.
-//!
-//! Threading:
-//!   - glfw runs on a dedicated POSIX thread spawned from Scheme via
-//!     call-with-new-thread.  All GL calls, FreeType calls, and glfw
-//!     callbacks fire on that thread.
-//!   - Input events from glfw callbacks land in a mutex-protected ring
-//!     and notify via an eventfd.  A Guile fiber on the main thread
-//!     blocks on the eventfd and drains the ring, building <key> /
-//!     <mouse> / <resize> records.  No SCM is touched from the glfw
-//!     thread.
-//!   - backend-draw on the main fiber hands raw cell bytes through a
-//!     mutex-protected mailbox.  The glfw thread reads it at the top
-//!     of each frame, ensures atlas slots exist for new codepoints,
-//!     uploads cells, draws.
+//! Native renderer driven by (canary backend-native).  See that module
+//! for threading model, defaults, and the FFI contract.
 
 const std = @import("std");
 const builtin = @import("builtin");
-const build_options = @import("build_options");
 
 const glfw = @cImport({
     @cInclude("GLFW/glfw3.h");
@@ -44,35 +21,16 @@ const guile = @cImport({
     @cInclude("libguile.h");
 });
 
-// libguile macros translate-c can't follow; live in wrappers.c.
 extern fn cn_scm_undefined() guile.SCM;
 extern fn cn_scm_unspecified() guile.SCM;
 extern fn cn_scm_is_undefined(s: guile.SCM) c_int;
 
-// ---- constants matching canary.js -------------------------------------
-
-const CELL_W_DEV: i32 = 10;
-const CELL_H_DEV: i32 = 20;
-const ATLAS_OVERSAMPLE: i32 = 2;
-const CELL_W: i32 = CELL_W_DEV * ATLAS_OVERSAMPLE;
-const CELL_H: i32 = CELL_H_DEV * ATLAS_OVERSAMPLE;
-const ATLAS_COLS: i32 = 16;
-const ATLAS_ROWS: i32 = 16;
-const ATLAS_LAYERS: i32 = 3;
-const ATLAS_MAX_SLOTS: u16 = @intCast(ATLAS_COLS * ATLAS_ROWS);
-
-// Per-cell vertex attribute layout (matches canary.js cellStride/FLOATS_PER_CELL).
+const WIRE_CELL_SIZE: usize = 13;
 const FLOATS_PER_CELL: usize = 12;
 const CELL_STRIDE: usize = FLOATS_PER_CELL * @sizeOf(f32);
-
-// canary wire cell layout (matches backend-webui.scm encode-frame).
-const WIRE_CELL_SIZE: usize = 13;
-
-const DEFAULT_FG = [4]f32{ 0.9, 0.9, 0.9, 1.0 };
-const DEFAULT_BG = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
 const COLOR_DEFAULT_SENTINEL: u32 = 0xFFFFFFFF;
 
-// ---- POD types crossing thread / FFI boundary -------------------------
+const MAX_LAYERS: usize = 8;
 
 const InputKind = enum(u8) {
     key = 1,
@@ -87,7 +45,7 @@ const InputEvent = extern struct {
     kind: u8,
     key_sym: u32 = 0,
     mods: u8 = 0,
-    action: u8 = 0, // 0=press 1=release 2=repeat
+    action: u8 = 0,
     mouse_x: i32 = 0,
     mouse_y: i32 = 0,
     mouse_button: u8 = 0,
@@ -114,31 +72,62 @@ const ImageEntry = struct {
     h: i32,
 };
 
-// ---- the singleton backend instance -----------------------------------
+const FontConfig = extern struct {
+    font_paths: [*]const [*:0]const u8,
+    n_paths: u32,
+    font_px: i32,
+};
+
+const NativeConfig = extern struct {
+    cell_w_dev: i32,
+    cell_h_dev: i32,
+    font_px_dev: i32,
+    atlas_oversample: i32,
+    atlas_cols: i32,
+    atlas_rows: i32,
+    n_layers: u32,
+    default_fg: [4]f32,
+    default_bg: [4]f32,
+    underline_y: f32,
+    strike_y_min: f32,
+    strike_y_max: f32,
+    layer_for_bold: i32,
+    layer_for_italic: i32,
+};
 
 const Backend = struct {
     alloc: std.mem.Allocator,
 
-    // window / GL
+    cell_w_dev: i32 = 0,
+    cell_h_dev: i32 = 0,
+    font_px_dev: i32 = 0,
+    atlas_oversample: i32 = 0,
+    atlas_cols: i32 = 0,
+    atlas_rows: i32 = 0,
+    n_layers: u32 = 0,
+    default_fg: [4]f32 = .{ 0, 0, 0, 0 },
+    default_bg: [4]f32 = .{ 0, 0, 0, 0 },
+    underline_y: f32 = 0,
+    strike_y_min: f32 = 0,
+    strike_y_max: f32 = 0,
+    layer_for_bold: i32 = -1,
+    layer_for_italic: i32 = -1,
+
+    cell_w: i32 = 0,
+    cell_h: i32 = 0,
+    font_px: i32 = 0,
+    atlas_max_slots: u16 = 0,
+
+    ft_lib: ft.FT_Library = null,
+    fonts: [MAX_LAYERS]ft.FT_Face = @splat(@as(ft.FT_Face, null)),
+    font_bytes: [MAX_LAYERS][]u8 = @splat(@as([]u8, &.{})),
+
     window: ?*glfw.GLFWwindow = null,
     framebuffer_w: i32 = 800,
     framebuffer_h: i32 = 600,
     content_scale: f32 = 1.0,
 
-    // freetype
-    ft_lib: ft.FT_Library = null,
-    fonts: [3]ft.FT_Face = .{ null, null, null },
-    font_bytes: [3][]u8 = .{ &.{}, &.{}, &.{} },
-
-    // atlas
-    glyph_map: std.AutoHashMapUnmanaged(u32, u16) = .{},
-    next_slot: u16 = 0,
-    atlas_dirty: std.AutoHashMapUnmanaged(u16, void) = .{},
     atlas_tex: gl.GLuint = 0,
-    atlas_sampler_unit: gl.GLint = 0,
-    fallback_slot: u16 = 0,
-
-    // pipelines
     cell_prog: gl.GLuint = 0,
     cursor_prog: gl.GLuint = 0,
     image_prog: gl.GLuint = 0,
@@ -148,20 +137,25 @@ const Backend = struct {
     cursor_vao: gl.GLuint = 0,
     image_vao: gl.GLuint = 0,
     cells_buf_capacity: usize = 0,
+    fallback_slot: u16 = 0,
 
-    // cell-program uniforms
     u_cellSize: gl.GLint = -1,
     u_viewport: gl.GLint = -1,
     u_atlasCells: gl.GLint = -1,
     u_atlas: gl.GLint = -1,
-    // cursor-program uniforms
+    u_layer_for_bold: gl.GLint = -1,
+    u_layer_for_italic: gl.GLint = -1,
+    u_underline_y: gl.GLint = -1,
+    u_strike_y_min: gl.GLint = -1,
+    u_strike_y_max: gl.GLint = -1,
+
     cu_cell: gl.GLint = -1,
     cu_cellSize: gl.GLint = -1,
     cu_viewport: gl.GLint = -1,
     cu_style: gl.GLint = -1,
     cu_alpha: gl.GLint = -1,
     cu_color: gl.GLint = -1,
-    // image-program uniforms
+
     iu_pos: gl.GLint = -1,
     iu_size: gl.GLint = -1,
     iu_uv: gl.GLint = -1,
@@ -169,10 +163,12 @@ const Backend = struct {
     iu_viewport: gl.GLint = -1,
     iu_img: gl.GLint = -1,
 
-    // images (uploaded RGBA8 textures keyed by canary's image id)
+    glyph_map: std.AutoHashMapUnmanaged(u32, u16) = .{},
+    next_slot: u16 = 0,
+    atlas_dirty: std.AutoHashMapUnmanaged(u16, void) = .{},
+
     images: std.AutoHashMapUnmanaged(u32, ImageEntry) = .{},
 
-    // frame mailbox (main fiber -> glfw thread)
     mailbox_mu: std.Thread.Mutex = .{},
     mailbox_cells: std.ArrayListUnmanaged(u8) = .{},
     mailbox_width: u16 = 0,
@@ -183,26 +179,19 @@ const Backend = struct {
     mailbox_cursor_blink: bool = false,
     mailbox_placements: std.ArrayListUnmanaged(ImagePlacement) = .{},
     mailbox_dirty: bool = false,
-
-    // CPU-side per-instance vertex buffer (resized on grid change)
     cells_attribs: std.ArrayListUnmanaged(f32) = .{},
 
-    // input ring (glfw thread -> main fiber)
     event_mu: std.Thread.Mutex = .{},
     events: std.ArrayListUnmanaged(InputEvent) = .{},
     eventfd: i32 = -1,
 
-    // shutdown
     stop_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    // last-mouse position for click coordinate computation
     mouse_x: f64 = 0,
     mouse_y: f64 = 0,
 };
 
 var g_backend: ?*Backend = null;
-
-// ---- GLSL sources (ports of canary.js shaders to GL 3.3 core) ---------
 
 const CELL_VS =
     \\#version 330 core
@@ -237,17 +226,6 @@ const CELL_VS =
     \\
 ;
 
-// Attr bit packing follows backend-webui.scm:932-950 face->attrs (the
-// wire encoder is the authority):
-//   bit 0  bold        -> atlas layer 1
-//   bit 1  italic      -> atlas layer 2
-//   bit 2  underline   -> bottom strip
-//   bit 3  inverse     -> swap fg/bg
-//   bit 4  crossed     -> middle strip
-//   bit 5  faint       -> fg *= 0.5
-//   bit 6  hyperlink   -> ignored by the renderer
-// The canary.js client interprets a different ordering; fix that
-// separately if visual parity matters.
 const CELL_FS =
     \\#version 330 core
     \\in vec2 v_uv;
@@ -256,19 +234,24 @@ const CELL_FS =
     \\in vec4 v_bg;
     \\flat in int v_attrs;
     \\uniform sampler2DArray u_atlas;
+    \\uniform int u_layer_for_bold;
+    \\uniform int u_layer_for_italic;
+    \\uniform float u_underline_y;
+    \\uniform float u_strike_y_min;
+    \\uniform float u_strike_y_max;
     \\out vec4 fragColor;
     \\void main() {
     \\  int layer = 0;
-    \\  if ((v_attrs & 1) != 0) layer = 1;
-    \\  else if ((v_attrs & 2) != 0) layer = 2;
+    \\  if ((v_attrs & 1) != 0 && u_layer_for_bold >= 0) layer = u_layer_for_bold;
+    \\  else if ((v_attrs & 2) != 0 && u_layer_for_italic >= 0) layer = u_layer_for_italic;
     \\  float a = texture(u_atlas, vec3(v_uv, float(layer))).r;
     \\  vec4 fg = v_fg;
     \\  vec4 bg = v_bg;
     \\  if ((v_attrs & 8)  != 0) { vec4 t = fg; fg = bg; bg = t; }
     \\  if ((v_attrs & 32) != 0) fg.rgb *= 0.5;
     \\  vec4 col = mix(bg, fg, a);
-    \\  if ((v_attrs & 4) != 0 && v_cellUv.y > 0.86) col = fg;
-    \\  if ((v_attrs & 16) != 0 && v_cellUv.y > 0.46 && v_cellUv.y < 0.54) col = fg;
+    \\  if ((v_attrs & 4) != 0 && v_cellUv.y > u_underline_y) col = fg;
+    \\  if ((v_attrs & 16) != 0 && v_cellUv.y > u_strike_y_min && v_cellUv.y < u_strike_y_max) col = fg;
     \\  fragColor = col;
     \\}
     \\
@@ -337,8 +320,6 @@ const IMAGE_FS =
     \\
 ;
 
-// ---- shader / pipeline construction -----------------------------------
-
 fn compile_shader(kind: gl.GLenum, src: [*c]const u8) gl.GLuint {
     const sh = gl.glCreateShader(kind);
     gl.glShaderSource(sh, 1, &src, null);
@@ -350,7 +331,7 @@ fn compile_shader(kind: gl.GLenum, src: [*c]const u8) gl.GLuint {
         gl.glGetShaderiv(sh, gl.GL_INFO_LOG_LENGTH, &log_len);
         var buf: [4096]u8 = undefined;
         gl.glGetShaderInfoLog(sh, @intCast(@min(log_len, buf.len)), null, &buf[0]);
-        std.debug.print("canary-native shader compile fail: {s}\n", .{buf[0..@intCast(log_len)]});
+        std.debug.print("canary-native shader compile: {s}\n", .{buf[0..@intCast(log_len)]});
         return 0;
     }
     return sh;
@@ -373,114 +354,10 @@ fn link_program(vs_src: [*c]const u8, fs_src: [*c]const u8) gl.GLuint {
         gl.glGetProgramiv(prog, gl.GL_INFO_LOG_LENGTH, &log_len);
         var buf: [4096]u8 = undefined;
         gl.glGetProgramInfoLog(prog, @intCast(@min(log_len, buf.len)), null, &buf[0]);
-        std.debug.print("canary-native link fail: {s}\n", .{buf[0..@intCast(log_len)]});
+        std.debug.print("canary-native link: {s}\n", .{buf[0..@intCast(log_len)]});
         return 0;
     }
     return prog;
-}
-
-fn init_gl(b: *Backend) bool {
-    // Atlas: 2D array texture, R8, 3 layers.
-    gl.glGenTextures(1, &b.atlas_tex);
-    gl.glActiveTexture(gl.GL_TEXTURE0);
-    gl.glBindTexture(gl.GL_TEXTURE_2D_ARRAY, b.atlas_tex);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
-    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
-    gl.glTexStorage3D(
-        gl.GL_TEXTURE_2D_ARRAY,
-        1,
-        gl.GL_R8,
-        ATLAS_COLS * CELL_W,
-        ATLAS_ROWS * CELL_H,
-        ATLAS_LAYERS,
-    );
-    // GL_UNPACK_ALIGNMENT defaults to 4; our rows are CELL_W bytes which
-    // may not be 4-aligned for sub-rect uploads.  Set to 1 so any width
-    // works.
-    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
-
-    b.cell_prog = link_program(CELL_VS, CELL_FS);
-    b.cursor_prog = link_program(CURSOR_VS, CURSOR_FS);
-    b.image_prog = link_program(IMAGE_VS, IMAGE_FS);
-    if (b.cell_prog == 0 or b.cursor_prog == 0 or b.image_prog == 0) return false;
-
-    // Cell program uniform locations.
-    b.u_cellSize = gl.glGetUniformLocation(b.cell_prog, "u_cellSize");
-    b.u_viewport = gl.glGetUniformLocation(b.cell_prog, "u_viewport");
-    b.u_atlasCells = gl.glGetUniformLocation(b.cell_prog, "u_atlasCells");
-    b.u_atlas = gl.glGetUniformLocation(b.cell_prog, "u_atlas");
-
-    gl.glUseProgram(b.cell_prog);
-    gl.glUniform2f(b.u_atlasCells, @floatFromInt(ATLAS_COLS), @floatFromInt(ATLAS_ROWS));
-    gl.glUniform1i(b.u_atlas, 0);
-
-    // Cursor program uniform locations.
-    b.cu_cell = gl.glGetUniformLocation(b.cursor_prog, "u_cursorCell");
-    b.cu_cellSize = gl.glGetUniformLocation(b.cursor_prog, "u_cellSize");
-    b.cu_viewport = gl.glGetUniformLocation(b.cursor_prog, "u_viewport");
-    b.cu_style = gl.glGetUniformLocation(b.cursor_prog, "u_cursorStyle");
-    b.cu_alpha = gl.glGetUniformLocation(b.cursor_prog, "u_cursorAlpha");
-    b.cu_color = gl.glGetUniformLocation(b.cursor_prog, "u_cursorColor");
-
-    // Image program uniform locations.
-    b.iu_pos = gl.glGetUniformLocation(b.image_prog, "a_pos");
-    b.iu_size = gl.glGetUniformLocation(b.image_prog, "a_size");
-    b.iu_uv = gl.glGetUniformLocation(b.image_prog, "a_uvRect");
-    b.iu_cellSize = gl.glGetUniformLocation(b.image_prog, "u_cellSize");
-    b.iu_viewport = gl.glGetUniformLocation(b.image_prog, "u_viewport");
-    b.iu_img = gl.glGetUniformLocation(b.image_prog, "u_img");
-
-    // Static quad buffer (two triangles, unit square).
-    gl.glGenBuffers(1, &b.quad_buf);
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
-    const quad = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1 };
-    gl.glBufferData(
-        gl.GL_ARRAY_BUFFER,
-        @sizeOf(@TypeOf(quad)),
-        &quad[0],
-        gl.GL_STATIC_DRAW,
-    );
-
-    // Streaming per-instance cell buffer.
-    gl.glGenBuffers(1, &b.cells_buf);
-
-    // Cell VAO (instanced).
-    gl.glGenVertexArrays(1, &b.cell_vao);
-    gl.glBindVertexArray(b.cell_vao);
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
-    const aQuad: gl.GLuint = @intCast(gl.glGetAttribLocation(b.cell_prog, "a_quad"));
-    gl.glEnableVertexAttribArray(aQuad);
-    gl.glVertexAttribPointer(aQuad, 2, gl.GL_FLOAT, gl.GL_FALSE, 0, null);
-
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.cells_buf);
-    const stride: gl.GLsizei = @intCast(CELL_STRIDE);
-    setup_instance_attr(b.cell_prog, "a_cell", 2, stride, 0);
-    setup_instance_attr(b.cell_prog, "a_glyph", 1, stride, 8);
-    setup_instance_attr(b.cell_prog, "a_fg", 4, stride, 12);
-    setup_instance_attr(b.cell_prog, "a_bg", 4, stride, 28);
-    setup_instance_attr(b.cell_prog, "a_attrs", 1, stride, 44);
-
-    // Cursor VAO (just the quad).
-    gl.glGenVertexArrays(1, &b.cursor_vao);
-    gl.glBindVertexArray(b.cursor_vao);
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
-    const cuQuad: gl.GLuint = @intCast(gl.glGetAttribLocation(b.cursor_prog, "a_quad"));
-    gl.glEnableVertexAttribArray(cuQuad);
-    gl.glVertexAttribPointer(cuQuad, 2, gl.GL_FLOAT, gl.GL_FALSE, 0, null);
-
-    // Image VAO (just the quad).
-    gl.glGenVertexArrays(1, &b.image_vao);
-    gl.glBindVertexArray(b.image_vao);
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
-    const iaQuad: gl.GLuint = @intCast(gl.glGetAttribLocation(b.image_prog, "a_quad"));
-    gl.glEnableVertexAttribArray(iaQuad);
-    gl.glVertexAttribPointer(iaQuad, 2, gl.GL_FLOAT, gl.GL_FALSE, 0, null);
-
-    gl.glBindVertexArray(0);
-    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0);
-    return true;
 }
 
 fn setup_instance_attr(
@@ -505,25 +382,110 @@ fn setup_instance_attr(
     gl.glVertexAttribDivisor(uloc, 1);
 }
 
-// ---- font loading -----------------------------------------------------
+fn init_gl(b: *Backend) bool {
+    gl.glGenTextures(1, &b.atlas_tex);
+    gl.glActiveTexture(gl.GL_TEXTURE0);
+    gl.glBindTexture(gl.GL_TEXTURE_2D_ARRAY, b.atlas_tex);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_WRAP_S, gl.GL_CLAMP_TO_EDGE);
+    gl.glTexParameteri(gl.GL_TEXTURE_2D_ARRAY, gl.GL_TEXTURE_WRAP_T, gl.GL_CLAMP_TO_EDGE);
+    gl.glTexStorage3D(
+        gl.GL_TEXTURE_2D_ARRAY,
+        1,
+        gl.GL_R8,
+        b.atlas_cols * b.cell_w,
+        b.atlas_rows * b.cell_h,
+        @intCast(b.n_layers),
+    );
+    gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, 1);
 
-fn font_dir_from_env() []const u8 {
-    if (std.posix.getenv("CANARY_NATIVE_FONT_DIR")) |s| return s;
-    if (build_options.default_font_dir.len > 0) return build_options.default_font_dir;
-    // Dev fallback when neither the env var nor a Guix-baked store path
-    // is available.  Works for systems that drop DejaVu in this canonical
-    // /run path; otherwise the load_font call below reports the miss.
-    return "/run/current-system/profile/share/fonts/truetype";
+    b.cell_prog = link_program(CELL_VS, CELL_FS);
+    b.cursor_prog = link_program(CURSOR_VS, CURSOR_FS);
+    b.image_prog = link_program(IMAGE_VS, IMAGE_FS);
+    if (b.cell_prog == 0 or b.cursor_prog == 0 or b.image_prog == 0) return false;
+
+    b.u_cellSize = gl.glGetUniformLocation(b.cell_prog, "u_cellSize");
+    b.u_viewport = gl.glGetUniformLocation(b.cell_prog, "u_viewport");
+    b.u_atlasCells = gl.glGetUniformLocation(b.cell_prog, "u_atlasCells");
+    b.u_atlas = gl.glGetUniformLocation(b.cell_prog, "u_atlas");
+    b.u_layer_for_bold = gl.glGetUniformLocation(b.cell_prog, "u_layer_for_bold");
+    b.u_layer_for_italic = gl.glGetUniformLocation(b.cell_prog, "u_layer_for_italic");
+    b.u_underline_y = gl.glGetUniformLocation(b.cell_prog, "u_underline_y");
+    b.u_strike_y_min = gl.glGetUniformLocation(b.cell_prog, "u_strike_y_min");
+    b.u_strike_y_max = gl.glGetUniformLocation(b.cell_prog, "u_strike_y_max");
+
+    gl.glUseProgram(b.cell_prog);
+    gl.glUniform2f(b.u_atlasCells, @floatFromInt(b.atlas_cols), @floatFromInt(b.atlas_rows));
+    gl.glUniform1i(b.u_atlas, 0);
+    gl.glUniform1i(b.u_layer_for_bold, b.layer_for_bold);
+    gl.glUniform1i(b.u_layer_for_italic, b.layer_for_italic);
+    gl.glUniform1f(b.u_underline_y, b.underline_y);
+    gl.glUniform1f(b.u_strike_y_min, b.strike_y_min);
+    gl.glUniform1f(b.u_strike_y_max, b.strike_y_max);
+
+    b.cu_cell = gl.glGetUniformLocation(b.cursor_prog, "u_cursorCell");
+    b.cu_cellSize = gl.glGetUniformLocation(b.cursor_prog, "u_cellSize");
+    b.cu_viewport = gl.glGetUniformLocation(b.cursor_prog, "u_viewport");
+    b.cu_style = gl.glGetUniformLocation(b.cursor_prog, "u_cursorStyle");
+    b.cu_alpha = gl.glGetUniformLocation(b.cursor_prog, "u_cursorAlpha");
+    b.cu_color = gl.glGetUniformLocation(b.cursor_prog, "u_cursorColor");
+
+    b.iu_pos = gl.glGetUniformLocation(b.image_prog, "a_pos");
+    b.iu_size = gl.glGetUniformLocation(b.image_prog, "a_size");
+    b.iu_uv = gl.glGetUniformLocation(b.image_prog, "a_uvRect");
+    b.iu_cellSize = gl.glGetUniformLocation(b.image_prog, "u_cellSize");
+    b.iu_viewport = gl.glGetUniformLocation(b.image_prog, "u_viewport");
+    b.iu_img = gl.glGetUniformLocation(b.image_prog, "u_img");
+
+    gl.glGenBuffers(1, &b.quad_buf);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
+    const quad = [_]f32{ 0, 0, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1 };
+    gl.glBufferData(
+        gl.GL_ARRAY_BUFFER,
+        @sizeOf(@TypeOf(quad)),
+        &quad[0],
+        gl.GL_STATIC_DRAW,
+    );
+
+    gl.glGenBuffers(1, &b.cells_buf);
+
+    gl.glGenVertexArrays(1, &b.cell_vao);
+    gl.glBindVertexArray(b.cell_vao);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
+    const aQuad: gl.GLuint = @intCast(gl.glGetAttribLocation(b.cell_prog, "a_quad"));
+    gl.glEnableVertexAttribArray(aQuad);
+    gl.glVertexAttribPointer(aQuad, 2, gl.GL_FLOAT, gl.GL_FALSE, 0, null);
+
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.cells_buf);
+    const stride: gl.GLsizei = @intCast(CELL_STRIDE);
+    setup_instance_attr(b.cell_prog, "a_cell", 2, stride, 0);
+    setup_instance_attr(b.cell_prog, "a_glyph", 1, stride, 8);
+    setup_instance_attr(b.cell_prog, "a_fg", 4, stride, 12);
+    setup_instance_attr(b.cell_prog, "a_bg", 4, stride, 28);
+    setup_instance_attr(b.cell_prog, "a_attrs", 1, stride, 44);
+
+    gl.glGenVertexArrays(1, &b.cursor_vao);
+    gl.glBindVertexArray(b.cursor_vao);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
+    const cuQuad: gl.GLuint = @intCast(gl.glGetAttribLocation(b.cursor_prog, "a_quad"));
+    gl.glEnableVertexAttribArray(cuQuad);
+    gl.glVertexAttribPointer(cuQuad, 2, gl.GL_FLOAT, gl.GL_FALSE, 0, null);
+
+    gl.glGenVertexArrays(1, &b.image_vao);
+    gl.glBindVertexArray(b.image_vao);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.quad_buf);
+    const iaQuad: gl.GLuint = @intCast(gl.glGetAttribLocation(b.image_prog, "a_quad"));
+    gl.glEnableVertexAttribArray(iaQuad);
+    gl.glVertexAttribPointer(iaQuad, 2, gl.GL_FLOAT, gl.GL_FALSE, 0, null);
+
+    gl.glBindVertexArray(0);
+    gl.glBindBuffer(gl.GL_ARRAY_BUFFER, 0);
+    return true;
 }
 
-fn load_font(b: *Backend, layer: usize, name: []const u8) bool {
-    const dir = font_dir_from_env();
-    var buf: [1024]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ dir, name }) catch return false;
-    var file = std.fs.openFileAbsolute(path, .{}) catch |e| {
-        std.debug.print("canary-native font open {s}: {}\n", .{ path, e });
-        return false;
-    };
+fn load_font_file(b: *Backend, layer: usize, path: [*:0]const u8) bool {
+    var file = std.fs.openFileAbsoluteZ(path, .{}) catch return false;
     defer file.close();
     const stat = file.stat() catch return false;
     const bytes = b.alloc.alloc(u8, stat.size) catch return false;
@@ -536,35 +498,12 @@ fn load_font(b: *Backend, layer: usize, name: []const u8) bool {
         0,
         &b.fonts[layer],
     );
-    if (err != 0) {
-        std.debug.print("canary-native FT_New_Memory_Face {s}: 0x{x}\n", .{ path, err });
-        return false;
-    }
-    // Pick the EM size so the font's ascender + |descender| equals
-    // CELL_H pixels.  FT_Set_Pixel_Sizes alone leaves descenders
-    // overhanging the cell (DejaVu Sans Mono at EM=CELL_H is ~17%
-    // taller than CELL_H, so g/j/y/p/q clip at the cell bottom).
-    const face = b.fonts[layer];
-    const units = @as(i32, face.*.units_per_EM);
-    const asc = @as(i32, face.*.ascender);   // font units, positive
-    const dsc = @as(i32, face.*.descender);  // font units, negative
-    const total = asc - dsc;                  // glyph-bbox height
-    const target = @divFloor(CELL_H * units, total);
-    _ = ft.FT_Set_Pixel_Sizes(face, 0, @intCast(target));
-    return true;
-}
-
-fn init_freetype(b: *Backend) bool {
-    if (ft.FT_Init_FreeType(&b.ft_lib) != 0) return false;
-    if (!load_font(b, 0, "DejaVuSansMono.ttf")) return false;
-    if (!load_font(b, 1, "DejaVuSansMono-Bold.ttf")) return false;
-    if (!load_font(b, 2, "DejaVuSansMono-Oblique.ttf")) return false;
-    return true;
+    return err == 0;
 }
 
 fn ensure_slot(b: *Backend, cp: u32) u16 {
     if (b.glyph_map.get(cp)) |slot| return slot;
-    if (b.next_slot >= ATLAS_MAX_SLOTS) return b.fallback_slot;
+    if (b.next_slot >= b.atlas_max_slots) return b.fallback_slot;
     const slot = b.next_slot;
     b.next_slot += 1;
     b.glyph_map.put(b.alloc, cp, slot) catch return b.fallback_slot;
@@ -575,27 +514,34 @@ fn ensure_slot(b: *Backend, cp: u32) u16 {
 
 fn rasterise_glyph(b: *Backend, cp: u32, slot: u16) void {
     const slot_i: i32 = @intCast(slot);
-    const slot_x: gl.GLint = @intCast(@rem(slot_i, ATLAS_COLS) * CELL_W);
-    const slot_y: gl.GLint = @intCast(@divTrunc(slot_i, ATLAS_COLS) * CELL_H);
+    const slot_x: gl.GLint = @intCast(@rem(slot_i, b.atlas_cols) * b.cell_w);
+    const slot_y: gl.GLint = @intCast(@divTrunc(slot_i, b.atlas_cols) * b.cell_h);
 
-    var staging: [@intCast(CELL_W * CELL_H)]u8 = undefined;
-    for (0..ATLAS_LAYERS) |layer| {
-        @memset(&staging, 0);
+    const staging_len: usize = @intCast(b.cell_w * b.cell_h);
+    const staging = b.alloc.alloc(u8, staging_len) catch return;
+    defer b.alloc.free(staging);
+
+    for (0..b.n_layers) |layer| {
+        @memset(staging, 0);
         const face = b.fonts[layer];
+        if (face == null) continue;
         const err = ft.FT_Load_Char(face, cp, ft.FT_LOAD_RENDER | ft.FT_LOAD_TARGET_NORMAL);
         if (err == 0) {
             const bitmap = face.*.glyph.*.bitmap;
-            const ascender: i32 = @intCast(face.*.size.*.metrics.ascender >> 6);
+            const ascender_px: i32 = @intCast(face.*.size.*.metrics.ascender >> 6);
+            const descender_px: i32 = @intCast(-(face.*.size.*.metrics.descender >> 6));
             const bm_w: i32 = @intCast(bitmap.width);
             const bm_h: i32 = @intCast(bitmap.rows);
             const bm_left: i32 = face.*.glyph.*.bitmap_left;
             const bm_top: i32 = face.*.glyph.*.bitmap_top;
-            // Center horizontally in the cell; align top of glyph relative
-            // to baseline at ascender.
-            const dx_centre: i32 = @divFloor(CELL_W - bm_w, 2);
-            const dx: i32 = if (bm_left > 0) bm_left else dx_centre;
-            const dy: i32 = ascender - bm_top;
-            blit_grayscale(&staging, CELL_W, CELL_H, bitmap.buffer, bm_w, bm_h, @intCast(bitmap.pitch), dx, dy);
+            // Baseline placement: centre the font's ascender+descender
+            // span vertically inside the cell so descenders fit even when
+            // the font's natural metrics exceed cell_h.
+            _ = bm_left;
+            const baseline: i32 = @divFloor(b.cell_h + ascender_px - descender_px, 2);
+            const dx: i32 = @divFloor(b.cell_w - bm_w, 2);
+            const dy: i32 = baseline - bm_top;
+            blit_grayscale(staging.ptr, b.cell_w, b.cell_h, bitmap.buffer, bm_w, bm_h, @intCast(bitmap.pitch), dx, dy);
         }
         gl.glActiveTexture(gl.GL_TEXTURE0);
         gl.glBindTexture(gl.GL_TEXTURE_2D_ARRAY, b.atlas_tex);
@@ -605,12 +551,12 @@ fn rasterise_glyph(b: *Backend, cp: u32, slot: u16) void {
             slot_x,
             slot_y,
             @intCast(layer),
-            CELL_W,
-            CELL_H,
+            b.cell_w,
+            b.cell_h,
             1,
             gl.GL_RED,
             gl.GL_UNSIGNED_BYTE,
-            &staging[0],
+            staging.ptr,
         );
     }
 }
@@ -642,8 +588,6 @@ fn blit_grayscale(
     }
 }
 
-// ---- glfw callbacks (fire on the glfw thread) -------------------------
-
 fn push_event(b: *Backend, evt: InputEvent) void {
     b.event_mu.lock();
     defer b.event_mu.unlock();
@@ -673,8 +617,6 @@ fn char_callback(window: ?*glfw.GLFWwindow, codepoint: c_uint) callconv(.c) void
         .kind = @intFromEnum(InputKind.key),
         .key_sym = @intCast(codepoint),
         .action = 0,
-        // Char events get mods=0; the corresponding keydown carried the
-        // mods so the Scheme side can fold them if needed.
     });
 }
 
@@ -728,8 +670,6 @@ fn framebuffer_size_callback(window: ?*glfw.GLFWwindow, w: c_int, h: c_int) call
     });
 }
 
-// ---- main loop --------------------------------------------------------
-
 fn build_cells_attribs(b: *Backend) usize {
     b.mailbox_mu.lock();
     defer b.mailbox_mu.unlock();
@@ -755,8 +695,8 @@ fn build_cells_attribs(b: *Backend) usize {
         out[base + 0] = col;
         out[base + 1] = row;
         out[base + 2] = @floatFromInt(slot);
-        unpack_color(fg, out[base + 3 ..][0..4], DEFAULT_FG);
-        unpack_color(bg, out[base + 7 ..][0..4], DEFAULT_BG);
+        unpack_color(fg, out[base + 3 ..][0..4], b.default_fg);
+        unpack_color(bg, out[base + 7 ..][0..4], b.default_bg);
         out[base + 11] = @floatFromInt(attrs);
     }
     return w * h;
@@ -783,8 +723,6 @@ fn cursor_alpha_now(b: *Backend) f32 {
 fn run_loop(b: *Backend) void {
     while (glfw.glfwWindowShouldClose(b.window) == 0 and !b.stop_flag.load(.monotonic)) {
         glfw.glfwWaitEventsTimeout(0.016);
-        // Window-close button: tell the Scheme side so it can stop the
-        // engine and clean up.  The loop will exit on the next check.
         if (glfw.glfwWindowShouldClose(b.window) != 0) {
             push_event(b, .{ .kind = @intFromEnum(InputKind.quit) });
             break;
@@ -793,7 +731,6 @@ fn run_loop(b: *Backend) void {
         const cell_count = build_cells_attribs(b);
         if (cell_count == 0) continue;
 
-        // Upload the per-instance cell buffer (resize-on-grow strategy).
         const need_bytes: usize = b.cells_attribs.items.len * @sizeOf(f32);
         gl.glBindBuffer(gl.GL_ARRAY_BUFFER, b.cells_buf);
         if (need_bytes > b.cells_buf_capacity) {
@@ -814,19 +751,17 @@ fn run_loop(b: *Backend) void {
         }
 
         gl.glViewport(0, 0, b.framebuffer_w, b.framebuffer_h);
-        gl.glClearColor(0, 0, 0, 1);
+        gl.glClearColor(b.default_bg[0], b.default_bg[1], b.default_bg[2], b.default_bg[3]);
         gl.glClear(gl.GL_COLOR_BUFFER_BIT);
 
-        // Cells.
         gl.glUseProgram(b.cell_prog);
         gl.glBindVertexArray(b.cell_vao);
         gl.glUniform2f(b.u_viewport, @floatFromInt(b.framebuffer_w), @floatFromInt(b.framebuffer_h));
-        gl.glUniform2f(b.u_cellSize, @floatFromInt(CELL_W_DEV), @floatFromInt(CELL_H_DEV));
+        gl.glUniform2f(b.u_cellSize, @floatFromInt(b.cell_w_dev), @floatFromInt(b.cell_h_dev));
         gl.glActiveTexture(gl.GL_TEXTURE0);
         gl.glBindTexture(gl.GL_TEXTURE_2D_ARRAY, b.atlas_tex);
         gl.glDrawArraysInstanced(gl.GL_TRIANGLES, 0, 6, @intCast(cell_count));
 
-        // Cursor.
         b.mailbox_mu.lock();
         const cursor_style = b.mailbox_cursor_style;
         const cursor_col = b.mailbox_cursor_col;
@@ -836,18 +771,17 @@ fn run_loop(b: *Backend) void {
             gl.glUseProgram(b.cursor_prog);
             gl.glBindVertexArray(b.cursor_vao);
             gl.glUniform2f(b.cu_cell, @floatFromInt(cursor_col), @floatFromInt(cursor_row));
-            gl.glUniform2f(b.cu_cellSize, @floatFromInt(CELL_W_DEV), @floatFromInt(CELL_H_DEV));
+            gl.glUniform2f(b.cu_cellSize, @floatFromInt(b.cell_w_dev), @floatFromInt(b.cell_h_dev));
             gl.glUniform2f(b.cu_viewport, @floatFromInt(b.framebuffer_w), @floatFromInt(b.framebuffer_h));
             gl.glUniform1i(b.cu_style, @intCast(cursor_style));
             gl.glUniform1f(b.cu_alpha, cursor_alpha_now(b));
-            gl.glUniform4f(b.cu_color, DEFAULT_FG[0], DEFAULT_FG[1], DEFAULT_FG[2], 1.0);
+            gl.glUniform4f(b.cu_color, b.default_fg[0], b.default_fg[1], b.default_fg[2], 1.0);
             gl.glDrawArrays(gl.GL_TRIANGLES, 0, 6);
         }
 
-        // Images.
         gl.glUseProgram(b.image_prog);
         gl.glBindVertexArray(b.image_vao);
-        gl.glUniform2f(b.iu_cellSize, @floatFromInt(CELL_W_DEV), @floatFromInt(CELL_H_DEV));
+        gl.glUniform2f(b.iu_cellSize, @floatFromInt(b.cell_w_dev), @floatFromInt(b.cell_h_dev));
         gl.glUniform2f(b.iu_viewport, @floatFromInt(b.framebuffer_w), @floatFromInt(b.framebuffer_h));
         gl.glUniform1i(b.iu_img, 1);
         gl.glActiveTexture(gl.GL_TEXTURE1);
@@ -878,7 +812,7 @@ fn run_loop(b: *Backend) void {
     }
 }
 
-// ---- extern "C" Guile FFI surface -------------------------------------
+// --- FFI exports ---------------------------------------------------------
 
 export fn canary_native_create() ?*anyopaque {
     const alloc = std.heap.c_allocator;
@@ -895,15 +829,97 @@ export fn canary_native_create() ?*anyopaque {
 export fn canary_native_destroy(handle: ?*anyopaque) void {
     const b: *Backend = @ptrCast(@alignCast(handle.?));
     if (b.eventfd >= 0) std.posix.close(b.eventfd);
+    for (b.fonts) |f| {
+        if (f != null) _ = ft.FT_Done_Face(f);
+    }
+    if (b.ft_lib != null) _ = ft.FT_Done_FreeType(b.ft_lib);
+    for (b.font_bytes) |fb| {
+        if (fb.len > 0) b.alloc.free(fb);
+    }
     b.glyph_map.deinit(b.alloc);
     b.atlas_dirty.deinit(b.alloc);
     b.mailbox_cells.deinit(b.alloc);
     b.mailbox_placements.deinit(b.alloc);
     b.events.deinit(b.alloc);
     b.cells_attribs.deinit(b.alloc);
-    for (b.font_bytes) |fb| if (fb.len > 0) b.alloc.free(fb);
     b.alloc.destroy(b);
     g_backend = null;
+}
+
+export fn canary_native_configure_font(handle: ?*anyopaque, cfg: *const FontConfig) c_int {
+    const b: *Backend = @ptrCast(@alignCast(handle.?));
+    if (cfg.n_paths == 0 or cfg.n_paths > MAX_LAYERS) return -1;
+    if (cfg.font_px <= 0) return -1;
+    if (b.ft_lib == null) {
+        if (ft.FT_Init_FreeType(&b.ft_lib) != 0) return -2;
+    }
+    const n: usize = cfg.n_paths;
+    for (0..n) |i| {
+        const path = cfg.font_paths[i];
+        if (!load_font_file(b, i, path)) return -3;
+        _ = ft.FT_Set_Pixel_Sizes(b.fonts[i], 0, @intCast(cfg.font_px));
+    }
+    b.font_px = cfg.font_px;
+    b.n_layers = @intCast(n);
+    return 0;
+}
+
+export fn canary_native_query_cell_size(
+    handle: ?*anyopaque,
+    out_cell_w: *i32,
+    out_cell_h: *i32,
+) c_int {
+    const b: *Backend = @ptrCast(@alignCast(handle.?));
+    if (b.fonts[0] == null) return -1;
+    const face = b.fonts[0];
+    const advance: i32 = @intCast(face.*.size.*.metrics.max_advance >> 6);
+    const ascender: i32 = @intCast(face.*.size.*.metrics.ascender >> 6);
+    const descender: i32 = @intCast(-(face.*.size.*.metrics.descender >> 6));
+    out_cell_w.* = advance;
+    out_cell_h.* = ascender + descender;
+    return 0;
+}
+
+export fn canary_native_configure(handle: ?*anyopaque, cfg: *const NativeConfig) c_int {
+    const b: *Backend = @ptrCast(@alignCast(handle.?));
+    if (cfg.cell_w_dev <= 0 or cfg.cell_h_dev <= 0) return -1;
+    if (cfg.font_px_dev <= 0) return -1;
+    if (cfg.atlas_oversample < 1) return -1;
+    if (cfg.atlas_cols <= 0 or cfg.atlas_rows <= 0) return -1;
+    if (cfg.n_layers == 0 or cfg.n_layers > MAX_LAYERS) return -1;
+    if (cfg.n_layers != b.n_layers) return -1;
+    if (cfg.underline_y < 0 or cfg.underline_y > 1) return -1;
+    if (cfg.strike_y_min < 0 or cfg.strike_y_min > 1) return -1;
+    if (cfg.strike_y_max < 0 or cfg.strike_y_max > 1) return -1;
+
+    b.cell_w_dev = cfg.cell_w_dev;
+    b.cell_h_dev = cfg.cell_h_dev;
+    b.font_px_dev = cfg.font_px_dev;
+    b.atlas_oversample = cfg.atlas_oversample;
+    b.atlas_cols = cfg.atlas_cols;
+    b.atlas_rows = cfg.atlas_rows;
+    b.default_fg = cfg.default_fg;
+    b.default_bg = cfg.default_bg;
+    b.underline_y = cfg.underline_y;
+    b.strike_y_min = cfg.strike_y_min;
+    b.strike_y_max = cfg.strike_y_max;
+    b.layer_for_bold = cfg.layer_for_bold;
+    b.layer_for_italic = cfg.layer_for_italic;
+
+    b.cell_w = cfg.cell_w_dev * cfg.atlas_oversample;
+    b.cell_h = cfg.cell_h_dev * cfg.atlas_oversample;
+    b.font_px = cfg.font_px_dev * cfg.atlas_oversample;
+    b.atlas_max_slots = @intCast(cfg.atlas_cols * cfg.atlas_rows);
+    // FreeType pixel size for atlas rasterization sits at the
+    // oversampled px; LINEAR downsample restores cell-pixel size.
+    for (0..b.n_layers) |i| {
+        if (b.fonts[i] == null) continue;
+        _ = ft.FT_Set_Pixel_Sizes(b.fonts[i], 0, @intCast(b.font_px));
+    }
+
+    b.framebuffer_w = cfg.cell_w_dev * 80;
+    b.framebuffer_h = cfg.cell_h_dev * 24;
+    return 0;
 }
 
 export fn canary_native_run(handle: ?*anyopaque) void {
@@ -930,7 +946,6 @@ export fn canary_native_run(handle: ?*anyopaque) void {
 
     glfw.glfwMakeContextCurrent(b.window);
     glfw.glfwSwapInterval(1);
-
     glfw.glfwGetFramebufferSize(b.window, &b.framebuffer_w, &b.framebuffer_h);
     var sx: f32 = 1;
     var sy: f32 = 1;
@@ -945,13 +960,6 @@ export fn canary_native_run(handle: ?*anyopaque) void {
     _ = glfw.glfwSetFramebufferSizeCallback(b.window, framebuffer_size_callback);
 
     if (!init_gl(b)) {
-        std.debug.print("canary-native init_gl failed\n", .{});
-        glfw.glfwDestroyWindow(b.window);
-        glfw.glfwTerminate();
-        return;
-    }
-    if (!init_freetype(b)) {
-        std.debug.print("canary-native init_freetype failed\n", .{});
         glfw.glfwDestroyWindow(b.window);
         glfw.glfwTerminate();
         return;
@@ -959,7 +967,6 @@ export fn canary_native_run(handle: ?*anyopaque) void {
     b.fallback_slot = ensure_slot(b, '?');
     _ = ensure_slot(b, ' ');
 
-    // Tell Scheme the initial size by faking a resize event.
     push_event(b, .{
         .kind = @intFromEnum(InputKind.resize),
         .width = @intCast(@max(0, b.framebuffer_w)),
@@ -968,11 +975,6 @@ export fn canary_native_run(handle: ?*anyopaque) void {
 
     run_loop(b);
 
-    // Cleanup.
-    for (b.fonts) |f| {
-        if (f != null) _ = ft.FT_Done_Face(f);
-    }
-    if (b.ft_lib != null) _ = ft.FT_Done_FreeType(b.ft_lib);
     if (b.window != null) glfw.glfwDestroyWindow(b.window);
     glfw.glfwTerminate();
 }
@@ -988,8 +990,31 @@ export fn canary_native_eventfd(handle: ?*anyopaque) c_int {
     return b.eventfd;
 }
 
-// Returns next event by writing fields into the supplied out-params.
-// Returns 1 if an event was drained, 0 if the queue is empty.
+export fn canary_native_wait_event(handle: ?*anyopaque) c_int {
+    const b: *Backend = @ptrCast(@alignCast(handle.?));
+    var pfd = std.posix.pollfd{
+        .fd = b.eventfd,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    };
+    while (!b.stop_flag.load(.monotonic)) {
+        const n = std.posix.poll(@as([*]std.posix.pollfd, @ptrCast(&pfd))[0..1], 250) catch return 0;
+        if (n == 0) continue;
+        if ((pfd.revents & std.posix.POLL.IN) != 0) {
+            var counter: u64 = 0;
+            _ = std.posix.read(b.eventfd, std.mem.asBytes(&counter)) catch return 0;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+export fn canary_native_drain_eventfd(handle: ?*anyopaque) void {
+    const b: *Backend = @ptrCast(@alignCast(handle.?));
+    var counter: u64 = 0;
+    _ = std.posix.read(b.eventfd, std.mem.asBytes(&counter)) catch {};
+}
+
 export fn canary_native_next_event(
     handle: ?*anyopaque,
     out_kind: *u8,
@@ -1021,38 +1046,6 @@ export fn canary_native_next_event(
     return 1;
 }
 
-// Drain the eventfd counter (Scheme side calls after waking from poll).
-export fn canary_native_drain_eventfd(handle: ?*anyopaque) void {
-    const b: *Backend = @ptrCast(@alignCast(handle.?));
-    var counter: u64 = 0;
-    _ = std.posix.read(b.eventfd, std.mem.asBytes(&counter)) catch {};
-}
-
-// Blocking wait for the next eventfd notification.  The eventfd was
-// created with EFD_NONBLOCK; this call uses ppoll to block until the
-// fd is readable, then drains one counter via eventfd's atomic 8-byte
-// read.  Returns 0 on shutdown (stop_flag set or read returns 0).
-export fn canary_native_wait_event(handle: ?*anyopaque) c_int {
-    const b: *Backend = @ptrCast(@alignCast(handle.?));
-    var pfd = std.posix.pollfd{
-        .fd = b.eventfd,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    };
-    while (!b.stop_flag.load(.monotonic)) {
-        const n = std.posix.poll(@as([*]std.posix.pollfd, @ptrCast(&pfd))[0..1], 250) catch {
-            return 0;
-        };
-        if (n == 0) continue; // timeout; loop and check stop_flag
-        if ((pfd.revents & std.posix.POLL.IN) != 0) {
-            var counter: u64 = 0;
-            _ = std.posix.read(b.eventfd, std.mem.asBytes(&counter)) catch return 0;
-            return 1;
-        }
-    }
-    return 0;
-}
-
 export fn canary_native_submit_frame(
     handle: ?*anyopaque,
     cells_ptr: [*]const u8,
@@ -1082,12 +1075,4 @@ export fn canary_native_submit_frame(
 export fn canary_native_set_title(handle: ?*anyopaque, title: [*:0]const u8) void {
     const b: *Backend = @ptrCast(@alignCast(handle.?));
     if (b.window) |w| glfw.glfwSetWindowTitle(w, title);
-}
-
-export fn canary_native_cell_w_dev() c_int {
-    return CELL_W_DEV;
-}
-
-export fn canary_native_cell_h_dev() c_int {
-    return CELL_H_DEV;
 }
