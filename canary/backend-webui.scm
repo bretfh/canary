@@ -98,6 +98,23 @@
   (theme      #:init-keyword #:theme
               #:init-value default-theme
               #:accessor webui-backend-theme)
+  (font-px       #:init-keyword #:font-px       #:accessor wb-font-px)
+  (font-family   #:init-keyword #:font-family   #:accessor wb-font-family)
+  (cell-w        #:init-keyword #:cell-w        #:accessor wb-cell-w)
+  (cell-h        #:init-keyword #:cell-h        #:accessor wb-cell-h)
+  (atlas-cols    #:init-keyword #:atlas-cols    #:accessor wb-atlas-cols)
+  (atlas-rows    #:init-keyword #:atlas-rows    #:accessor wb-atlas-rows)
+  (atlas-oversample #:init-keyword #:atlas-oversample #:accessor wb-atlas-oversample)
+  (atlas-layers  #:init-keyword #:atlas-layers  #:accessor wb-atlas-layers)
+  (layer-fonts   #:init-keyword #:layer-fonts   #:accessor wb-layer-fonts)
+  (layer-for-bold   #:init-keyword #:layer-for-bold   #:accessor wb-layer-for-bold)
+  (layer-for-italic #:init-keyword #:layer-for-italic #:accessor wb-layer-for-italic)
+  (default-fg    #:init-keyword #:default-fg    #:accessor wb-default-fg)
+  (default-bg    #:init-keyword #:default-bg    #:accessor wb-default-bg)
+  (cursor-styles #:init-keyword #:cursor-styles #:accessor wb-cursor-styles)
+  (underline-y   #:init-keyword #:underline-y   #:accessor wb-underline-y)
+  (strike-y-min  #:init-keyword #:strike-y-min  #:accessor wb-strike-y-min)
+  (strike-y-max  #:init-keyword #:strike-y-max  #:accessor wb-strike-y-max)
   ;; Metrics: monotonic counters and cumulative timings.  Encoded
   ;; mostly in nanoseconds (internal-time-units-per-second is 1e9 on
   ;; Linux Guile); `stats' renders as ms.  Mutated only from the main
@@ -159,9 +176,78 @@
   (queue-ns-max  #:init-value 0 #:accessor wb-queue-ns-max)
   (queue-samples #:init-value 0 #:accessor wb-queue-samples))
 
-(define* (webui-backend #:key (size (size 80 24)) (theme default-theme))
-  "Return a fresh <webui-backend> sized to SIZE under THEME."
-  (make <webui-backend> #:size size #:theme theme))
+(define %default-font-px           16)
+(define %default-font-family
+  "ui-monospace, \"Cascadia Mono\", \"DejaVu Sans Mono\", \"Liberation Mono\", Menlo, Consolas, monospace")
+(define %default-atlas-cols        16)
+(define %default-atlas-rows        16)
+(define %default-atlas-oversample  2)
+(define %default-atlas-layers      3)
+(define %default-layer-fonts       '("" "bold " "italic "))
+(define %default-layer-for-bold    1)
+(define %default-layer-for-italic  2)
+(define %default-fg                #xFFFFFFFF)  ; wire sentinel: no library opinion
+(define %default-bg                #xFFFFFFFF)
+(define %default-cursor-styles     '((hidden    . 0)
+                                     (block     . 1)
+                                     (underline . 2)
+                                     (bar       . 3)))
+(define %default-underline-y       0.86)
+(define %default-strike-y-min      0.46)
+(define %default-strike-y-max      0.54)
+
+(define* (webui-backend
+          #:key (size              (size 80 24))
+                (theme             default-theme)
+                (font-px           %default-font-px)
+                (font-family       %default-font-family)
+                (cell-w            #f)
+                (cell-h            #f)
+                (atlas-cols        %default-atlas-cols)
+                (atlas-rows        %default-atlas-rows)
+                (atlas-oversample  %default-atlas-oversample)
+                (atlas-layers      %default-atlas-layers)
+                (layer-fonts       %default-layer-fonts)
+                (layer-for-bold    %default-layer-for-bold)
+                (layer-for-italic  %default-layer-for-italic)
+                (default-fg        %default-fg)
+                (default-bg        %default-bg)
+                (cursor-styles     %default-cursor-styles)
+                (underline-y       %default-underline-y)
+                (strike-y-min      %default-strike-y-min)
+                (strike-y-max      %default-strike-y-max))
+  "Return a fresh <webui-backend>.  SIZE is the cell grid (a <size>
+of columns by rows).  THEME is a <theme>.  FONT-PX is the requested
+font size in device pixels.  FONT-FAMILY is the CSS font stack the
+browser uses when rasterising glyphs into the atlas.  CELL-W and
+CELL-H default to #f, meaning let the browser derive them from the
+font via Canvas2D measureText and post the result back; pass explicit
+values to force padded cells.  ATLAS-COLS, ATLAS-ROWS, ATLAS-LAYERS
+size the codepoint slot grid and the number of font-weight layers
+respectively.  ATLAS-OVERSAMPLE multiplies atlas texture resolution
+against the cell to keep glyphs crisp under fractional scaling.
+LAYER-FONTS is a list of CSS font-weight prefixes (one per layer);
+the default '(\"\" \"bold \" \"italic \") prepends nothing for layer 0
+and 'bold '/' italic ' for layers 1 and 2.  LAYER-FOR-BOLD and
+LAYER-FOR-ITALIC are integer indices selecting which layer renders
+each attr; -1 disables the layer.  DEFAULT-FG and DEFAULT-BG are u32
+RGB values (sentinel #xFFFFFFFF means \"renderer chooses\").
+CURSOR-STYLES is an alist mapping symbols (hidden block underline
+bar) to integer wire codes.  UNDERLINE-Y, STRIKE-Y-MIN, and
+STRIKE-Y-MAX are vertical fractions within the cell for the two
+decoration strips."
+  (make <webui-backend>
+    #:size size #:theme theme
+    #:font-px font-px #:font-family font-family
+    #:cell-w cell-w #:cell-h cell-h
+    #:atlas-cols atlas-cols #:atlas-rows atlas-rows
+    #:atlas-oversample atlas-oversample #:atlas-layers atlas-layers
+    #:layer-fonts layer-fonts
+    #:layer-for-bold layer-for-bold #:layer-for-italic layer-for-italic
+    #:default-fg default-fg #:default-bg default-bg
+    #:cursor-styles cursor-styles
+    #:underline-y underline-y
+    #:strike-y-min strike-y-min #:strike-y-max strike-y-max))
 
 (define (set-webui-backend-theme! b th)
   "Replace the theme on backend B with TH."
@@ -315,16 +401,6 @@
 ;; Frame format magic, little-endian "GCEL" (0x4C454347).
 (define %frame-magic #x4C454347)
 
-;; Device pixels per cell on the browser side.  Must stay in sync with
-;; CELL_W_DEV / CELL_H_DEV defaults in backend-webui/client/canary.js.
-;; Used to translate the backend's cell-grid `#:size` into the pixel
-;; window size we ask webui to open the browser at, so the engine's
-;; first frame fits the window exactly.  These are device px because
-;; cells are now rendered in device px (so the chosen font px equals
-;; that many actual pixels on screen, locked against Wayland
-;; fractional-scale drift).
-(define %css-cell-w 10)
-(define %css-cell-h 20)
 
 
 (define (%search-library-path basename)
@@ -1083,6 +1159,15 @@ Returns a canary protocol message or #f.  Avoids pulling in a full
 JSON dependency for L1; the wire schema is closed."
   (let ((tag (json-field json "type")))
     (cond
+     ((string=? tag "measured-cell")
+      ;; Browser-side font measurement result.  Store on the backend
+      ;; so subsequent resize math uses the actual cell pixel size;
+      ;; no engine-visible message is produced.
+      (let ((cw (json-int json "cellW"))
+            (ch (json-int json "cellH")))
+        (when cw (set! (wb-cell-w b) cw))
+        (when ch (set! (wb-cell-h b) ch)))
+      #f)
      ((string=? tag "resize")
       ;; Just produce the msg.  All backend/term mutation happens on the
       ;; engine fiber via `backend-handle-resize!`; doing it here would
@@ -1400,10 +1485,51 @@ client will simply wait for the first WebSocket frame as before."
       (let ((bv (encode-frame b term '() clicks)))
         (%bv->base64 bv))))))
 
+(define (%num->js x)
+  "Render X (an integer or real) as a JavaScript number literal."
+  (cond
+   ((integer? x) (number->string x))
+   ((real? x)    (number->string (exact->inexact x)))
+   (else "null")))
+
+(define (%maybe->js x)
+  "Render X as a JavaScript value, treating #f as null."
+  (if x (%num->js x) "null"))
+
+(define (%canary-config-script b)
+  "Emit a synchronous <script> block that sets window.__CANARY_CONFIG
+to a JSON-like object holding every user-facing knob B carries.  The
+browser module reads it before resolving its own defaults."
+  (string-append
+   "<script>window.__CANARY_CONFIG={"
+   "fontPx:"          (%num->js (wb-font-px b))
+   ",fontFamily:"     (js-string-literal (wb-font-family b))
+   ",cellW:"          (%maybe->js (wb-cell-w b))
+   ",cellH:"          (%maybe->js (wb-cell-h b))
+   ",atlasCols:"      (%num->js (wb-atlas-cols b))
+   ",atlasRows:"      (%num->js (wb-atlas-rows b))
+   ",atlasOversample:" (%num->js (wb-atlas-oversample b))
+   ",atlasLayers:"    (%num->js (wb-atlas-layers b))
+   ",layerFonts:["
+   (let loop ((rest (map js-string-literal (wb-layer-fonts b))) (acc ""))
+     (cond
+      ((null? rest) acc)
+      ((string-null? acc) (loop (cdr rest) (car rest)))
+      (else (loop (cdr rest) (string-append acc "," (car rest))))))
+   "],layerForBold:"  (%num->js (wb-layer-for-bold b))
+   ",layerForItalic:" (%num->js (wb-layer-for-italic b))
+   ",defaultFg:"      (%num->js (wb-default-fg b))
+   ",defaultBg:"      (%num->js (wb-default-bg b))
+   ",underlineY:"     (%num->js (wb-underline-y b))
+   ",strikeYMin:"     (%num->js (wb-strike-y-min b))
+   ",strikeYMax:"     (%num->js (wb-strike-y-max b))
+   "};</script>"))
+
 (define (client-html b)
   "Return the complete HTML document that boots the browser-side
-WebGL2 renderer.  Embeds the initial frame bytes inline as base64 in
-a JS variable so canary.js applyFrame()s on first module run — no
+WebGL2 renderer.  Embeds B's user-facing config inline as
+window.__CANARY_CONFIG and the initial frame as base64 in
+window.__canaryInitialFrame, so canary.js boots without any
 WebSocket round-trip on first paint."
   (let ((frame-b64 (%initial-frame-base64 b)))
     (string-append
@@ -1421,9 +1547,7 @@ WebSocket round-trip on first paint."
      "html,body{margin:0;height:100%;background:#000;overflow:hidden;}"
      "canvas{display:block;background:#000;}"
      "</style>"
-     ;; Inline stub queues plus the initial frame, set up BEFORE
-     ;; webui.js loads.  webui.js is deferred so HTML parse doesn't
-     ;; block on its fetch.
+     (%canary-config-script b)
      "<script>"
      "window.__canaryFrameQueue=[];"
      "window.canaryFrame=function(b){window.__canaryFrameQueue.push(b);};"

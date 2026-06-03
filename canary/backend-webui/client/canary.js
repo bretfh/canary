@@ -20,16 +20,79 @@ const HEADER_SIZE = 16;
 const CELL_SIZE   = 13;
 
 const __qs = new URLSearchParams(window.location.search);
-const DEBUG       = __qs.get('debug') === '1';
-const CELL_W_DEV  = parseInt(__qs.get('cell-w'), 10) || 10;
-const CELL_H_DEV  = parseInt(__qs.get('cell-h'), 10) || 20;
-const FONT_PX_DEV = parseInt(__qs.get('font'),   10) || 16;
-const ATLAS_OVERSAMPLE = 2;
-const CELL_W  = CELL_W_DEV  * ATLAS_OVERSAMPLE;
-const CELL_H  = CELL_H_DEV  * ATLAS_OVERSAMPLE;
+const __cfg = window.__CANARY_CONFIG || {};
+const DEBUG = __qs.get('debug') === '1';
+
+function __read(key, qsKey, fallback) {
+  if (__cfg[key] != null) return __cfg[key];
+  if (qsKey) {
+    const v = parseInt(__qs.get(qsKey), 10);
+    if (!Number.isNaN(v) && v > 0) return v;
+  }
+  return fallback;
+}
+
+const FONT_PX_DEV = __read('fontPx', 'font', 16);
+const ATLAS_OVERSAMPLE = __read('atlasOversample', null, 2);
 const FONT_PX = FONT_PX_DEV * ATLAS_OVERSAMPLE;
-const ATLAS_COLS = 16;
-const ATLAS_ROWS = 16;
+const ATLAS_COLS = __read('atlasCols', null, 16);
+const ATLAS_ROWS = __read('atlasRows', null, 16);
+const ATLAS_LAYERS = __read('atlasLayers', null, 3);
+const ATLAS_FONT_FAMILY = __cfg.fontFamily ||
+  'ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace';
+const LAYER_FONTS = __cfg.layerFonts || ['', 'bold ', 'italic '];
+const LAYER_FOR_BOLD = __cfg.layerForBold != null ? __cfg.layerForBold : 1;
+const LAYER_FOR_ITALIC = __cfg.layerForItalic != null ? __cfg.layerForItalic : 2;
+const UNDERLINE_Y = __cfg.underlineY != null ? __cfg.underlineY : 0.86;
+const STRIKE_Y_MIN = __cfg.strikeYMin != null ? __cfg.strikeYMin : 0.46;
+const STRIKE_Y_MAX = __cfg.strikeYMax != null ? __cfg.strikeYMax : 0.54;
+const COLOR_DEFAULT_SENTINEL = 0xFFFFFFFF;
+
+function __sentinelOr(value, fallback) {
+  if (value == null || value === COLOR_DEFAULT_SENTINEL) return fallback;
+  const r = ((value >> 16) & 0xFF) / 255;
+  const g = ((value >> 8) & 0xFF) / 255;
+  const b = (value & 0xFF) / 255;
+  return [r, g, b, 1.0];
+}
+
+const DEFAULT_FG = __sentinelOr(__cfg.defaultFg, [1.0, 1.0, 1.0, 1.0]);
+const DEFAULT_BG = __sentinelOr(__cfg.defaultBg, [0.0, 0.0, 0.0, 1.0]);
+
+let CELL_W_DEV;
+let CELL_H_DEV;
+let CELL_W;
+let CELL_H;
+
+function __measureCell() {
+  const c = document.createElement('canvas');
+  const ctx = c.getContext('2d');
+  ctx.font = FONT_PX_DEV + 'px ' + ATLAS_FONT_FAMILY;
+  const m = ctx.measureText('M');
+  const advance = Math.ceil(m.width);
+  const ascent = (m.fontBoundingBoxAscent != null)
+    ? m.fontBoundingBoxAscent
+    : (m.actualBoundingBoxAscent || FONT_PX_DEV * 0.8);
+  const descent = (m.fontBoundingBoxDescent != null)
+    ? m.fontBoundingBoxDescent
+    : (m.actualBoundingBoxDescent || FONT_PX_DEV * 0.2);
+  return [Math.max(1, advance), Math.max(1, Math.ceil(ascent + descent))];
+}
+
+{
+  const userW = __read('cellW', 'cell-w', null);
+  const userH = __read('cellH', 'cell-h', null);
+  if (userW && userH) {
+    CELL_W_DEV = userW;
+    CELL_H_DEV = userH;
+  } else {
+    const [mw, mh] = __measureCell();
+    CELL_W_DEV = userW || mw;
+    CELL_H_DEV = userH || mh;
+  }
+  CELL_W = CELL_W_DEV * ATLAS_OVERSAMPLE;
+  CELL_H = CELL_H_DEV * ATLAS_OVERSAMPLE;
+}
 
 const canvas = document.getElementById('cv');
 // tabindex so the canvas can take focus and receive keydowns reliably
@@ -75,13 +138,10 @@ const state = {
 const FLOATS_PER_CELL = 12;
 const cellStride = FLOATS_PER_CELL * 4;
 
-// ---- Atlas: three font weights rasterised into 2D canvases, uploaded
-// as a sampler2DArray.  Identity layout: codepoint -> slot (shared
-// across layers), shader picks layer per cell from attr bits.
-
-const ATLAS_LAYERS = 3;
-const LAYER_REGULAR = 0, LAYER_BOLD = 1, LAYER_ITALIC = 2;
-const LAYER_FONTS = ['', 'bold ', 'italic '];
+// ---- Atlas: N font-weight layers rasterised into 2D canvases,
+// uploaded as a sampler2DArray.  Identity layout: codepoint -> slot
+// (shared across layers), shader picks layer per cell from attr bits
+// via the LAYER_FOR_BOLD / LAYER_FOR_ITALIC config uniforms.
 
 const atlasCanvases = [];
 const atlasCtxs = [];
@@ -98,9 +158,6 @@ for (let i = 0; i < ATLAS_LAYERS; i++) {
 const atlasMap = new Map();
 let nextSlot = 0;
 let atlasDirty = true;
-
-const ATLAS_FONT_FAMILY =
-  'ui-monospace, "Cascadia Mono", "DejaVu Sans Mono", "Liberation Mono", Menlo, Consolas, monospace';
 
 function rasteriseGlyph(cp, slot) {
   const x = (slot % ATLAS_COLS) * CELL_W;
@@ -221,19 +278,24 @@ in vec4 v_fg;
 in vec4 v_bg;
 flat in int  v_attrs;
 uniform mediump sampler2DArray u_atlas;
+uniform int u_layer_for_bold;
+uniform int u_layer_for_italic;
+uniform float u_underline_y;
+uniform float u_strike_y_min;
+uniform float u_strike_y_max;
 out vec4 fragColor;
 void main() {
   int layer = 0;
-  if ((v_attrs & 2) != 0) layer = 1;
-  else if ((v_attrs & 4) != 0) layer = 2;
+  if ((v_attrs & 1) != 0 && u_layer_for_bold >= 0) layer = u_layer_for_bold;
+  else if ((v_attrs & 2) != 0 && u_layer_for_italic >= 0) layer = u_layer_for_italic;
   float a = texture(u_atlas, vec3(v_uv, float(layer))).r;
   vec4 fg = v_fg;
   vec4 bg = v_bg;
   if ((v_attrs & 8)  != 0) { vec4 t = fg; fg = bg; bg = t; }
-  if ((v_attrs & 1)  != 0) fg.rgb *= 0.5;
+  if ((v_attrs & 32) != 0) fg.rgb *= 0.5;
   vec4 col = mix(bg, fg, a);
-  if ((v_attrs & 16) != 0 && v_cellUv.y > 0.86) col = fg;
-  if ((v_attrs & 32) != 0 && v_cellUv.y > 0.46 && v_cellUv.y < 0.54) col = fg;
+  if ((v_attrs & 4)  != 0 && v_cellUv.y > u_underline_y) col = fg;
+  if ((v_attrs & 16) != 0 && v_cellUv.y > u_strike_y_min && v_cellUv.y < u_strike_y_max) col = fg;
   fragColor = col;
 }`;
 
@@ -268,6 +330,11 @@ function buildCellProgram() {
   gl.useProgram(program);
   gl.uniform2f(uAtlasCells, ATLAS_COLS, ATLAS_ROWS);
   gl.uniform1i(uAtlas, 0);
+  gl.uniform1i(gl.getUniformLocation(program, 'u_layer_for_bold'),   LAYER_FOR_BOLD);
+  gl.uniform1i(gl.getUniformLocation(program, 'u_layer_for_italic'), LAYER_FOR_ITALIC);
+  gl.uniform1f(gl.getUniformLocation(program, 'u_underline_y'),  UNDERLINE_Y);
+  gl.uniform1f(gl.getUniformLocation(program, 'u_strike_y_min'), STRIKE_Y_MIN);
+  gl.uniform1f(gl.getUniformLocation(program, 'u_strike_y_max'), STRIKE_Y_MAX);
 
   quadBuf = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
@@ -509,8 +576,6 @@ function buildDeferredPrograms() {
 
 // ---- Frame parsing --------------------------------------------------
 
-const DEFAULT_FG = [0.9, 0.9, 0.9, 1.0];
-const DEFAULT_BG = [0.0, 0.0, 0.0, 1.0];
 const utf8Decoder = new TextDecoder('utf-8');
 
 function unpackColor(packed, out, off, fallback) {
@@ -1039,4 +1104,5 @@ whenWebuiReady(() => {
   recompute();
   applyCanvas();
   tellServer();
+  send('measured-cell', { cellW: CELL_W_DEV, cellH: CELL_H_DEV });
 });
