@@ -85,11 +85,6 @@
                 (or h (loop (cdr rest)))))))
           (let ((p (%search-library-path basename)))
             (and p (false-if-exception (dynamic-link p))))
-          (let ((dev (string-append
-                      (dirname (current-filename))
-                      "/backend-native/zig-out/lib/" basename)))
-            (and (file-exists? dev)
-                 (false-if-exception (dynamic-link dev))))
           prog)))))
 
 ;; libnative is resolved on first use rather than at module-load so
@@ -352,6 +347,10 @@
                                    (mouse cx cy 3
                                           (if (positive? sdy)
                                               'scroll-up 'scroll-down)))))
+                ((6) ; window-close button -> stop the engine
+                 ((module-ref (resolve-module '(canary engine))
+                              'stop-engine!)
+                  eng))
                 (else #f)))
             (loop)))))))
 

@@ -80,6 +80,7 @@ const InputKind = enum(u8) {
     resize = 3,
     paste = 4,
     scroll = 5,
+    quit = 6,
 };
 
 const InputEvent = extern struct {
@@ -772,6 +773,12 @@ fn cursor_alpha_now(b: *Backend) f32 {
 fn run_loop(b: *Backend) void {
     while (glfw.glfwWindowShouldClose(b.window) == 0 and !b.stop_flag.load(.monotonic)) {
         glfw.glfwWaitEventsTimeout(0.016);
+        // Window-close button: tell the Scheme side so it can stop the
+        // engine and clean up.  The loop will exit on the next check.
+        if (glfw.glfwWindowShouldClose(b.window) != 0) {
+            push_event(b, .{ .kind = @intFromEnum(InputKind.quit) });
+            break;
+        }
 
         const cell_count = build_cells_attribs(b);
         if (cell_count == 0) continue;

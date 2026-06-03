@@ -984,6 +984,16 @@ already fired before the WebSocket came up."
       (hash-clear! (webui-backend-image-ids b))
       (set! (webui-backend-next-image-id b) 1)
       (when eng (send-to-engine eng 'force-render)))
+     ((= type +webui-event-disconnected+)
+      ;; Closing the webview means the user wants the app gone.
+      ;; libwebui doesn't reconnect after this — webui-wait returns,
+      ;; the wait-thread exits, and join-thread later finishes — but
+      ;; nothing else tells the engine to stop, so it sits in the
+      ;; fiber scheduler indefinitely.  Trigger the same shutdown
+      ;; path the 'quit cmd takes.
+      (when eng
+        ((module-ref (resolve-module '(canary engine)) 'stop-engine!)
+         eng)))
      (else #f))))
 
 (define (dispatch-browser-event! b event)
