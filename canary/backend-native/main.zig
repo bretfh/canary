@@ -190,6 +190,9 @@ const Backend = struct {
 
     mouse_x: f64 = 0,
     mouse_y: f64 = 0,
+
+    last_pressed_key: c_int = 0,
+    key_codepoints: [512]u32 = std.mem.zeroes([512]u32),
 };
 
 var g_backend: ?*Backend = null;
@@ -597,21 +600,43 @@ fn key_callback(window: ?*glfw.GLFWwindow, key: c_int, scancode: c_int, action: 
     _ = scancode;
     _ = window;
     const b = g_backend orelse return;
-    if (action == glfw.GLFW_RELEASE) return;
     const text_mods = mods & (glfw.GLFW_MOD_CONTROL | glfw.GLFW_MOD_ALT | glfw.GLFW_MOD_SUPER);
     const is_printable = key >= 32 and key <= 126;
-    if (is_printable and text_mods == 0) return;
+    const key_idx: usize = if (key >= 0 and key < b.key_codepoints.len) @intCast(key) else 0;
+
+    if (action != glfw.GLFW_RELEASE and is_printable and text_mods == 0) {
+        b.last_pressed_key = key;
+        return;
+    }
+
+    if (action == glfw.GLFW_RELEASE and is_printable and text_mods == 0) {
+        const cp = b.key_codepoints[key_idx];
+        if (cp != 0) {
+            push_event(b, .{
+                .kind = @intFromEnum(InputKind.char),
+                .key_sym = cp,
+                .action = 1,
+            });
+            b.key_codepoints[key_idx] = 0;
+        }
+        return;
+    }
+
     push_event(b, .{
         .kind = @intFromEnum(InputKind.key),
         .key_sym = @intCast(key),
         .mods = @intCast(mods),
-        .action = 0,
+        .action = if (action == glfw.GLFW_RELEASE) 1 else 0,
     });
 }
 
 fn char_callback(window: ?*glfw.GLFWwindow, codepoint: c_uint) callconv(.c) void {
     _ = window;
     const b = g_backend orelse return;
+    const key = b.last_pressed_key;
+    if (key > 0 and key < b.key_codepoints.len) {
+        b.key_codepoints[@intCast(key)] = codepoint;
+    }
     push_event(b, .{
         .kind = @intFromEnum(InputKind.char),
         .key_sym = @intCast(codepoint),

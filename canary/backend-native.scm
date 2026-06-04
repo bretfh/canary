@@ -474,14 +474,15 @@ symbols ('shift 'control 'alt 'meta)."
 (define (build-key-event sym-int mods-byte action)
   "Build a <key> for GLFW key code SYM-INT, or #f if not recognised.
 Named keys (escape, arrows, F-keys, etc.) use their symbol; modified
-printable keys (Ctrl-S, Alt-A) use the lowercase character.  Repeats
-arrive as fresh presses so held navigation keys (backspace, arrows)
-advance the textinput each tick."
-  (let ((named (assv sym-int %glfw-named-keys)))
+printable keys (Ctrl-S, Alt-A) use the lowercase character.  ACTION
+0=press, 1=release; the engine clears its held-set on release so the
+next press of the same key dispatches as a fresh press."
+  (let ((evt (if (= action 1) 'release 'press))
+        (named (assv sym-int %glfw-named-keys)))
     (cond
      (named
       (let ((k (normalize-key (cons (cdr named) (decode-mods mods-byte)))))
-        (slot-set! k 'event 'press)
+        (slot-set! k 'event evt)
         k))
      ((and (>= sym-int 32) (<= sym-int 126))
       (let* ((cp  (if (and (>= sym-int 65) (<= sym-int 90))
@@ -489,14 +490,17 @@ advance the textinput each tick."
                       sym-int))
              (k   (normalize-key (cons (integer->char cp)
                                        (decode-mods mods-byte)))))
-        (slot-set! k 'event 'press)
+        (slot-set! k 'event evt)
         k))
      (else #f))))
 
-(define (build-char-event codepoint)
-  "Build a <key> for the printable Unicode CODEPOINT."
+(define (build-char-event codepoint action)
+  "Build a <key> for the printable Unicode CODEPOINT.  ACTION 0=press,
+1=release.  The matching press+release pair lets the engine clear its
+held-set so a second press of the same key fires as a fresh press
+rather than dispatching as 'repeat (which most widgets ignore)."
   (let ((k (normalize-key (list (integer->char codepoint)))))
-    (slot-set! k 'event 'press)
+    (slot-set! k 'event (if (= action 1) 'release 'press))
     k))
 
 (define (drain-events! b)
@@ -540,19 +544,13 @@ engine.  Called by the drain thread after %wait-event signals."
                   (rw     (bytevector-u16-native-ref w-bv 0))
                   (rh     (bytevector-u16-native-ref h-bv 0))
                   (sdy    (bytevector-s8-ref scroll-bv 0)))
-              (when (or (= kind 1) (= kind 7))
-                ((module-ref (resolve-module '(canary engine))
-                             'engine-log!)
-                 eng 'input 'debug
-                 (format #f "kind=~a sym=~a mods=~a action=~a"
-                         kind sym mods action)))
               (case kind
                 ((1)
                  (let ((k (build-key-event sym mods action)))
                    (when k (send-to-engine eng k))))
                 ((7)
                  (when (>= sym 32)
-                   (send-to-engine eng (build-char-event sym))))
+                   (send-to-engine eng (build-char-event sym action))))
                 ((2)
                  (let* ((cx  (quotient mx cell-w))
                         (cy  (quotient my cell-h))
