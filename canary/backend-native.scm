@@ -471,24 +471,27 @@ symbols ('shift 'control 'alt 'meta)."
     (294 . f5)  (295 . f6)  (296 . f7)  (297 . f8)
     (298 . f9)  (299 . f10) (300 . f11) (301 . f12)))
 
-(define (glfw-key-action->event action)
-  "Translate a GLFW action byte ACTION (0=press, 1=release, 2=repeat)
-to a canary event symbol."
-  (case action
-    ((0) 'press)
-    ((1) 'release)
-    ((2) 'repeat)
-    (else 'press)))
-
 (define (build-key-event sym-int mods-byte action)
-  "Build a <key> for the named GLFW key code SYM-INT, or #f if it's
-not one of the named keys.  Printable codepoints go through the char
-path instead."
+  "Build a <key> for GLFW key code SYM-INT, or #f if not recognised.
+Named keys (escape, arrows, F-keys, etc.) use their symbol; modified
+printable keys (Ctrl-S, Alt-A) use the lowercase character.  Repeats
+arrive as fresh presses so held navigation keys (backspace, arrows)
+advance the textinput each tick."
   (let ((named (assv sym-int %glfw-named-keys)))
-    (and named
-         (let ((k (normalize-key (cons (cdr named) (decode-mods mods-byte)))))
-           (slot-set! k 'event (glfw-key-action->event action))
-           k))))
+    (cond
+     (named
+      (let ((k (normalize-key (cons (cdr named) (decode-mods mods-byte)))))
+        (slot-set! k 'event 'press)
+        k))
+     ((and (>= sym-int 32) (<= sym-int 126))
+      (let* ((cp  (if (and (>= sym-int 65) (<= sym-int 90))
+                      (+ sym-int 32)
+                      sym-int))
+             (k   (normalize-key (cons (integer->char cp)
+                                       (decode-mods mods-byte)))))
+        (slot-set! k 'event 'press)
+        k))
+     (else #f))))
 
 (define (build-char-event codepoint)
   "Build a <key> for the printable Unicode CODEPOINT."
@@ -539,13 +542,11 @@ engine.  Called by the drain thread after %wait-event signals."
                   (sdy    (bytevector-s8-ref scroll-bv 0)))
               (case kind
                 ((1)
-                 (cond
-                  ((< sym 256)
-                   (when (and (>= sym 32) (= action 0))
-                     (send-to-engine eng (build-char-event sym))))
-                  (else
-                   (let ((k (build-key-event sym mods action)))
-                     (when k (send-to-engine eng k))))))
+                 (let ((k (build-key-event sym mods action)))
+                   (when k (send-to-engine eng k))))
+                ((7)
+                 (when (>= sym 32)
+                   (send-to-engine eng (build-char-event sym))))
                 ((2)
                  (let* ((cx  (quotient mx cell-w))
                         (cy  (quotient my cell-h))

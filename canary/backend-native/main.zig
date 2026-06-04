@@ -39,6 +39,7 @@ const InputKind = enum(u8) {
     paste = 4,
     scroll = 5,
     quit = 6,
+    char = 7,
 };
 
 const InputEvent = extern struct {
@@ -534,12 +535,8 @@ fn rasterise_glyph(b: *Backend, cp: u32, slot: u16) void {
             const bm_h: i32 = @intCast(bitmap.rows);
             const bm_left: i32 = face.*.glyph.*.bitmap_left;
             const bm_top: i32 = face.*.glyph.*.bitmap_top;
-            // Baseline placement: centre the font's ascender+descender
-            // span vertically inside the cell so descenders fit even when
-            // the font's natural metrics exceed cell_h.
-            _ = bm_left;
             const baseline: i32 = @divFloor(b.cell_h + ascender_px - descender_px, 2);
-            const dx: i32 = @divFloor(b.cell_w - bm_w, 2);
+            const dx: i32 = bm_left;
             const dy: i32 = baseline - bm_top;
             blit_grayscale(staging.ptr, b.cell_w, b.cell_h, bitmap.buffer, bm_w, bm_h, @intCast(bitmap.pitch), dx, dy);
         }
@@ -600,13 +597,15 @@ fn key_callback(window: ?*glfw.GLFWwindow, key: c_int, scancode: c_int, action: 
     _ = scancode;
     _ = window;
     const b = g_backend orelse return;
-    var act: u8 = 0;
-    if (action == glfw.GLFW_RELEASE) act = 1 else if (action == glfw.GLFW_REPEAT) act = 2;
+    if (action == glfw.GLFW_RELEASE) return;
+    const text_mods = mods & (glfw.GLFW_MOD_CONTROL | glfw.GLFW_MOD_ALT | glfw.GLFW_MOD_SUPER);
+    const is_printable = key >= 32 and key <= 126;
+    if (is_printable and text_mods == 0) return;
     push_event(b, .{
         .kind = @intFromEnum(InputKind.key),
         .key_sym = @intCast(key),
         .mods = @intCast(mods),
-        .action = act,
+        .action = 0,
     });
 }
 
@@ -614,7 +613,7 @@ fn char_callback(window: ?*glfw.GLFWwindow, codepoint: c_uint) callconv(.c) void
     _ = window;
     const b = g_backend orelse return;
     push_event(b, .{
-        .kind = @intFromEnum(InputKind.key),
+        .kind = @intFromEnum(InputKind.char),
         .key_sym = @intCast(codepoint),
         .action = 0,
     });
