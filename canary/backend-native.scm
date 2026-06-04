@@ -540,6 +540,12 @@ engine.  Called by the drain thread after %wait-event signals."
                   (rw     (bytevector-u16-native-ref w-bv 0))
                   (rh     (bytevector-u16-native-ref h-bv 0))
                   (sdy    (bytevector-s8-ref scroll-bv 0)))
+              (when (or (= kind 1) (= kind 7))
+                ((module-ref (resolve-module '(canary engine))
+                             'engine-log!)
+                 eng 'input 'debug
+                 (format #f "kind=~a sym=~a mods=~a action=~a"
+                         kind sym mods action)))
               (case kind
                 ((1)
                  (let ((k (build-key-event sym mods action)))
