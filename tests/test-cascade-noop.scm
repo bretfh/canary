@@ -32,12 +32,12 @@
     (lambda ()
       (memoized-view w)
       (test-assert "view cache populated by memoized-view"
-                   (hash-ref cache w))
+                   (hashq-ref cache w))
       (let ((result (dispatch-update! eng w (tick))))
         (test-assert "no-op cascade returns same identity"
                      (eq? w (car result))))
       (test-assert "view cache preserved across no-op cascade"
-                   (hash-ref cache w)))))
+                   (hashq-ref cache w)))))
 
 ;; State-changing cascade: update-slots breaks identity, so the gate
 ;; opens; the cascade returns a fresh instance.

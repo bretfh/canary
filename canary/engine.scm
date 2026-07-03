@@ -1428,9 +1428,11 @@ Returns ('msg . resize), 'stop, or 'flush.  TIMEOUT in seconds, or
 (define (event-loop eng)
   "Main message-processing loop for ENG.  Sleeps on the msg-bell,
 drains the queue on wake, calls process-one on each msg, and
-re-renders if any handler reported a state change.  Renders use a
-fresh view cache per frame so widget subtrees don't leak across
-frames.
+re-renders if any handler reported a state change.  The whole cycle
+runs under the engine's persistent weak-key view cache: unchanged
+widget instances reuse their memoised view across frames, replaced
+instances invalidate during dispatch, and departed instances drop
+out via key weakness.
 
   Per-cycle timing is reported to the backend via
   BACKEND-RECORD-CYCLE!; instrumented backends accumulate it for
@@ -1441,35 +1443,35 @@ frames.
         (perform-operation (wait-until-port-readable-operation rd))
         (let ((t-wake (get-internal-real-time)))
           (drain-bell! (engine-msg-bell eng))
-          (let* ((msgs (drain-msgs! eng))
-                 (t-drain (get-internal-real-time))
-                 (dispatched?
-                  (let lp ((ms msgs) (any? #f))
-                    (cond
-                     ((null? ms) any?)
-                     ((not (engine-running? eng)) any?)
-                     (else
-                      (let ((d? (process-one eng (car ms))))
-                        (lp (cdr ms) (or any? d?)))))))
-                 (t-process (get-internal-real-time)))
-            (when (and (engine-running? eng) dispatched?)
-              (refresh-live-widgets! eng)
-              (with-view-cache (make-hash-table)
-                (lambda ()
-                 (catch #t
-                   (lambda () (render-frame eng))
-                   (lambda (key . args)
-                     (engine-log! eng 'render 'error (format #f "~a ~a" key args)))))))
-            (let ((t-end (get-internal-real-time)))
-              (backend-record-cycle!
-               (engine-backend eng)
-               `((t-wake     . ,t-wake)
-                 (drain-ns   . ,(- t-drain t-wake))
-                 (process-ns . ,(- t-process t-drain))
-                 (render-ns  . ,(- t-end t-process))
-                 (cycle-ns   . ,(- t-end t-wake))
-                 (msg-count  . ,(length msgs))
-                 (dispatched? . ,dispatched?))))))
+          (with-view-cache (engine-view-cache eng)
+            (lambda ()
+              (let* ((msgs (drain-msgs! eng))
+                     (t-drain (get-internal-real-time))
+                     (dispatched?
+                      (let lp ((ms msgs) (any? #f))
+                        (cond
+                         ((null? ms) any?)
+                         ((not (engine-running? eng)) any?)
+                         (else
+                          (let ((d? (process-one eng (car ms))))
+                            (lp (cdr ms) (or any? d?)))))))
+                     (t-process (get-internal-real-time)))
+                (when (and (engine-running? eng) dispatched?)
+                  (refresh-live-widgets! eng)
+                  (catch #t
+                    (lambda () (render-frame eng))
+                    (lambda (key . args)
+                      (engine-log! eng 'render 'error (format #f "~a ~a" key args)))))
+                (let ((t-end (get-internal-real-time)))
+                  (backend-record-cycle!
+                   (engine-backend eng)
+                   `((t-wake     . ,t-wake)
+                     (drain-ns   . ,(- t-drain t-wake))
+                     (process-ns . ,(- t-process t-drain))
+                     (render-ns  . ,(- t-end t-process))
+                     (cycle-ns   . ,(- t-end t-wake))
+                     (msg-count  . ,(length msgs))
+                     (dispatched? . ,dispatched?))))))))
         (when (engine-running? eng) (loop))))))
 
 ;;; ── stderr capture (engine-owned, surfaces in log overlay) ─────────

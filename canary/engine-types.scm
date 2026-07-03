@@ -34,7 +34,8 @@
             engine-held-keys    set-engine-held-keys!
             engine-pending-key  set-engine-pending-key!
             engine-pending-action set-engine-pending-action!
-            engine-pending-sub-id set-engine-pending-sub-id!))
+            engine-pending-sub-id set-engine-pending-sub-id!
+            engine-view-cache))
 
 (define-record-type <engine>
   (%make-engine backend theme keymap title mouse-mode cursor alt-screen?
@@ -43,7 +44,8 @@
                 log-entries log-cap show-log? log-height-frac
                 focus-chain subs resize-channel
                 live-widgets widget-subs
-                held-keys pending-key pending-action pending-sub-id)
+                held-keys pending-key pending-action pending-sub-id
+                view-cache)
   engine?
   (backend     engine-backend         set-engine-backend!)
   (theme       engine-theme           set-engine-theme!)
@@ -81,7 +83,12 @@
   (held-keys     engine-held-keys     set-engine-held-keys!)
   (pending-key   engine-pending-key   set-engine-pending-key!)
   (pending-action engine-pending-action set-engine-pending-action!)
-  (pending-sub-id engine-pending-sub-id set-engine-pending-sub-id!))
+  (pending-sub-id engine-pending-sub-id set-engine-pending-sub-id!)
+  ;; Weak-key view memo, node instance -> view tree.  Weak keys let
+  ;; entries for replaced instances vanish with their nodes, so the
+  ;; cache can persist across frames: unchanged widgets never re-run
+  ;; their view method.
+  (view-cache    engine-view-cache))
 
 (define* (engine #:key backend theme keymap title (mouse-mode 'off)
                       (cursor 'hidden) (alt-screen? #t) filter root
@@ -100,4 +107,5 @@ trackers) starts empty."
                 stop-ch '() -1 -1 '() log-cap show-log? log-height-frac
                 '() (make-hash-table) resize-channel
                 (make-hash-table) (make-hash-table)
-                '() #f #f #f))
+                '() #f #f #f
+                (make-weak-key-hash-table)))

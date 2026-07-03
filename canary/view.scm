@@ -579,9 +579,9 @@ back to a plain `view` call."
   (let ((cache (%view-cache)))
     (cond
      ((not cache) (view node))
-     ((hash-ref cache node) => (lambda (tree) tree))
+     ((hashq-ref cache node) => (lambda (tree) tree))
      (else (let ((tree (view node)))
-             (hash-set! cache node tree)
+             (hashq-set! cache node tree)
              tree)))))
 
 (define (invalidate-cached-view! node)
@@ -589,7 +589,7 @@ back to a plain `view` call."
 any.  Called when NODE's state has changed and its memoised view is
 stale."
   (let ((cache (%view-cache)))
-    (when cache (hash-remove! cache node))))
+    (when cache (hashq-remove! cache node))))
 
 (define (view-node? x)
   "Return #t if X is any kind of view-tree node: a known leaf or
