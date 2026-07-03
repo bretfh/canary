@@ -58,3 +58,6 @@ clean:
 
 repl:
 	$(GUILE) -L . --listen=37147
+
+bench-mem:
+	$(GUILE) -L . tools/membench.scm
