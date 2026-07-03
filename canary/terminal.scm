@@ -28,16 +28,12 @@
 (define %termios-size 128)
 (define %stdin-fd 0)
 (define %original-termios #f)
-(define %original-flags #f)
 
 (define %sysname (utsname:sysname (uname)))
 (define %linux? (string=? %sysname "Linux"))
 
 (define %TIOCGWINSZ (if %linux? #x5413 #x40087468))
 (define %O_RDONLY 0)
-(define %O_NONBLOCK (if %linux? #o4000 4))
-(define %F_GETFL 3)
-(define %F_SETFL 4)
 
 (define %tcgetattr
   (pointer->procedure int (dynamic-func "tcgetattr" %libc) (list int '*)))
@@ -60,14 +56,18 @@
 (define %close
   (pointer->procedure int (dynamic-func "close" %libc) (list int)))
 
-(define %fcntl
-  (pointer->procedure int (dynamic-func "fcntl" %libc) (list int int int)))
-
 (define (enter-raw-mode)
-  "Switch stdin into raw mode (no canonical processing, no echo) and
-non-blocking I/O.  Stashes the original termios + flags on the first
-call so `exit-raw-mode` can restore them.  Errors when stdin is not
-a TTY or termios syscalls fail."
+  "Switch stdin into raw mode (no canonical processing, no echo).
+Stashes the original termios on the first call so `exit-raw-mode`
+can restore it.  Errors when stdin is not a TTY or termios syscalls
+fail.
+
+The fd's flags are left alone: every read in canary is guarded by
+`char-ready?', so stdin works blocking, and setting O_NONBLOCK here
+would leak onto stdout when fds 0 and 1 share one open file
+description (a shell or openvt duping the tty) — under fibers'
+suspendable ports a mid-frame EAGAIN then parks the event-loop
+fiber on tty writability, which fbcon never reliably signals."
   (unless (= 1 (%isatty %stdin-fd))
     (error "stdin is not a TTY"))
   (let ((termios (make-bytevector %termios-size 0)))
@@ -77,22 +77,14 @@ a TTY or termios syscalls fail."
       (set! %original-termios (bytevector-copy termios)))
     (%cfmakeraw (bytevector->pointer termios))
     (when (< (%tcsetattr %stdin-fd 0 (bytevector->pointer termios)) 0)
-      (error "tcsetattr failed")))
-  (let ((flags (%fcntl %stdin-fd %F_GETFL 0)))
-    (when (>= flags 0)
-      (unless %original-flags
-        (set! %original-flags flags))
-      (%fcntl %stdin-fd %F_SETFL (logior flags %O_NONBLOCK)))))
+      (error "tcsetattr failed"))))
 
 (define (exit-raw-mode)
-  "Restore the termios state and stdin flags captured by the most
-recent `enter-raw-mode`.  No-op if raw mode wasn't entered."
+  "Restore the termios state captured by the most recent
+`enter-raw-mode`.  No-op if raw mode wasn't entered."
   (when %original-termios
     (%tcsetattr %stdin-fd 0 (bytevector->pointer %original-termios))
-    (set! %original-termios #f))
-  (when %original-flags
-    (%fcntl %stdin-fd %F_SETFL %original-flags)
-    (set! %original-flags #f)))
+    (set! %original-termios #f)))
 
 (define (esc str)
   "Return STR prefixed with an ESC byte."
