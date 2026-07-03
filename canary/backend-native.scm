@@ -44,8 +44,8 @@
 (define %default-font-paths        '("DejaVuSansMono.ttf"
                                      "DejaVuSansMono-Bold.ttf"
                                      "DejaVuSansMono-Oblique.ttf"))
-(define %default-atlas-cols        16)
-(define %default-atlas-rows        16)
+(define %default-atlas-cols        32)
+(define %default-atlas-rows        32)
 (define %default-atlas-oversample  2)
 (define %default-layer-for-bold    1)
 (define %default-layer-for-italic  2)

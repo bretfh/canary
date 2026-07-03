@@ -193,6 +193,8 @@ const Backend = struct {
 
     last_pressed_key: c_int = 0,
     key_codepoints: [512]u32 = std.mem.zeroes([512]u32),
+
+    mouse_held: u8 = 3,
 };
 
 var g_backend: ?*Backend = null;
@@ -647,9 +649,20 @@ fn char_callback(window: ?*glfw.GLFWwindow, codepoint: c_uint) callconv(.c) void
 fn mouse_button_callback(window: ?*glfw.GLFWwindow, button: c_int, action: c_int, mods: c_int) callconv(.c) void {
     _ = window;
     const b = g_backend orelse return;
+    const btn: u8 = switch (button) {
+        glfw.GLFW_MOUSE_BUTTON_LEFT => 0,
+        glfw.GLFW_MOUSE_BUTTON_MIDDLE => 1,
+        glfw.GLFW_MOUSE_BUTTON_RIGHT => 2,
+        else => return,
+    };
+    if (action == glfw.GLFW_PRESS) {
+        b.mouse_held = btn;
+    } else {
+        b.mouse_held = 3;
+    }
     push_event(b, .{
         .kind = @intFromEnum(InputKind.mouse),
-        .mouse_button = @intCast(button),
+        .mouse_button = btn,
         .action = if (action == glfw.GLFW_PRESS) 0 else 1,
         .mods = @intCast(mods),
         .mouse_x = @intFromFloat(b.mouse_x),
@@ -665,6 +678,7 @@ fn cursor_pos_callback(window: ?*glfw.GLFWwindow, x: f64, y: f64) callconv(.c) v
     push_event(b, .{
         .kind = @intFromEnum(InputKind.mouse),
         .action = 2,
+        .mouse_button = b.mouse_held,
         .mouse_x = @intFromFloat(x),
         .mouse_y = @intFromFloat(y),
     });
