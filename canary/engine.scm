@@ -21,6 +21,7 @@
                                             cancel cancel? cancel-id))
   #:use-module ((canary key) #:select (<key> key-sym key-mods key-event key=?))
   #:use-module (canary input)
+  #:use-module ((canary input-evdev) #:select (spawn-evdev-input!))
   #:use-module (canary backend)
   #:use-module (canary backend-ansi)
   #:use-module (canary theme)
@@ -1585,10 +1586,13 @@ session server) owns those."
 
 (define* (run-app root #:key title (keymap #f) (theme #f) (mouse 'off)
                   (cursor 'hidden) (alt-screen? #t) (filter #f) (backend #f)
+                  (evdev #f)
                   (show-log? #t) (log-cap 200) (log-height-frac 1/5))
   "Run an app rooted at ROOT (a widget with a `view' method).
 Kwargs: title, keymap, theme, mouse, cursor, alt-screen?, filter,
-backend, plus log-overlay config."
+backend, evdev (a device spec for `spawn-evdev-input!' -- #t for
+every key-capable device, or a list of device names/paths), plus
+log-overlay config."
   (let* ((b (or backend (ansi-backend #:theme (or theme default-theme))))
          (th (or theme default-theme))
          (km (or keymap (keymap)))
@@ -1650,6 +1654,11 @@ backend, plus log-overlay config."
                (spawn-fiber (guarded 'event-loop     (lambda () (event-loop eng))))
                (when (backend-uses-stdin? b)
                  (spawn-fiber (guarded 'input-loop   (lambda () (input-loop eng)))))
+               (when evdev
+                 (spawn-evdev-input! (lambda (msg) (send eng msg))
+                                     #:devices evdev
+                                     #:stop-port (car (engine-stop-ch eng))
+                                     #:running? (lambda () (engine-running? eng))))
                (spawn-fiber (guarded 'resize-debounce (lambda () (resize-debounce-loop eng))))
                (send eng (make <init>))
                (let ((sz (backend-size (engine-backend eng))))

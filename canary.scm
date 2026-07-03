@@ -1,6 +1,7 @@
 (define-module (canary)
   #:use-module (canary engine)
   #:use-module (canary backend-ansi)
+  #:use-module (canary input-evdev)
   #:use-module (canary key)
   #:use-module (canary keymap)
   #:use-module (canary layout)
@@ -28,6 +29,8 @@
    fps
 
    <key> key key? key-sym key-mods key-event key=? key->string
+
+   evdev-devices spawn-evdev-input!
 
    view update
 
