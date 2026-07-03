@@ -6,7 +6,8 @@
             <canary-class>
             <component>
             define-component
-            widget-id))
+            widget-id
+            consumes-keys?))
 
 ;;; Commentary:
 ;;;
@@ -55,6 +56,14 @@ cache."
 
 (define-syntax-rule (define-component name slot/option ...)
   (define-class name (<component>) slot/option ...))
+
+(define-method (consumes-keys? (w <component>))
+  "Return #t when this focused component should swallow raw key events
+before the engine consults its keymap.  Default #f.  Widgets that act
+as text-entry surfaces (textinput, cmdlines, password fields) override
+to #t so keymap-bound keys like Space or letters reach the field
+instead of firing app-wide actions."
+  #f)
 
 (define (update-slots obj . overrides)
   "Return a fresh instance of the same kind as OBJ with every slot

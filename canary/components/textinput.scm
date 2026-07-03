@@ -100,6 +100,8 @@ next sibling, which is exactly where we want the caret."
           ;; reads as a stray square.
           (hbox (txt prompt) (txt visible)))))))))
 
+(define-method (consumes-keys? (ti <textinput>)) #t)
+
 (define-method (update (ti <textinput>) (msg <focus-in>))
   "Engine dispatches <focus-in> when this textinput joins the focus
 chain.  Mirror it in the focused? slot so the next render shows the

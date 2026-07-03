@@ -920,6 +920,18 @@ cancel it."
                     (lambda () %pending-flush-msg)
                     sid))))
 
+(define (focus-leaf-consumes-keys? eng)
+  "Return #t when the focus-chain leaf is a <component> whose
+`consumes-keys?' method returns #t (e.g. an active <textinput>).  Used
+to bypass the engine's keymap dispatch so text-entry widgets receive
+every key, including ones the app keymap would otherwise consume."
+  (let ((chain (engine-focus-chain eng)))
+    (and (pair? chain)
+         (let* ((leaf-id (car (last-pair chain)))
+                (id-map  (build-id-map (engine-root eng)))
+                (leaf    (hash-ref id-map leaf-id)))
+           (and leaf (consumes-keys? leaf))))))
+
 (define (dispatch-keymap-or-raw! eng msg)
   "Standard key dispatch: try the keymap stack, route to focus on no
 match.  Returns #t if anything changed."
@@ -1355,6 +1367,8 @@ Routing policy:
     ;; commit the pending single-key action.
     (fire-pending! eng)
     #t)
+   ((and (key? msg) (focus-leaf-consumes-keys? eng))
+    (dispatch! eng route-to-focus! (apply-filter eng msg)))
    ((and (key? msg)
          (pair? (engine-focus-chain eng))
          (pair? (cdr (engine-focus-chain eng))))
